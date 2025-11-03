@@ -169,7 +169,6 @@ unsigned int g_midb_cache_interval, g_midb_reload_interval;
 
 static constexpr time_duration DB_LOCK_TIMEOUT = std::chrono::seconds(60);
 static size_t g_table_size;
-static std::atomic<unsigned int> g_sequence_id;
 static gromox::atomic_bool g_notify_stop; /* stop signal for scanning thread */
 static pthread_t g_scan_tid;
 static char g_org_name[256];
@@ -238,17 +237,24 @@ static uint64_t me_get_digest(sqlite3 *psqlite, const char *mid_string,
 {
 	auto dir = cu_get_maildir();
 	std::string slurp_data;
-	if (exmdb_client->imapfile_read(dir, "ext", mid_string, &slurp_data)) {
-		if (!json_from_str(slurp_data.c_str(), digest))
-			return 0;
-	} else {
+	bool have_ext = false;
+
+	/* ext files may be absent (only midb generates them) */
+	if (exmdb_client->imapfile_read(dir, "ext", mid_string, &slurp_data))
+		if (json_from_str(slurp_data.c_str(), digest) &&
+		    digest.isMember("structure") && digest.isMember("mimes"))
+			have_ext = true;
+	if (!have_ext) {
+		/*
+		 * eml files are generally present, either because http wrote
+		 * it, or midb's me_insert_message wrote it.
+		 */
 		if (!exmdb_client->imapfile_read(dir, "eml", mid_string, &slurp_data))
 			return 0;
 		MAIL imail;
 		if (!imail.load_from_str(slurp_data.c_str(), slurp_data.size()))
 			return 0;
-		size_t size = 0;
-		if (imail.make_digest(&size, digest) <= 0)
+		if (imail.make_digest(digest) <= 0)
 			return 0;
 		digest["file"] = "";
 		auto djson = json_to_str(digest);
@@ -1327,7 +1333,6 @@ static void me_extract_digest_fields(const Json::Value &digest, char *subject,
 static void me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
     uint64_t message_id, sqlite3 *db, syncmessage_entry e) try
 {
-	size_t size;
 	char from[UADDR_SIZE], rcpt[UADDR_SIZE];
 	char subject[1024];
 	MESSAGE_CONTENT *pmsgctnt;
@@ -1337,7 +1342,15 @@ static void me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 	if (e.midstr.size() > 0 &&
 	    !exmdb_client->imapfile_read(dir, "ext", e.midstr, &djson))
 		e.midstr.clear();
-	if (e.midstr.empty()) {
+	Json::Value digest;
+	if (djson.size() > 0) {
+		if (!json_from_str(djson.c_str(), digest) ||
+		    !digest.isMember("structure") || !digest.isMember("mimes")) {
+			djson.clear();
+			digest = {};
+		}
+	}
+	if (digest.empty()) {
 		if (!cu_switch_allocator())
 			return;
 		if (!exmdb_client->read_message(dir, nullptr, CP_ACP,
@@ -1363,12 +1376,13 @@ static void me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 			return;
 		}
 		cu_switch_allocator();
-		Json::Value digest;
-		if (imail.make_digest(&size, digest) <= 0)
+		if (imail.make_digest(digest) <= 0)
 			return;
-		digest["file"] = "";
+		digest.removeMember("file");
 		djson = json_to_str(digest);
-		e.midstr = fmt::format("{}.m{}.{}", time(nullptr), ++g_sequence_id, g_host_id);
+		char guidtxt[GUIDSTR_SIZE]{};
+		GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+		e.midstr = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
 		if (!exmdb_client->imapfile_write(dir, "ext", e.midstr, djson)) {
 			mlog(LV_ERR, "E-1770: imapfile_write %s/ext/%s incomplete", dir, e.midstr.c_str());
 			return;
@@ -1387,10 +1401,8 @@ static void me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 	(*puidnext) ++;
 	bool b_unsent = e.msg_flags & MSGFLAG_UNSENT;
 	bool b_read   = e.msg_flags & MSGFLAG_READ;
-	Json::Value digest;
-	if (!json_from_str(djson.c_str(), digest))
-		return;
 	djson.clear();
+	size_t size = 0;
 	me_extract_digest_fields(digest, subject,
 		std::size(subject), from, std::size(from), rcpt,
 		std::size(rcpt), &size);
@@ -1849,7 +1861,7 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 	cl_err.release();
 	if (!exmdb_client->subscribe_notification(dir,
 	    fnevObjectCreated | fnevObjectDeleted | fnevObjectModified |
-	    fnevObjectMoved | fnevObjectCopied | fnevNewMail, TRUE,
+	    fnevObjectMoved | fnevObjectCopied, TRUE,
 	    0, 0, &pidb->sub_id))
 		pidb->sub_id = 0;	
 	pidb->load_time = time(nullptr);
@@ -2121,7 +2133,6 @@ static int me_menum(int argc, char **argv, int sockd) try
  */
 static int me_minst(int argc, char **argv, int sockd) try
 {
-	size_t mess_len;
 	uint32_t tmp_flags;
 	uint64_t change_num;
 	uint64_t message_id;
@@ -2142,9 +2153,9 @@ static int me_minst(int argc, char **argv, int sockd) try
 	if (!imail.load_from_str(pbuff.c_str(), pbuff.size()))
 		return MIDB_E_IMAIL_RETRIEVE;
 	Json::Value digest;
-	if (imail.make_digest(&mess_len, digest) <= 0)
+	if (imail.make_digest(digest) <= 0)
 		return MIDB_E_IMAIL_DIGEST;
-	digest["file"] = "";
+	digest["file"] = argv[3];
 	auto djson = json_to_str(digest);
 	if (!exmdb_client->imapfile_write(argv[1], "ext", argv[3], djson)) {
 		mlog(LV_ERR, "E-2073: imapfile_write %s/ext/%s failed", argv[1], argv[3]);
@@ -2241,9 +2252,10 @@ static int me_minst(int argc, char **argv, int sockd) try
 	if (cpid == CP_ACP)
 		cpid = static_cast<cpid_t>(1252);
 	ec_error_t e_result = ecRpcFailed;
+	uint64_t outmid = 0, outcn = 0;
 	if (!exmdb_client->write_message(argv[1], cpid,
-	    rop_util_make_eid_ex(1, folder_id), pmsgctnt, &e_result) ||
-	    e_result != ecSuccess)
+	    rop_util_make_eid_ex(1, folder_id), pmsgctnt, djson.c_str(),
+	    &outmid, &outcn, &e_result) || e_result != ecSuccess)
 		return MIDB_E_MDB_WRITEMESSAGE;
 	return cmd_write(sockd, "TRUE\r\n");
 } catch (const std::bad_alloc &) {
@@ -3970,16 +3982,6 @@ static void notif_handler(const char *dir,
 	uint64_t parent_id = 0, folder_id = 0, message_id = 0;
 
 	switch (pdb_notify->type) {
-	case db_notify_type::new_mail: {
-		auto n = static_cast<const DB_NOTIFY_NEW_MAIL *>(pdb_notify->pdata);
-		folder_id = n->folder_id;
-		message_id = n->message_id;
-		if (g_cmd_debug >= 2)
-			mlog(LV_DEBUG, "midb-async: %s new-mail f%llu:m%llu",
-				dir, LLU{folder_id}, LLU{message_id});
-		notif_msg_added(pidb.get(), folder_id, message_id);
-		break;
-	}
 	case db_notify_type::folder_created: {
 		auto n = static_cast<const DB_NOTIFY_FOLDER_CREATED *>(pdb_notify->pdata);
 		folder_id = n->folder_id;
@@ -4130,7 +4132,6 @@ static void notif_handler(const char *dir,
 void me_init(const char *default_charset, const char *org_name,
     size_t table_size)
 {
-	g_sequence_id = 0;
 	gx_strlcpy(g_default_charset, default_charset, std::size(g_default_charset));
 	gx_strlcpy(g_org_name, org_name, std::size(g_org_name));
 	g_table_size = table_size;

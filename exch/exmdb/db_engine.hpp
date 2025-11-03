@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <map>
@@ -105,7 +106,7 @@ struct db_close;
 using db_handle = std::unique_ptr<sqlite3, db_close>;
 
 /**
- * Per-mailbox state shared across multiple (and basically indepdent of)
+ * Per-mailbox state shared across multiple (and basically independent of)
  * db_conn.
  *
  * @reference: client reference count, db_base can be destroyed when count is 0
@@ -137,11 +138,11 @@ struct db_base {
 	const table_node *find_table(uint32_t) const;
 	void handle_spares(sqlite3 *, sqlite3 *);
 
-	void open(const char* dir);
+	void ctor2_and_open(const char *dir);
 	void drop_all();
 	void get_dbs(const char *dir, sqlite3 *&main, sqlite3 *&eph);
 
-private:
+	private:
 	db_handle get_db(const char *dir, DB_TYPE);
 
 	std::mutex sqlite_lock;
@@ -168,9 +169,11 @@ struct db_conn {
 		}
 	};
 	/* remote_id => subscription ids */
-	using ID_ARRAYS = std::map<const char *, std::vector<uint32_t>, xless>;
+	class ID_ARRAYS : public std::map<const char *, std::vector<uint32_t>, xless> {
+		using std::map<const char *, std::vector<uint32_t>, xless>::map;
+	};
 	/* As long as any NOTIFQ object is alive, dbase should be held at least read-locked. */
-	using NOTIFQ = std::vector<std::pair<DB_NOTIFY_DATAGRAM, ID_ARRAYS>>;
+	class NOTIFQ : public std::vector<std::pair<DB_NOTIFY_DATAGRAM, ID_ARRAYS>> {};
 
 	db_conn(db_base &);
 	~db_conn();
@@ -203,9 +206,13 @@ struct db_conn {
 	std::unique_ptr<prepared_statements> begin_optim();
 
 	gromox::xstmt prep(const char *q) const { return gromox::gx_sql_prep(psqlite, q); }
+	gromox::xstmt prep(const std::string &q) const { return gromox::gx_sql_prep(psqlite, q.c_str()); }
 	int exec(const char *q, unsigned int fl = 0) const { return gromox::gx_sql_exec(psqlite, q, fl); }
+	int exec(const std::string &q, unsigned int fl = 0) const { return gromox::gx_sql_exec(psqlite, q.c_str(), fl); }
 	gromox::xstmt eph_prep(const char *q) const { return gromox::gx_sql_prep(m_sqlite_eph, q); }
+	gromox::xstmt eph_prep(const std::string &q) const { return gromox::gx_sql_prep(m_sqlite_eph, q.c_str()); }
 	int eph_exec(const char *q) const { return gromox::gx_sql_exec(m_sqlite_eph, q); }
+	int eph_exec(const std::string &q) const { return gromox::gx_sql_exec(m_sqlite_eph, q.c_str()); }
 	inline uint32_t next_table_id() { return ++m_base->tables.last_id; }
 
 	sqlite3 *psqlite = nullptr, *m_sqlite_eph = nullptr;
@@ -219,6 +226,7 @@ extern void db_engine_init(size_t table_size, int cache_interval, unsigned int t
 extern int db_engine_run();
 extern void db_engine_stop();
 
+extern bool db_engine_set_maint(const char *path, enum db_maint_mode);
 extern db_conn_ptr db_engine_get_db(const char *dir);
 extern BOOL db_engine_vacuum(const char *path);
 extern BOOL db_engine_cgkreset(const char *dir, uint32_t flags);
@@ -231,7 +239,7 @@ extern unsigned int g_exmdb_schema_upgrades, g_exmdb_search_pacing;
 extern unsigned long long g_exmdb_search_pacing_time, g_exmdb_lock_timeout;
 extern unsigned int g_exmdb_search_yield, g_exmdb_search_nice;
 extern unsigned int g_exmdb_pvt_folder_softdel;
-extern std::string g_exmdb_ics_log_file;
+extern std::string g_exmdb_ics_log_file, exmdb_eph_prefix;
 /* Max number of cached DB connections per store, 0 = unlimited */
 extern unsigned int g_exmdb_max_sqlite_spares;
 extern unsigned long long g_sqlite_busy_timeout_ns;

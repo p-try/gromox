@@ -9,12 +9,18 @@
 #include <memory>
 #include <unistd.h>
 #include <utility>
+#include <fmt/format.h>
+#include <json/value.h>
+#include <libHX/ctype_helper.h>
 #include <libHX/endian.h>
 #include <libHX/io.h>
 #include <libHX/option.h>
 #include <libHX/scope.hpp>
+#include <gromox/exmdb_client.hpp>
 #include <gromox/exmdb_rpc.hpp>
 #include <gromox/ext_buffer.hpp>
+#include <gromox/json.hpp>
+#include <gromox/mail.hpp>
 #include <gromox/paths.h>
 #include <gromox/svc_loader.hpp>
 #include <gromox/textmaps.hpp>
@@ -25,6 +31,7 @@
 
 using namespace gromox;
 using namespace gi_dump;
+using LLU = unsigned long long;
 
 namespace {
 
@@ -38,7 +45,7 @@ struct ob_desc {
 
 using propididmap_t = std::unordered_map<uint16_t, uint16_t>;
 
-static char *g_username, *g_anchor_folder_str;
+static const char *g_username, *g_anchor_folder_str;
 static gi_folder_map_t g_folder_map;
 static gi_name_map g_src_name_map;
 static propididmap_t g_thru_name_map;
@@ -64,7 +71,7 @@ static constexpr HXoption g_options_table[] = {
 	{nullptr, 'c', HXTYPE_NONE, &g_continuous_mode, {}, {}, 0, "Continuous operation mode (do not stop on errors)"},
 	{nullptr, 'p', HXTYPE_NONE | HXOPT_INC, &g_show_props, nullptr, nullptr, 0, "Show properties in detail (if -t)"},
 	{nullptr, 't', HXTYPE_NONE, &g_show_tree, nullptr, nullptr, 0, "Show tree-based analysis of the archive"},
-	{nullptr, 'u', HXTYPE_STRING, &g_username, nullptr, nullptr, 0, "Username of store to import to", "EMAILADDR"},
+	{nullptr, 'u', HXTYPE_STRING, {}, {}, {}, 0, "Username of store to import to", "EMAILADDR"},
 	{nullptr, 'v', HXTYPE_NONE | HXOPT_INC, &g_verbose_create, nullptr, nullptr, 0, "Be more verbose"},
 	{nullptr, 'x', HXTYPE_VAL, &g_oexcl, nullptr, nullptr, 0, "Disable O_EXCL like behavior for non-spliced folders"},
 	{"loglevel", 0, HXTYPE_UINT, &g_mlog_level, {}, {}, {}, "Basic loglevel of the program", "N"},
@@ -88,6 +95,18 @@ static void filter_folder_map(gi_folder_map_t &fmap)
 		p.second.fid_to = rop_util_make_eid_ex(1, p.second.fid_to);
 }
 
+static void validate_magic(const char *magic)
+{
+	if (memcmp(magic, "GXMT", 4) != 0 || !HX_isdigit(magic[4]) ||
+	    !HX_isdigit(magic[5]) || !HX_isdigit(magic[6]) ||
+	    !HX_isdigit(magic[7]))
+		throw YError("PG-1127: Unrecognized input format. GXMT0004 file signature is missing.");
+	if (memcmp(&magic[4], "0004", 4) == 0)
+		return;
+	throw YError("PG-1127: Input is from an unsupported version. "
+		"Observed signature \"%.8s\", but only \"GXMT0004\" is understood.", magic);
+}
+
 static int exm_read_base_maps()
 {
 	errno = 0;
@@ -97,8 +116,7 @@ static int exm_read_base_maps()
 		return 0;
 	if (ret < 0 || static_cast<size_t>(ret) != std::size(magic))
 		throw YError("PG-1126: %s", strerror_eof(errno));
-	if (memcmp(magic, "GXMT0003", 8) != 0)
-		throw YError("PG-1127: Unrecognized input format");
+	validate_magic(magic);
 	ret = HXio_fullread(STDIN_FILENO, &g_splice, sizeof(g_splice));
 	if (ret < 0 || static_cast<size_t>(ret) != sizeof(g_splice))
 		throw YError("PG-1120: %s", strerror_eof(errno));
@@ -225,6 +243,66 @@ static void exm_folder_adjust(TPROPVAL_ARRAY &props)
 	exm_adjust_namedprops(props);
 }
 
+/**
+ * @o_excl:	Enforce that we are the first to create the folder, just like
+ * 		open(2)'s %O_EXCL flag.
+ */
+static int exm_create_folder(uint64_t parent_fld, TPROPVAL_ARRAY *props,
+    bool o_excl, uint64_t *new_fld_id)
+{
+	uint64_t change_num = 0;
+	if (!exmdb_client->allocate_cn(g_storedir, &change_num)) {
+		fprintf(stderr, "exm: allocate_cn(fld) RPC failed\n");
+		return -EIO;
+	}
+	if (!props->has(PR_LAST_MODIFICATION_TIME)) {
+		auto last_time = rop_util_current_nttime();
+		auto ret = props->set(PR_LAST_MODIFICATION_TIME, &last_time);
+		if (ret == ecServerOOM)
+			return -ENOMEM;
+		else if (ret != ecSuccess)
+			return -EIO;
+	}
+	auto err = props->set(PidTagParentFolderId, &parent_fld);
+	if (err == ecServerOOM)
+		return -ENOMEM;
+	else if (err != ecSuccess)
+		return -EIO;
+	auto ret = exm_set_change_keys(props, change_num);
+	if (ret != 0) {
+		fprintf(stderr, "exm: tpropval: %s\n", strerror(-ret));
+		return ret;
+	}
+	auto dn = props->get<const char>(PR_DISPLAY_NAME);
+	if (!o_excl && dn != nullptr) {
+		if (!exmdb_client->get_folder_by_name(g_storedir,
+		    parent_fld, dn, new_fld_id)) {
+			fprintf(stderr, "exm: get_folder_by_name \"%s\" RPC/network failed\n", dn);
+			return -EIO;
+		}
+		if (*new_fld_id != 0)
+			return 0;
+	}
+	if (dn == nullptr)
+		dn = "";
+	if (!exmdb_client->create_folder(g_storedir, CP_ACP, props, new_fld_id, &err)) {
+		fprintf(stderr, "exm: create_folder_by_properties \"%s\" RPC failed\n", dn);
+		return -EIO;
+	} else if (err != ecSuccess) {
+		fprintf(stderr, "exm: create_folder_by_properties \"%s\" RPC failed: %s\n",
+			dn, mapi_strerror(err));
+		return -EIO;
+	} else if (*new_fld_id == 0) {
+		fprintf(stderr, "exm: Could not create folder \"%s\". "
+			"Either it already existed or some there was some other unspecified problem.\n", dn);
+		return -EEXIST;
+	} else if (g_verbose_create) {
+		fprintf(stderr, "exm: Created folder \"%s\" (fid=0x%llx)\n", dn,
+			LLU{rop_util_get_gc_value(*new_fld_id)});
+	}
+	return 0;
+}
+
 static int exm_folder(const ob_desc &obd, TPROPVAL_ARRAY &props,
     const std::vector<PERMISSION_DATA> &perms)
 {
@@ -301,12 +379,159 @@ static int exm_folder(const ob_desc &obd, TPROPVAL_ARRAY &props,
 	return 0;
 }
 
-static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt)
+static int exm_create_msg(uint64_t parent_fld, MESSAGE_CONTENT *ctnt,
+    const std::string &im_repr, Json::Value &digest)
 {
-	if (g_show_tree)
-		printf("exm: Message %lxh (parent=%llxh)\n",
+	uint64_t msg_id = 0, change_num = 0;
+	if (!exmdb_client->allocate_message_id(g_storedir, parent_fld, &msg_id)) {
+		fprintf(stderr, "exm: allocate_message_id RPC failed (timeout?)\n");
+		return -EIO;
+	} else if (!exmdb_client->allocate_cn(g_storedir, &change_num)) {
+		fprintf(stderr, "exm: allocate_cn(msg) RPC failed\n");
+		return -EIO;
+	}
+	ec_error_t ret;
+	if ((ret = ctnt->proplist.set(PidTagMid, &msg_id)) != ecSuccess) {
+		fprintf(stderr, "exm: tpropval: %s\n", mapi_strerror(ret));
+		return ece2nerrno(ret);
+	}
+	auto iret = exm_set_change_keys(&ctnt->proplist, change_num);
+	if (iret != 0) {
+		fprintf(stderr, "exm: tpropval: %s\n", strerror(-iret));
+		return iret;
+	}
+	/*
+	 * midstr can be (almost) anything we want, the name is not
+	 * interpreted. But it should be chosen such that it does not collide
+	 * with a different process. A GUID fits that easily.
+	 *
+	 * Unlike attachments, the content of eml files is expected to be
+	 * different (look at all those timestamps in Date:, Received:, etc.),
+	 * so no effort is made to hash the content―which also conveniently
+	 * does away with the issue of multiple processes trying to potentially
+	 * vivify the same filename-derived-from-same-content.
+	 */
+	std::string djson;
+	if (im_repr.size() > 0) {
+		char guidtxt[GUIDSTR_SIZE]{};
+		GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+		auto midstr = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
+		digest["file"] = midstr;
+		if (!exmdb_client->imapfile_write(g_storedir, "eml",
+		    midstr.c_str(), im_repr.c_str())) {
+			fprintf(stderr, "exm: imapfile_write RPC failed\n");
+			return -EIO;
+		}
+		djson = json_to_str(digest);
+		digest.removeMember("file");
+	}
+
+	uint64_t outmid = 0, outcn = 0;
+	if (!exmdb_client->write_message(g_storedir, CP_UTF8, parent_fld,
+	    ctnt, djson.c_str(), &outmid, &outcn, &ret)) {
+		fprintf(stderr, "exm: write_message RPC failed\n");
+		return -EIO;
+	} else if (ret != ecSuccess) {
+		fprintf(stderr, "exm: write_message: %s\n", mapi_strerror(ret));
+		return -EIO;
+	} else if (g_verbose_create) {
+		fprintf(stderr, "Created new message 0x%llx:0x%llx\n",
+			LLU{rop_util_get_gc_value(parent_fld)},
+			LLU{rop_util_get_gc_value(outmid)});
+	}
+	return 0;
+}
+
+static int exm_deliver_msg(const char *target, MESSAGE_CONTENT *ct,
+    const std::string &im_repr, Json::Value &&digest, unsigned int mode)
+{
+	auto ts = rop_util_current_nttime();
+	auto ret = ct->proplist.set(PR_MESSAGE_DELIVERY_TIME, &ts);
+	if (ret != ecSuccess)
+		return ece2nerrno(ret);
+	uint64_t folder_id = 0, msg_id = 0;
+	uint32_t r32 = 0;
+	if (mode & DELIVERY_TWOSTEP)
+		mode &= ~(DELIVERY_DO_RULES | DELIVERY_DO_NOTIF);
+	uint64_t change_num = 0;
+	if (!exmdb_client->allocate_cn(g_storedir, &change_num)) {
+		fprintf(stderr, "exm: allocate_cn(msg)[delivery] RPC failed\n");
+		return -EIO;
+	}
+	auto iret = exm_set_change_keys(&ct->proplist, change_num);
+	if (iret != 0) {
+		fprintf(stderr, "exm: tpropval: %s\n", strerror(-iret));
+		return iret;
+	}
+	char guidtxt[GUIDSTR_SIZE]{};
+	GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+	auto midstr = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
+	digest["file"] = midstr;
+	if (!exmdb_client->imapfile_write(g_storedir, "eml",
+	    midstr.c_str(), im_repr.c_str())) {
+		fprintf(stderr, "exm: imapfile_write RPC failed\n");
+		return -EIO;
+	}
+	auto djson = json_to_str(digest);
+	if (!exmdb_client->deliver_message(g_storedir, ENVELOPE_FROM_NULL,
+	    target, CP_ACP, mode, ct, djson.c_str(), &folder_id, &msg_id, &r32)) {
+		fprintf(stderr, "exm: deliver_message RPC failed: code %u\n",
+		        r32);
+		return -EIO;
+	}
+
+	auto dm_status = static_cast<deliver_message_result>(r32);
+	switch (dm_status) {
+	case deliver_message_result::result_ok:
+		if (g_verbose_create)
+			fprintf(stderr, "Created/delivered new message 0x%llx:0x%llx\n",
+				LLU{rop_util_get_gc_value(folder_id)},
+				LLU{rop_util_get_gc_value(msg_id)});
+		break;
+	case deliver_message_result::result_error:
+		fprintf(stderr, "Message rejected - unspecified reason\n");
+		return EXIT_FAILURE;
+	case deliver_message_result::mailbox_full_bysize:
+		fprintf(stderr, "Message rejected - mailbox has reached quota limit");
+		return EXIT_FAILURE;
+	case deliver_message_result::mailbox_full_bymsg:
+		fprintf(stderr, "Message rejected - mailbox has reached maximum message count (cf. exmdb_provider.cfg:max_store_message_count)");
+		return EXIT_FAILURE;
+	case deliver_message_result::partial_completion:
+		fprintf(stderr, "Partial completion - The server could not save all of the message (wrong permissions/disk full/...)\n");
+		return EXIT_FAILURE;
+	}
+	if (!(mode & DELIVERY_TWOSTEP))
+		return EXIT_SUCCESS;
+	if (exmdb_local_rules_execute == nullptr) {
+		fprintf(stderr, "Programmer's error: libgxs_ruleproc.so was not activated, cannot perform rule processing");
+		return EXIT_FAILURE;
+	}
+	fprintf(stderr, "Exercising TWOSTEP ruleprocessor:\n");
+	if (msg_id == 0) {
+		fprintf(stderr, "deliver_message RPC did not give us a message_id -- not executing any rules.\n");
+		return EXIT_SUCCESS;
+	}
+	auto err = exmdb_local_rules_execute(g_storedir, ENVELOPE_FROM_NULL,
+	           target, folder_id, msg_id, mode);
+	if (err != ecSuccess) {
+		fprintf(stderr, "Rule execution not successful: %s\n", mapi_strerror(err));
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt,
+    const std::string &im_repr)
+{
+	if (g_show_tree) {
+		printf("exm: Message %lxh (parent=%llxh)",
 			static_cast<unsigned long>(obd.nid),
 			static_cast<unsigned long long>(obd.parent.folder_id));
+		if (im_repr.size() > 0)
+			printf(" [RFC5322: %zu bytes]", im_repr.size());
+		printf("\n");
+	}
 	if (g_show_tree && g_show_props)
 		gi_print(0, ctnt, ee_get_propname);
 	auto folder_it = g_folder_map.find(obd.parent.folder_id);
@@ -321,11 +546,27 @@ static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt)
 		tlog("adjusted properties:\n");
 		gi_print(0, ctnt, ee_get_propname);
 	}
+
+	Json::Value digest;
+	if (im_repr.size() > 0) {
+		MAIL imail;
+		if (!imail.load_from_str(im_repr.data(), im_repr.size())) {
+			fprintf(stderr, "Failed to parse RFC5322 block for message\n");
+			return -EIO;
+		}
+		auto ret = imail.make_digest(digest);
+		if (ret <= 0) {
+			fprintf(stderr, "Failed to produce JDigest for RFC5322 block\n");
+			return -EIO;
+		}
+	}
+
 	if (!g_do_delivery) {
 		for (auto i = 0U; i < g_repeat_iter; ++i) {
 			if (i > 0 && i % 1024 == 0)
 				fprintf(stderr, "mt2exm repeat %u/%u\n", i, g_repeat_iter);
-			auto ret = exm_create_msg(folder_it->second.fid_to, &ctnt);
+			auto ret = exm_create_msg(folder_it->second.fid_to,
+			           &ctnt, im_repr, digest);
 			if (ret != EXIT_SUCCESS)
 				return ret;
 		}
@@ -345,7 +586,8 @@ static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt)
 	for (auto i = 0U; i < g_repeat_iter; ++i) {
 		if (i > 0 && i % 1024 == 0)
 			fprintf(stderr, "mt2exm repeat %u/%u\n", i, g_repeat_iter);
-		auto ret = exm_deliver_msg(g_username, &ctnt, mode);
+		auto ret = exm_deliver_msg(g_username, &ctnt, im_repr,
+		           std::move(digest), mode);
 		if (ret != EXIT_SUCCESS)
 			return ret;
 	}
@@ -408,7 +650,12 @@ static int exm_packet(const void *buf, size_t bufsize)
 		auto cl_0 = HX::make_scope_exit([&]() { message_content_free_internal(&ctnt); });
 		if (ep.g_msgctnt(&ctnt) != pack_result::ok)
 			throw YError("PG-1119");
-		return exm_message(obd, ctnt);
+		std::string im_std, reserved;
+		if (ep.g_str(&im_std) != pack_result::ok ||
+		    ep.g_str(&reserved) != pack_result::ok)
+			throw YError("PG-1113");
+		reserved = {};
+		return exm_message(obd, ctnt, im_std);
 	}
 	throw YError("PG-1117: unknown obd.mapitype %u", static_cast<unsigned int>(obd.mapitype));
 }
@@ -432,11 +679,14 @@ static void terse_help()
 
 int main(int argc, char **argv) try
 {
+	HXopt6_auto_result argp;
 	setvbuf(stdout, nullptr, _IOLBF, 0);
-	if (HX_getopt5(g_options_table, argv, &argc, &argv,
-	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS)
+	if (HX_getopt6(g_options_table, argc, argv, &argp,
+	    HXOPT_USAGEONERR | HXOPT_ITER_OPTS) != HXOPT_ERR_SUCCESS)
 		return EXIT_FAILURE;
-	auto cl_0a = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
+	for (int i = 0; i < argp.nopts; ++i)
+		if (argp.desc[i]->sh == 'u')
+			g_username = argp.oarg[i];
 	if (g_username == nullptr) {
 		terse_help();
 		return EXIT_FAILURE;

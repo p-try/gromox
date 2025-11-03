@@ -938,21 +938,21 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 	}
 	
 	pvalue = pmsg->proplist.get<char>(PR_SPOUSE_NAME);
-	if (NULL != pvalue) {
+	if (NULL != pvalue && *pvalue != '\0') {
 		auto &sp_line = vcard.append_line("X-MS-SPOUSE");
 		sp_line.append_param("N");
 		sp_line.append_value(pvalue);
 	}
 	
 	pvalue = pmsg->proplist.get<char>(PR_MANAGER_NAME);
-	if (NULL != pvalue) {
+	if (NULL != pvalue && *pvalue != '\0') {
 		auto &mgr_line = vcard.append_line("X-MS-MANAGER");
 		mgr_line.append_param("N");
 		mgr_line.append_value(pvalue);
 	}
 	
 	pvalue = pmsg->proplist.get<char>(PR_ASSISTANT);
-	if (NULL != pvalue) {
+	if (NULL != pvalue && *pvalue != '\0') {
 		auto &as_line = vcard.append_line("X-MS-ASSISTANT");
 		as_line.append_param("N");
 		as_line.append_value(pvalue);
@@ -961,7 +961,7 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 	pvalue = pmsg->proplist.get<char>(PROP_TAG(PROP_TYPE(g_vcarduid_proptag), propids[PROP_ID(g_vcarduid_proptag)-0x8000]));
 	if (pvalue == nullptr) {
 		auto guid = GUID::random_new();
-		vcarduid = "uuid:" + bin2hex(&guid, sizeof(guid));
+		vcarduid = "uuid:" + bin2hex(guid);
 		pvalue = vcarduid.c_str();
 	}
 	if (pvalue != nullptr)

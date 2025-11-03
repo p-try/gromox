@@ -1,11 +1,4 @@
 #pragma once
-#include "php.h"
-#undef slprintf
-#undef vslprintf
-#undef snprintf
-#undef vsnprintf
-#undef vasprintf
-#undef asprintf
 #include <cstdint>
 #include <ctime>
 #include <vector>
@@ -13,7 +6,7 @@
 
 struct zcreq;
 struct zcresp;
-extern zend_bool zclient_do_rpc(const zcreq *, zcresp *);
+extern bool zclient_do_rpc(const zcreq *, zcresp *);
 extern ec_error_t zclient_setpropval(GUID ses, uint32_t obj, gromox::proptag_t, const void *);
 extern ec_error_t zclient_getpropval(GUID ses, uint32_t obj, gromox::proptag_t, void **);
 
@@ -21,7 +14,7 @@ extern ec_error_t zclient_getpropval(GUID ses, uint32_t obj, gromox::proptag_t, 
 #define ZCIDL(n, p) extern ec_error_t zclient_ ## n p;
 /* When calling these functions, none of the IDLOUT parameters may be NULL */
 ZCIDL(logon, (const char *username, const char *password, const char *rhost, uint32_t flags, IDLOUT GUID *hsession))
-ZCIDL(uinfo, (const char *username, IDLOUT BINARY *entryid, char **pdisplay_name, char **px500dn, uint32_t *privilege_bits))
+ZCIDL(uinfo, (const char *username, IDLOUT BINARY *entryid, std::string *pdisplay_name, std::string *px500dn, uint32_t *privilege_bits))
 ZCIDL(unloadobject, (GUID hsession, uint32_t hobject))
 ZCIDL(openentry, (GUID hsession, BINARY entryid, uint32_t flags, IDLOUT zs_objtype *mapi_type, uint32_t *hobject))
 ZCIDL(openstoreentry, (GUID hsession, uint32_t hobject, BINARY entryid, uint32_t flags, IDLOUT zs_objtype *mapi_type, uint32_t *hxobject))
@@ -78,9 +71,9 @@ ZCIDL(copyto, (GUID hsession, uint32_t hsrcobject, const PROPTAG_ARRAY *pexclude
 ZCIDL(savechanges, (GUID hsession, uint32_t hobject))
 ZCIDL(hierarchysync, (GUID hsession, uint32_t hfolder, IDLOUT uint32_t *hobject))
 ZCIDL(contentsync, (GUID hsession, uint32_t hfolder, IDLOUT uint32_t *hobject))
-ZCIDL(configsync, (GUID hsession, uint32_t hctx, uint32_t flags, const BINARY *pstate, const RESTRICTION *prestriction, IDLOUT zend_bool *b_changed, uint32_t *count))
+ZCIDL(configsync, (GUID hsession, uint32_t hctx, uint32_t flags, const BINARY *pstate, const RESTRICTION *prestriction, IDLOUT uint8_t *b_changed, uint32_t *count))
 ZCIDL(statesync, (GUID hsession, uint32_t hctx, IDLOUT BINARY *state))
-ZCIDL(syncmessagechange, (GUID hsession, uint32_t hctx, IDLOUT zend_bool *b_new, TPROPVAL_ARRAY *proplist))
+ZCIDL(syncmessagechange, (GUID hsession, uint32_t hctx, IDLOUT uint8_t *b_new, TPROPVAL_ARRAY *proplist))
 ZCIDL(syncfolderchange, (GUID hsession, uint32_t hctx, IDLOUT TPROPVAL_ARRAY *proplist))
 ZCIDL(syncreadstatechanges, (GUID hsession, uint32_t hctx, IDLOUT STATE_ARRAY *states))
 ZCIDL(syncdeletions, (GUID hsession, uint32_t hctx, uint32_t flags, IDLOUT BINARY_ARRAY *bins))
@@ -108,5 +101,6 @@ ZCIDL(essdn_to_username, (const char *essdn, IDLOUT char **username))
 ZCIDL(logon_token, (const char *token, const char *rhost, IDLOUT GUID *hsession))
 ZCIDL(getuserfreebusy, (GUID hsession, BINARY entryid, time_t starttime, time_t endtime, IDLOUT std::vector<freebusy_event> *fb_events))
 ZCIDL(getuserfreebusyical, (GUID hsession, BINARY entryid, time_t starttime, time_t endtime, IDLOUT BINARY *ical_bin))
+ZCIDL(logon_np, (const char *username, const char *password, const char *rhost, uint32_t flags, IDLOUT GUID *hsession))
 #undef ZCIDL
 #undef IDLOUT

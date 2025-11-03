@@ -936,7 +936,9 @@ static int do_message(unsigned int depth, const parent_desc &parent,
 	    ep.p_uint32(ident) != pack_result::ok ||
 	    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
 	    ep.p_uint64(parent.folder_id) != pack_result::ok ||
-	    ep.p_msgctnt(*ctnt) != pack_result::ok)
+	    ep.p_msgctnt(*ctnt) != pack_result::ok ||
+	    ep.p_str("") != pack_result::ok ||
+	    ep.p_str("") != pack_result::ok)
 		throw YError("PF-1058");
 	uint64_t xsize = cpu_to_le64(ep.m_offset);
 	if (HXio_fullwrite(STDOUT_FILENO, &xsize, sizeof(xsize)) < 0)
@@ -1207,7 +1209,7 @@ static errno_t do_file(const char *filename) try
 	}
 
 	uint8_t xsplice = g_splice;
-	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0003", 8) < 0)
+	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0004", 8) < 0)
 		throw YError("PF-1132: %s", strerror(errno));
 	if (HXio_fullwrite(STDOUT_FILENO, &xsplice, sizeof(xsplice)) < 0)
 		throw YError("PF-1133: %s", strerror(errno));
@@ -1233,7 +1235,7 @@ static errno_t do_file(const char *filename) try
 	libpff_item_ptr root;
 	if (libpff_file_get_root_item(file.get(), &~unique_tie(root), &~unique_tie(err)) < 1)
 		throw az_error("PF-1025", err);
-	gi_name_map_write({}); /* required by GXMT0003 format */
+	gi_name_map_write({}); /* required by GXMT format */
 
 	if (g_show_tree)
 		fprintf(stderr, "Object tree:\n");
@@ -1279,14 +1281,15 @@ static void terse_help()
 
 int main(int argc, char **argv)
 {
+	HXopt6_auto_result argp;
+
 	setvbuf(stdout, nullptr, _IOLBF, 0);
-	if (HX_getopt5(g_options_table, argv, &argc, &argv,
-	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS)
+	if (HX_getopt6(g_options_table, argc, argv, &argp,
+	    HXOPT_USAGEONERR | HXOPT_ITER_ARGS) != HXOPT_ERR_SUCCESS)
 		return EXIT_FAILURE;
-	auto cl_0 = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
 	if (g_with_hidden < 0)
 		g_with_hidden = !g_splice;
-	if (argc != 2) {
+	if (argp.nargs != 1) {
 		terse_help();
 		return EXIT_FAILURE;
 	}
@@ -1299,11 +1302,11 @@ int main(int argc, char **argv)
 	if (iconv_validate() != 0)
 		return EXIT_FAILURE;
 	textmaps_init(PKGDATADIR);
-	auto ret = do_file(argv[1]);
+	auto ret = do_file(argp.uarg[0]);
 	if (ret != 0) {
 		fprintf(stderr, "pff: Import unsuccessful.\n");
 		return EXIT_FAILURE;
 	}
-	fprintf(stderr, "pff: emitted %zu messages\n", g_msg_count);
+	fprintf(stderr, "pff: emitted %zu message(s)\n", g_msg_count);
 	return EXIT_SUCCESS;
 }

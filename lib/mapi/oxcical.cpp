@@ -41,7 +41,6 @@ using message_ptr = std::unique_ptr<MESSAGE_CONTENT, mc_delete>;
 
 namespace gromox {
 bool g_oxcical_allday_ymd = true; /* MS-OXCICAL v13 §2.1.3.1.1.20.8 p. 49. */
-bool oxcmail_exchsched_compat = false;
 }
 
 static constexpr char
@@ -843,7 +842,9 @@ static bool oxcical_parse_recipients(const ical_component &main_ev,
 			return false;
 		tmp_int32 = recipSendable;
 		if (is_organizer)
-			tmp_int32 |= recipOrganizer;
+			tmp_int32 |= recipOrganizer | recipOriginal;
+		else
+			tmp_int32 |= recipAddedByOrganizer;
 		if (pproplist->set(PR_RECIPIENT_FLAGS, &tmp_int32) != ecSuccess)
 			return false;
 	}
@@ -1052,6 +1053,19 @@ static bool oxcical_parse_subtype(namemap &phash, uint16_t *plast_propid,
 		pexception->overrideflags |= ARO_SUBTYPE;
 		pexception->subtype = 1;
 	}
+	return true;
+}
+
+static bool oxcical_set_stateflags(namemap &hash, uint16_t &last_propid,
+    MESSAGE_CONTENT &msg)
+{
+	uint32_t val = 0;
+	PROPERTY_NAME pn = {MNID_ID, PSETID_Appointment, PidLidAppointmentStateFlags};
+	if (namemap_add(hash, last_propid, std::move(pn)) != 0)
+		return false;
+	if (msg.proplist.set(PROP_TAG(PT_LONG, last_propid), &val) != ecSuccess)
+		return false;
+	++last_propid;
 	return true;
 }
 
@@ -1326,10 +1340,17 @@ static bool oxcical_parse_organizer(const ical_component &main_event,
 			paddress = nullptr;
 	}
 	pdisplay_name = piline->get_first_paramval("CN");
+	/*
+	 * Some clients omit the CN parameter, which would leave
+	 * PR_SENT_REPRESENTING_NAME unset. Outlook interprets a missing
+	 * PR_SENT_REPRESENTING_NAME as if the current user were the organizer,
+	 * which disables the response buttons. Fallback to filling it with the
+	 * email address.
+	 */
+	if (pdisplay_name == nullptr)
+		pdisplay_name = paddress;
 	if (pdisplay_name != nullptr) {
-		if (pmsg->proplist.set(PR_SENT_REPRESENTING_NAME, pdisplay_name) != ecSuccess)
-			return false;
-		if (oxcmail_exchsched_compat &&
+		if (pmsg->proplist.set(PR_SENT_REPRESENTING_NAME, pdisplay_name) != ecSuccess ||
 		    pmsg->proplist.set(PR_SENDER_NAME, pdisplay_name) != ecSuccess)
 			return false;
 	}
@@ -1353,15 +1374,12 @@ static bool oxcical_parse_organizer(const ical_component &main_event,
 	if (pmsg->proplist.set(PR_SENT_REPRESENTING_ADDRTYPE, "SMTP") != ecSuccess ||
 	    pmsg->proplist.set(PR_SENT_REPRESENTING_EMAIL_ADDRESS, paddress) != ecSuccess ||
 	    pmsg->proplist.set(PR_SENT_REPRESENTING_SMTP_ADDRESS, paddress) != ecSuccess ||
-	    pmsg->proplist.set(PR_SENT_REPRESENTING_ENTRYID, &tmp_bin) != ecSuccess)
+	    pmsg->proplist.set(PR_SENT_REPRESENTING_ENTRYID, &tmp_bin) != ecSuccess ||
+	    pmsg->proplist.set(PR_SENDER_ADDRTYPE, "SMTP") != ecSuccess ||
+	    pmsg->proplist.set(PR_SENDER_EMAIL_ADDRESS, paddress) != ecSuccess ||
+	    pmsg->proplist.set(PR_SENDER_SMTP_ADDRESS, paddress) != ecSuccess ||
+	    pmsg->proplist.set(PR_SENDER_ENTRYID, &tmp_bin) != ecSuccess)
 		return false;
-	if (oxcmail_exchsched_compat) {
-		if (pmsg->proplist.set(PR_SENDER_ADDRTYPE, "SMTP") != ecSuccess ||
-		    pmsg->proplist.set(PR_SENDER_EMAIL_ADDRESS, paddress) != ecSuccess ||
-		    pmsg->proplist.set(PR_SENDER_SMTP_ADDRESS, paddress) != ecSuccess ||
-		    pmsg->proplist.set(PR_SENDER_ENTRYID, &tmp_bin) != ecSuccess)
-			return false;
-	}
 	return true;
 }
 
@@ -1942,7 +1960,9 @@ static bool oxcical_parse_valarm(uint32_t reminder_delta, time_t start_time,
 static const ical_component *oxcical_main_event(const event_list_t &evlist, const char **err)
 {
 	*err = nullptr;
-	if (evlist.size() == 1)
+	if (evlist.size() == 0)
+		return nullptr;
+	else if (evlist.size() == 1)
 		return evlist.front();
 	const ical_component *main_event = nullptr;
 	for (const auto &event : evlist) {
@@ -1966,6 +1986,8 @@ static const ical_component *oxcical_main_event(const event_list_t &evlist, cons
 			return nullptr;
 		}
 	}
+	if (main_event == nullptr)
+		*err = "E-2739: Some VEVENT.RECURRENCE-ID points to a UID but there was no RRULE line anywhere";
 	return main_event;
 }
 
@@ -2163,10 +2185,12 @@ static const char *oxcical_import_internal(const char *str_zone, const char *met
 	    start_itime.type != itime_type::utc && start_itime.hour == 0 &&
 	    start_itime.minute == 0 && start_itime.second == 0 &&
 	    end_itime.hour == 0 && end_itime.minute == 0 &&
-	    end_itime.second == 0 && end_itime.delta_day(start_itime) == 1)
+	    end_itime.second == 0)
 		b_allday = true;
 	if (b_allday && !oxcical_parse_subtype(phash, &last_propid, pmsg, pexception))
 		return "E-2704: oxcical_parse_subtype returned an unspecified error";
+	if (!oxcical_set_stateflags(phash, last_propid, *pmsg))
+		return "E-2739";
 
 	ical_time itime{};
 	piline = pmain_event->get_line("RECURRENCE-ID");
@@ -2465,6 +2489,136 @@ static bool oxcical_import_events(const char *str_zone, uint16_t calendartype,
 	return true;
 }
 
+#define E_2201 "E-2201: get_propids failed for an unspecified reason"
+
+static const char *oxcical_import_todo(const ical &pical,
+    const ical_component &comp, EXT_BUFFER_ALLOC alloc,
+    GET_PROPIDS get_propids, MESSAGE_CONTENT *pmsg)
+{
+	static constexpr uint8_t le_true = 1;
+	namemap phash;
+	uint16_t last_propid = 0x8000;
+	if (!oxcical_parse_categories(comp, phash, &last_propid, pmsg))
+		return "E-2191: oxcical_parse_categories returned an unspecified error";
+	if (!oxcical_parse_class(comp, pmsg))
+		return "E-2192: oxcical_parse_class returned an unspecified error";
+	if (!oxcical_parse_body(comp, "", pmsg))
+		return "E-2705: oxcical_parse_body returned an unspecified error";
+	if (!oxcical_parse_html(comp, pmsg))
+		return "E-2193: oxcical_parse_html returned an unspecified error";
+	if (!oxcical_parse_dtstamp(comp, "", phash, &last_propid, pmsg))
+		return "E-2194: oxcical_parse_dtstamp returned an unspecified error";
+	if (!oxcical_parse_summary(comp, pmsg, alloc, nullptr, nullptr))
+		return "E-2706: oxcical_parse_summary returned an unspecified error";
+
+	const PROPERTY_NAME namequeries[] = {
+		{MNID_ID, PSETID_Task, PidLidTaskStatus},
+		{MNID_ID, PSETID_Task, PidLidPercentComplete},
+		{MNID_ID, PSETID_Task, PidLidTaskStartDate},
+		{MNID_ID, PSETID_Task, PidLidTaskDueDate},
+		{MNID_ID, PSETID_Task, PidLidTaskDateCompleted},
+		{MNID_ID, PSETID_Task, PidLidTaskComplete},
+	};
+	enum { l_status = 0, l_pct, l_start, l_due, l_completed, l_completeflag };
+	static_assert(l_completeflag + 1 == std::size(namequeries));
+	const PROPNAME_ARRAY propnames = {std::size(namequeries), deconst(namequeries)};
+	PROPID_ARRAY propids;
+	if (!get_propids(&propnames, &propids) || propids.size() != propnames.size())
+		return E_2201;
+
+	auto line = comp.get_line("STATUS");
+	if (line != nullptr) {
+		auto val = line->get_first_subvalue();
+		if (val != nullptr) {
+			uint32_t v;
+			if (strcasecmp(val, "NEEDS-ACTION") == 0)
+				v = tsvNotStarted;
+			else if (strcasecmp(val, "COMPLETED") == 0)
+				v = tsvComplete;
+			else if (strcasecmp(val, "IN-PROGRESS") == 0)
+				v = tsvInProgress;
+			else if (strcasecmp(val, "CANCELLED") == 0)
+				v = tsvDeferred;
+			else
+				v = tsvNotStarted;
+			pmsg->proplist.set(PROP_TAG(PT_LONG, propids[l_status]), &v);
+			if (v == tsvComplete)
+				pmsg->proplist.set(PROP_TAG(PT_BOOLEAN, propids[l_completeflag]), &le_true);
+		}
+	}
+
+	line = comp.get_line("PERCENT-COMPLETE");
+	if (line != nullptr) {
+		auto val = line->get_first_subvalue();
+		if (val != nullptr) {
+			double d = strtod(val, nullptr) / 100.0;
+			pmsg->proplist.set(PROP_TAG(PT_DOUBLE, propids[l_pct]), &d);
+		}
+	}
+
+	line = comp.get_line("DTSTART");
+	if (line != nullptr) {
+		auto tzid = line->get_first_paramval("TZID");
+		const ical_component *tzc = tzid != nullptr ? oxcical_find_vtimezone(pical, tzid) : nullptr;
+		ical_time itime{};
+		time_t utctime;
+		if (oxcical_parse_dtvalue(tzc, *line, &itime, &utctime)) {
+			auto ntt = rop_util_unix_to_nttime(utctime);
+			pmsg->proplist.set(PROP_TAG(PT_SYSTIME, propids[l_start]), &ntt);
+		}
+	}
+
+	line = comp.get_line("DUE");
+	if (line != nullptr) {
+		auto tzid = line->get_first_paramval("TZID");
+		const ical_component *tzc = tzid != nullptr ? oxcical_find_vtimezone(pical, tzid) : nullptr;
+		ical_time itime{};
+		time_t utctime;
+		if (oxcical_parse_dtvalue(tzc, *line, &itime, &utctime)) {
+			auto ntt = rop_util_unix_to_nttime(utctime);
+			pmsg->proplist.set(PROP_TAG(PT_SYSTIME, propids[l_due]), &ntt);
+		}
+	}
+
+	line = comp.get_line("COMPLETED");
+	if (line != nullptr) {
+		auto tzid = line->get_first_paramval("TZID");
+		const ical_component *tzc = tzid != nullptr ? oxcical_find_vtimezone(pical, tzid) : nullptr;
+		ical_time itime{};
+		time_t utctime;
+		if (oxcical_parse_dtvalue(tzc, *line, &itime, &utctime)) {
+			auto ntt = rop_util_unix_to_nttime(utctime);
+			pmsg->proplist.set(PROP_TAG(PT_SYSTIME, propids[l_completed]), &ntt);
+			pmsg->proplist.set(PROP_TAG(PT_BOOLEAN, propids[l_completeflag]), &le_true);
+		}
+	}
+
+	ical_time itime{};
+	oxcical_parse_uid(comp, itime, alloc, phash, &last_propid, pmsg);
+	return nullptr;
+}
+
+static const char *oxcical_import_journal(const ical &pical,
+    const ical_component &comp, EXT_BUFFER_ALLOC alloc,
+    MESSAGE_CONTENT *pmsg)
+{
+	namemap phash;
+	uint16_t last_propid = 0x8000;
+	if (!oxcical_parse_categories(comp, phash, &last_propid, pmsg))
+		return "E-2191: oxcical_parse_categories returned an unspecified error";
+	if (!oxcical_parse_class(comp, pmsg))
+		return "E-2192: oxcical_parse_class returned an unspecified error";
+	if (!oxcical_parse_body(comp, "", pmsg))
+		return "E-2705: oxcical_parse_body returned an unspecified error";
+	if (!oxcical_parse_html(comp, pmsg))
+		return "E-2193: oxcical_parse_html returned an unspecified error";
+	if (!oxcical_parse_dtstamp(comp, "", phash, &last_propid, pmsg))
+		return "E-2194: oxcical_parse_dtstamp returned an unspecified error";
+	if (!oxcical_parse_summary(comp, pmsg, alloc, nullptr, nullptr))
+		return "E-2706: oxcical_parse_summary returned an unspecified error";
+	return nullptr;
+}
+
 /**
  * Build a by-UID lookup map for @pical.
  *
@@ -2476,7 +2630,9 @@ static bool oxcical_classify_calendar(const ical &pical, uidxevent_list_t &ul) t
 {
 	for (const auto &comp : pical.component_list) {
 		auto pcomponent = &comp;
-		if (strcasecmp(pcomponent->m_name.c_str(), "VEVENT") != 0)
+		if (strcasecmp(pcomponent->m_name.c_str(), "VEVENT") != 0 &&
+		    strcasecmp(pcomponent->m_name.c_str(), "VTODO") != 0 &&
+                    strcasecmp(pcomponent->m_name.c_str(), "VJOURNAL") != 0)
 			continue;
 		auto piline = pcomponent->get_line("UID");
 		auto puid = piline != nullptr ? piline->get_first_subvalue() : nullptr;
@@ -2560,6 +2716,40 @@ ec_error_t oxcical_import_multi(const char *str_zone, const ical &pical,
 	    uid_list.size() == 0) {
 		mlog(LV_ERR, "E-2412: iCal import data contained no VEVENTs with UIDs");
 		return ecNotFound;
+	}
+	auto first_comp = uid_list.begin()->second.front();
+	if (strcasecmp(first_comp->m_name.c_str(), "VTODO") == 0) {
+		message_ptr msg(message_content_init());
+		if (msg == nullptr)
+			return ecMAPIOOM;
+		msgvec.push_back(std::move(msg));
+		auto pmsg = msgvec.back().get();
+		if (pmsg->proplist.set(PR_MESSAGE_CLASS, "IPM.Task") != ecSuccess)
+			return ecError;
+		auto err = oxcical_import_todo(pical, *first_comp, alloc,
+			  get_propids, pmsg);
+		if (err != nullptr) {
+			mlog(LV_ERR, "%s", err);
+			return ecError;
+		}
+		finalvec.insert(finalvec.end(), std::make_move_iterator(msgvec.begin()), std::make_move_iterator(msgvec.end()));
+		return ecSuccess;
+	} else if (strcasecmp(first_comp->m_name.c_str(), "VJOURNAL") == 0) {
+		message_ptr msg(message_content_init());
+		if (msg == nullptr)
+			return ecMAPIOOM;
+		msgvec.push_back(std::move(msg));
+		auto pmsg = msgvec.back().get();
+		if (pmsg->proplist.set(PR_MESSAGE_CLASS, "IPM.Activity") != ecSuccess)
+			return ecError;
+		auto err = oxcical_import_journal(pical, *first_comp, alloc,
+			  pmsg);
+		if (err != nullptr) {
+			mlog(LV_ERR, "%s", err);
+			return ecError;
+		}
+		finalvec.insert(finalvec.end(), std::make_move_iterator(msgvec.begin()), std::make_move_iterator(msgvec.end()));
+		return ecSuccess;
 	}
 	piline = pical.get_line("METHOD");
 	if (piline == nullptr) {
@@ -3173,8 +3363,6 @@ static void oxcical_export_organizer(const MESSAGE_CONTENT &msg,
 		line->append_param("CN", str);
 }
 
-#define E_2201 "E-2201: get_propids failed for an unspecified reason"
-
 static const char *oxcical_export_uid(const MESSAGE_CONTENT &msg,
     ical_component &com, EXT_BUFFER_ALLOC alloc, GET_PROPIDS get_propids)
 {
@@ -3489,6 +3677,7 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 	auto icaltype = "VEVENT";
 	const char *partstat = nullptr;
 	bool b_proposal = false, b_exceptional = true, b_recurrence = false;
+	bool is_task = false;
 	if (method == nullptr) {
 		b_exceptional = false;
 		if (class_match_prefix(str, "IPM.Appointment") == 0) {
@@ -3516,12 +3705,11 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 			partstat = "NEEDS-ACTION";
 		} else if (class_match_prefix(str, "IPM.Task") == 0) {
 			method = "";
-			icaltype = nullptr;
-			pical.m_name = "VTODO";
+			icaltype = "VTODO";
+			is_task = true;
 		} else if (class_match_prefix(str, "IPM.Activity") == 0) {
 			method = "";
-			icaltype = nullptr;
-			pical.m_name = "VJOURNAL";
+			icaltype = "VJOURNAL";
 		} else {
 			return fmt::format("W-2060: oxcical_export does not handle message class \"{}\"", str);
 		}
@@ -3743,10 +3931,12 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 			ptz_component != nullptr ? tzid : nullptr);
 	}
 
-	err = oxcical_export_task(*pmsg, *pcomponent, ptz_component,
-	      tzid, get_propids);
-	if (err != nullptr)
-		return err;
+	if (is_task) {
+		err = oxcical_export_task(*pmsg, *pcomponent, ptz_component,
+		      tzid, get_propids);
+		if (err != nullptr)
+			return err;
+	}
 
 	auto sa = pmsg->proplist.get<const STRING_ARRAY>(PROP_TAG(PT_MV_UNICODE, propids[l_keywords]));
 	if (sa != nullptr) {

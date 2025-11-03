@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 #include <gromox/common_types.hpp>
 #include <gromox/defs.h>
 #include <gromox/element_data.hpp>
@@ -119,10 +120,10 @@ enum class exmdb_callid : uint8_t {
 	allocate_message_id = 0x5b,
 	allocate_cn = 0x5c,
 	mark_modified = 0x5d,
-	get_message_group_id = 0x5e,
-	set_message_group_id = 0x5f,
-	save_change_indices = 0x60,
-	get_change_indices = 0x61,
+	// get_pgm_id = 0x5e,
+	// set_pgm_id = 0x5f,
+	// save_change_pgrp = 0x60,
+	// get_change_pgrp = 0x61,
 	try_mark_submit = 0x62,
 	clear_submit = 0x63,
 	link_message = 0x64,
@@ -135,7 +136,7 @@ enum class exmdb_callid : uint8_t {
 	empty_folder_rule = 0x6b,
 	update_folder_rule = 0x6c,
 	// deliver_message_v1 = 0x6d,
-	write_message = 0x6e,
+	// write_message_v1 = 0x6e,
 	read_message = 0x6f,
 	get_content_sync = 0x70,
 	get_hierarchy_sync = 0x71,
@@ -166,11 +167,15 @@ enum class exmdb_callid : uint8_t {
 	recalc_store_size = 0x8a,
 	movecopy_folder = 0x8b,
 	create_folder = 0x8c,
-	write_message_v2 = 0x8d,
+	// write_message_v2 = 0x8d,
 	imapfile_read = 0x8e,
 	imapfile_write = 0x8f,
 	imapfile_delete = 0x90,
 	cgkreset = 0x91,
+	write_message /* v3 */ = 0x92,
+	set_maintenance = 0x93,
+	autoreply_getprop = 0x94,
+	autoreply_setprop = 0x95,
 	/* update exch/exmdb/names.cpp:exmdb_rpc_idtoname! */
 };
 
@@ -217,6 +222,10 @@ struct exreq_set_store_properties final : public exreq {
 	cpid_t cpid;
 	TPROPVAL_ARRAY *ppropvals;
 };
+
+/* @cpid fields unused, always CP_UTF8 */
+using exreq_autoreply_getprop = exreq_get_store_properties;
+using exreq_autoreply_setprop = exreq_set_store_properties;
 
 struct exreq_remove_store_properties final : public exreq {
 	PROPTAG_ARRAY *pproptags;
@@ -671,27 +680,6 @@ struct exreq_allocate_message_id final : public exreq {
 	uint64_t folder_id;
 };
 
-struct exreq_get_message_group_id final : public exreq {
-	uint64_t message_id;
-};
-
-struct exreq_set_message_group_id final : public exreq {
-	uint64_t message_id;
-	uint32_t group_id;
-};
-
-struct exreq_save_change_indices final : public exreq {
-	uint64_t message_id;
-	uint64_t cn;
-	INDEX_ARRAY *pindices;
-	PROPTAG_ARRAY *pungroup_proptags;
-};
-
-struct exreq_get_change_indices final : public exreq {
-	uint64_t message_id;
-	uint64_t cn;
-};
-
 struct exreq_mark_modified final : public exreq {
 	uint64_t message_id;
 };
@@ -770,11 +758,11 @@ struct exreq_deliver_message final : public exreq {
 };
 
 struct exreq_write_message final : public exreq {
-	cpid_t cpid;
-	uint64_t folder_id;
-	MESSAGE_CONTENT *pmsgctnt;
+	cpid_t cpid{};
+	uint64_t folder_id = 0;
+	MESSAGE_CONTENT *pmsgctnt = nullptr;
+	std::string digest;
 };
-using exreq_write_message_v2 = exreq_write_message;
 
 struct exreq_read_message final : public exreq {
 	char *username;
@@ -864,6 +852,14 @@ struct exreq_imapfile_write final : public exreq {
 	std::string type, mid, data;
 };
 
+enum class db_maint_mode {
+	usable, hold, reject, hold_waitforexcl, reject_waitforexcl,
+};
+
+struct exreq_set_maintenance final : public exreq {
+	uint32_t mode = 0;
+};
+
 /**
  * FOLDERS:     process folders
  * MESSAGES:    process messages
@@ -921,6 +917,9 @@ struct exresp_get_store_properties final : public exresp {
 struct exresp_set_store_properties final : public exresp {
 	PROBLEM_ARRAY problems;
 };
+
+using exresp_autoreply_getprop = exresp_get_store_properties;
+using exresp_autoreply_setprop = exresp_set_store_properties;
 
 struct exresp_get_mbox_perm final : public exresp {
 	uint32_t permission;
@@ -1225,15 +1224,6 @@ struct exresp_allocate_cn final : public exresp {
 	uint64_t cn;
 };
 
-struct exresp_get_message_group_id final : public exresp {
-	uint32_t *pgroup_id;
-};
-
-struct exresp_get_change_indices final : public exresp {
-	INDEX_ARRAY indices;
-	PROPTAG_ARRAY ungroup_proptags;
-};
-
 struct exresp_try_mark_submit final : public exresp {
 	BOOL b_marked;
 };
@@ -1316,13 +1306,18 @@ struct exresp_autoreply_tsquery final : public exresp {
 	uint64_t tdiff = 0;
 };
 
-struct exresp_write_message_v2 final : public exresp {
+struct exresp_write_message final : public exresp {
 	uint64_t outmid = 0, outcn = 0;
 	ec_error_t e_result{};
 };
 
 struct exresp_imapfile_read final : public exresp {
 	std::string data;
+};
+
+struct exresp_purge_softdelete final : public exresp {
+	uint32_t cnt_folders = 0, cnt_messages = 0;
+	uint64_t sz_normal = 0, sz_fai = 0;
 };
 
 using exreq_ping_store = exreq;
@@ -1345,8 +1340,6 @@ using exresp_update_message_instance_rcpts = exresp;
 using exresp_empty_message_instance_attachments = exresp;
 using exresp_set_message_instance_conflict = exresp;
 using exresp_remove_message_properties = exresp;
-using exresp_set_message_group_id = exresp;
-using exresp_save_change_indices = exresp;
 using exresp_remove_store_properties = exresp;
 using exresp_mark_modified = exresp;
 using exresp_clear_submit = exresp;
@@ -1362,16 +1355,16 @@ using exresp_vacuum = exresp;
 using exresp_unload_store = exresp;
 using exresp_ping_store = exresp;
 using exresp_notify_new_mail = exresp;
-using exresp_purge_softdelete = exresp;
+
 using exresp_purge_datafiles = exresp;
 using exresp_autoreply_tsupdate = exresp;
 using exresp_recalc_store_size = exresp;
 using exresp_flush_instance = exresp_error;
-using exresp_write_message = exresp_error;
 using exresp_movecopy_folder = exresp_error;
 using exresp_imapfile_write = exresp;
 using exresp_imapfile_delete = exresp;
 using exresp_cgkreset = exresp;
+using exresp_set_maintenance = exresp;
 
 struct DB_NOTIFY_DATAGRAM {
 	char *dir = nullptr;

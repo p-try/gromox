@@ -15,7 +15,6 @@
 #include <gromox/defs.h>
 #include <gromox/mail_func.hpp>
 #include <gromox/mapidefs.h>
-#include <gromox/msgchg_grouping.hpp>
 #include <gromox/paths.h>
 #include <gromox/proc_common.h>
 #include <gromox/rop_util.hpp>
@@ -44,6 +43,7 @@ static DCERPC_ENDPOINT *ep_6001;
 
 static constexpr cfg_directive emsmdb_gxcfg_dflt[] = {
 	{"backfill_transport_headers", "0", CFG_BOOL},
+	{"emsmdb_compress_threshold", "-1", CFG_SIZE},
 	{"outgoing_smtp_url", "sendmail://localhost"},
 	{"reported_server_version", "15.00.0847.4040"},
 	CFG_TABLE_END,
@@ -58,15 +58,14 @@ static constexpr cfg_directive emsmdb_cfg_defaults[] = {
 	{"ems_max_pending_sesnotif", "1K", CFG_SIZE, "0"},
 	{"emsmdb_max_cxh_per_user", "100", CFG_SIZE, "100"},
 	{"emsmdb_max_obh_per_session", "500", CFG_SIZE, "500"},
-	{"emsmdb_private_folder_softdelete", "0", CFG_BOOL},
+	{"emsmdb_private_folder_softdelete", "1", CFG_BOOL},
 	{"emsmdb_rop_chaining", "1"},
 	{"mailbox_ping_interval", "5min", CFG_TIME, "60s", "1h"},
 	{"max_ext_rule_length", "510K", CFG_SIZE, "1"},
 	{"max_mail_length", "64M", CFG_SIZE, "1"},
-	{"max_mail_num", "1000000", CFG_SIZE, "1"},
 	{"max_rcpt_num", "256", CFG_SIZE, "1"},
 	{"rop_debug", "0"},
-	{"submit_command", "/usr/bin/php " PKGDATADIR "/sa/submit.php"},
+	{"submit_command", "/usr/bin/php " PKGDATADIR "/submit.php"},
 	{"x500_org_name", "Gromox default"},
 	CFG_TABLE_END,
 };
@@ -82,6 +81,7 @@ static bool exch_emsmdb_reload(std::shared_ptr<CONFIG_FILE> gxcfg,
 		return false;
 	}
 	emsmdb_backfill_transporthdr = gxcfg->get_ll("backfill_transport_headers");
+	emsmdb_compress_threshold = gxcfg->get_ll("emsmdb_compress_threshold");
 	auto str = znul(gxcfg->get_value("reported_server_version"));
 	auto &ver = server_normal_version;
 	memset(ver, 0, sizeof(ver));
@@ -126,7 +126,6 @@ static constexpr DCERPC_INTERFACE interface_async_emsmdb = {
 extern void emsmdb_report();
 BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 {
-	int max_mail;
 	int max_rcpt;
 	int async_num;
 	int max_rule_len;
@@ -162,7 +161,6 @@ BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 			return false;
 		gx_strlcpy(org_name, pfile->get_value("x500_org_name"), std::size(org_name));
 		max_rcpt = pfile->get_ll("max_rcpt_num");
-		max_mail = pfile->get_ll("max_mail_num");
 		char max_length_s[32], max_rule_len_s[32], ping_int_s[32];
 		auto max_length = pfile->get_ll("max_mail_length");
 		max_rule_len = pfile->get_ll("max_ext_rule_length");
@@ -183,10 +181,10 @@ BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 		async_num = pfile->get_ll("async_threads_num");
 
 		mlog(LV_INFO, "emsmdb: x500=\"%s\", max_rcpt=%d, "
-		        "max_mail=%d, max_mail_len=%s, max_ext_rule_len=%s, "
+		        "max_mail_len=%s, max_ext_rule_len=%s, "
 		        "ping_int=%s, async_threads=%d, smtp=%s",
 		       org_name, max_rcpt,
-		       max_mail, max_length_s, max_rule_len_s, ping_int_s,
+		       max_length_s, max_rule_len_s, ping_int_s,
 		       async_num, smtp_url.c_str());
 		
 #define regsvr(f) register_service(#f, f)
@@ -213,7 +211,7 @@ BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 			mlog(LV_ERR, "emsmdb: failed to register emsmdb interface");
 			return FALSE;
 		}
-		common_util_init(org_name, max_rcpt, max_mail, max_length,
+		common_util_init(org_name, max_rcpt, max_length,
 			max_rule_len, std::move(smtp_url), submit_command);
 		rop_processor_init(ping_interval);
 		emsmdb_interface_init();
@@ -229,10 +227,6 @@ BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 		}
 		if (exmdb_client->run() != 0) {
 			mlog(LV_ERR, "emsmdb: failed to run exmdb client");
-			return FALSE;
-		}
-		if (msgchg_grouping_run(get_data_path()) != 0) {
-			mlog(LV_ERR, "emsmdb: failed to run msgchg grouping");
 			return FALSE;
 		}
 		if (0 != emsmdb_interface_run()) {

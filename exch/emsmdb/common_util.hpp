@@ -11,7 +11,6 @@
 #include <gromox/util.hpp>
 #define NOTIFY_RECEIPT_READ							1
 #define NOTIFY_RECEIPT_NON_READ						2
-#define MINIMUM_COMPRESS_SIZE						0x100
 #define STORE_OWNER_GRANTED nullptr
 
 DECLARE_PROC_API(emsmdb, extern);
@@ -88,16 +87,15 @@ BOOL common_util_convert_tagged_propval(
 BOOL common_util_convert_restriction(BOOL to_unicode, RESTRICTION *pres);
 BOOL common_util_convert_rule_actions(BOOL to_unicode, RULE_ACTIONS *pactions);
 extern void common_util_notify_receipt(const char *username, int type, message_content *brief);
-extern BOOL common_util_save_message_ics(logon_object *plogon, uint64_t msg_id, PROPTAG_ARRAY *changed_tags);
 extern ec_error_t ems_send_mail(MAIL *, const char *sender, const std::vector<std::string> &rcpts);
 extern ec_error_t ems_send_vmail(vmime::shared_ptr<vmime::message>, const char *sender, const std::vector<std::string> &rcpts);
-extern ec_error_t cu_send_message(logon_object *, message_object *, bool submit);
+extern ec_error_t cu_send_message(logon_object *, message_object *, const char *ev_from);
 extern bool bounce_producer_make(bool (*)(const char *, char *, size_t), bool (*)(const char *, char *, size_t), bool (*)(const char *, char *, size_t), const char *user, message_content *, const char *bounce_type, MAIL *);
 
 extern int (*common_util_add_timer)(const char *command, int interval);
 extern BOOL (*common_util_cancel_timer)(int timer_id);
 
-extern void common_util_init(const char *org_name, unsigned int max_rcpt, unsigned int max_msg, size_t max_mail_len, unsigned int max_rule_len, std::string &&smtp_url, const char *submit_cmd);
+extern void common_util_init(const char *org_name, unsigned int max_rcpt, size_t max_mail_len, unsigned int max_rule_len, std::string &&smtp_url, const char *submit_cmd);
 extern int common_util_run();
 extern const char *common_util_get_submit_command();
 extern uint32_t common_util_get_ftstream_id();
@@ -106,7 +104,7 @@ extern ec_error_t replid_to_replguid(const logon_object &, uint16_t, GUID &);
 extern ec_error_t replguid_to_replid(const logon_object &, const GUID &, uint16_t &);
 
 extern size_t g_max_mail_len;
-extern unsigned int g_max_rcpt, g_max_message;
+extern unsigned int g_max_rcpt;
 extern unsigned int g_max_rule_len, g_max_extrule_len;
 extern char g_emsmdb_org_name[256];
 

@@ -457,7 +457,6 @@ static errno_t do_message(libolecf_item_t *msg_dir, MESSAGE_CONTENT &ctnt, mapi_
 	auto cset = cpid_to_cset(static_cast<cpid_t>(cpid));
 	if (cset == nullptr)
 		cset = "ascii";
-	fprintf(stderr, "Using codepage %s for 8-bit strings\n", cset);
 	auto ret = parse_propstrm(ep, cset, msg_dir, ctnt.proplist);
 	if (ret < 0)
 		return -ret;
@@ -583,7 +582,7 @@ static errno_t do_file(const char *filename) try
 			return ret;
 	}
 
-	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0003", 8) < 0)
+	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0004", 8) < 0)
 		throw YError("PG-1014: %s", strerror(errno));
 	uint8_t flag = false;
 	if (HXio_fullwrite(STDOUT_FILENO, &flag, sizeof(flag)) < 0) /* splice flag */
@@ -612,7 +611,9 @@ static errno_t do_file(const char *filename) try
 	    ep.p_uint32(1) != pack_result::ok ||
 	    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
 	    ep.p_uint64(parent.folder_id) != pack_result::ok ||
-	    ep.p_msgctnt(*ctnt) != pack_result::ok) {
+	    ep.p_msgctnt(*ctnt) != pack_result::ok ||
+	    ep.p_str("") != pack_result::ok ||
+	    ep.p_str("") != pack_result::ok) {
 		fprintf(stderr, "E-2006\n");
 		return EXIT_FAILURE;
 	}
@@ -642,12 +643,12 @@ static void terse_help()
 
 int main(int argc, char **argv)
 {
+	HXopt6_auto_result argp;
 	setvbuf(stdout, nullptr, _IOLBF, 0);
-	if (HX_getopt5(g_options_table, argv, &argc, &argv,
-	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS)
+	if (HX_getopt6(g_options_table, argc, argv, &argp,
+	    HXOPT_USAGEONERR | HXOPT_ITER_ARGS) != HXOPT_ERR_SUCCESS)
 		return EXIT_FAILURE;
-	auto cl_0a = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
-	if (argc != 2) {
+	if (argp.nargs != 1) {
 		terse_help();
 		return EXIT_FAILURE;
 	}
@@ -661,7 +662,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	textmaps_init(PKGDATADIR);
 
-	auto ret = do_file(argv[1]);
+	auto ret = do_file(argp.uarg[0]);
 	if (ret != 0) {
 		fprintf(stderr, "oxm2mt: Import unsuccessful.\n");
 		return EXIT_FAILURE;

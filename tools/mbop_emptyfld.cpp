@@ -18,22 +18,16 @@ using namespace gromox;
 namespace emptyfld {
 
 static unsigned int g_del_flags = DEL_MESSAGES | DELETE_HARD_DELETE, g_recurse, g_delempty;
-static char *g_time_str;
 static mapitime_t g_cutoff_time;
 
-static void opt_m(const struct HXoptcb *cb) { g_del_flags &= ~DEL_MESSAGES; }
-static void opt_nuke(const struct HXoptcb *cb) { g_del_flags |= DEL_FOLDERS; }
-static void opt_a(const struct HXoptcb *cb) { g_del_flags |= DEL_ASSOCIATED; }
-static void opt_s(const struct HXoptcb *cb) { g_del_flags &= ~DELETE_HARD_DELETE; }
-
 static constexpr HXoption g_options_table[] = {
-	{nullptr, 'M', HXTYPE_NONE, {}, {}, opt_m, 0, "Exclude normal messages from deletion"},
-	{nullptr, 'R', HXTYPE_NONE, &g_recurse, {}, {}, 0, "Recurse into subfolders to delete messages"},
-	{"delempty", 0, HXTYPE_NONE, &g_delempty, {}, {}, 0, "Delete subfolders which are empty"},
-	{"nuke-folders", 0, HXTYPE_NONE, {}, {}, opt_nuke, 0, "Do not recurse but delete subfolders outright"},
-	{nullptr, 'a', HXTYPE_NONE, {}, {}, opt_a, 0, "Include associated messages in deletion"},
-	{nullptr, 't', HXTYPE_STRING, &g_time_str, {}, {}, 0, "Messages need to be older than...", "TIMESPEC"},
-	{"soft",    0, HXTYPE_NONE, {}, {}, opt_s, 0, "Soft-delete (experimental)"},
+	{{}, 'M', HXTYPE_NONE, {}, {}, {}, 'M', "Exclude normal messages from deletion"},
+	{{}, 'R', HXTYPE_NONE, {}, {}, {}, 'R', "Recurse into subfolders to delete messages"},
+	{"delempty", 0, HXTYPE_NONE, {}, {}, {}, '1', "Delete subfolders which are empty"},
+	{"nuke-folders", 0, HXTYPE_NONE, {}, {}, {}, '2', "Do not recurse but delete subfolders outright"},
+	{{}, 'a', HXTYPE_NONE, {}, {}, {}, 'a', "Include associated messages in deletion"},
+	{{}, 't', HXTYPE_STRING, {}, {}, {}, 't', "Messages need to be older than...", "TIMESPEC"},
+	{"soft", 0, HXTYPE_NONE, {}, {}, {}, '3', "Soft-delete"},
 	MBOP_AUTOHELP,
 	HXOPT_TABLEEND,
 };
@@ -46,7 +40,7 @@ static int generic_del(eid_t fid, const std::vector<uint64_t> &chosen)
 	ea.pids  = deconst(chosen.data());
 	if (!exmdb_client->delete_messages(g_storedir, CP_ACP, nullptr, fid,
 	    &ea, false, &partial_complete)) {
-		fprintf(stderr, "fid 0x%llx delete_messages failed\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx delete_messages failed\n", LLU{rop_util_get_gc_value(fid)});
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -64,7 +58,7 @@ static int select_mids_by_time(eid_t fid, unsigned int tbl_flags,
 	RESTRICTION rst_e = {RES_AND, {deconst(&rst_d)}};
 	if (!exmdb_client->load_content_table(g_storedir, CP_ACP, fid, nullptr,
 	    tbl_flags, &rst_e, nullptr, &table_id, &row_count)) {
-		fprintf(stderr, "fid 0x%llx load_content_table failed\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx load_content_table failed\n", LLU{rop_util_get_gc_value(fid)});
 		return EXIT_FAILURE;
 	}
 	auto cl_0 = HX::make_scope_exit([&]() { exmdb_client->unload_table(g_storedir, table_id); });
@@ -73,7 +67,7 @@ static int select_mids_by_time(eid_t fid, unsigned int tbl_flags,
 	tarray_set rowset{};
 	if (!exmdb_client->query_table(g_storedir, nullptr, CP_ACP, table_id,
 	    &mtaghdr, 0, row_count, &rowset)) {
-		fprintf(stderr, "fid 0x%llx query_table failed\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx query_table failed\n", LLU{rop_util_get_gc_value(fid)});
 		return EXIT_FAILURE;
 	}
 	for (const auto &row : rowset) {
@@ -101,7 +95,7 @@ static int do_hierarchy(eid_t fid, uint32_t depth)
 	auto cl_0 = HX::make_scope_exit([&]() {
 		uint32_t curr_delc, curr_fldc;
 		delcount(fid, &curr_delc, &curr_fldc);
-		printf("Folder 0x%llx: deleted %d messages\n", LLU{rop_util_get_gc_value(fid)}, curr_delc - prev_delc);
+		printf("Folder 0x%llx: deleted %d message(s)\n", LLU{rop_util_get_gc_value(fid)}, curr_delc - prev_delc);
 	});
 	if (g_del_flags & DEL_MESSAGES) {
 		auto ret = do_contents(fid, 0);
@@ -119,7 +113,7 @@ static int do_hierarchy(eid_t fid, uint32_t depth)
 	uint32_t table_id = 0, row_count = 0;
 	if (!exmdb_client->load_hierarchy_table(g_storedir, fid,
 	    nullptr, 0, nullptr, &table_id, &row_count)) {
-		fprintf(stderr, "fid 0x%llx load_content_table failed\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx load_content_table failed\n", LLU{rop_util_get_gc_value(fid)});
 		return EXIT_FAILURE;
 	}
 	auto cl_1 = HX::make_scope_exit([=]() { exmdb_client->unload_table(g_storedir, table_id); });
@@ -128,7 +122,7 @@ static int do_hierarchy(eid_t fid, uint32_t depth)
 	tarray_set rowset{};
 	if (!exmdb_client->query_table(g_storedir, nullptr, CP_ACP, table_id,
 	    &ftaghdr, 0, row_count, &rowset)) {
-		fprintf(stderr, "fid 0x%llx query_table failed\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx query_table failed\n", LLU{rop_util_get_gc_value(fid)});
 		return EXIT_FAILURE;
 	}
 	exmdb_client->unload_table(g_storedir, table_id);
@@ -145,7 +139,7 @@ static int do_hierarchy(eid_t fid, uint32_t depth)
 	static constexpr PROPTAG_ARRAY ftaghdr2 = {std::size(ftags2), deconst(ftags2)};
 	TPROPVAL_ARRAY props{};
 	if (!exmdb_client->get_folder_properties(g_storedir, CP_ACP, fid, &ftaghdr2, &props)) {
-		fprintf(stderr, "fid 0x%llx get_folder_props failed\n", LLU{fid});
+		mbop_fprintf(stderr, "fid 0x%llx get_folder_props failed\n", LLU{fid});
 		return EXIT_FAILURE;
 	}
 	auto p1 = props.get<const uint32_t>(PR_CONTENT_COUNT);
@@ -159,53 +153,66 @@ static int do_hierarchy(eid_t fid, uint32_t depth)
 	BOOL b_result = false;
 	if (!exmdb_client->delete_folder(g_storedir, CP_ACP, fid,
 	    g_del_flags & DELETE_HARD_DELETE, &b_result)) {
-		fprintf(stderr, "fid 0x%llx delete_folder RPC rejected/malformed\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx delete_folder RPC rejected/malformed\n", LLU{rop_util_get_gc_value(fid)});
 		return EXIT_FAILURE;
 	} else if (!b_result) {
-		fprintf(stderr, "fid 0x%llx delete_folder unsuccessful (no permissions etc.)\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "fid 0x%llx delete_folder unsuccessful (no permissions etc.)\n", LLU{rop_util_get_gc_value(fid)});
 	} else {
-		fprintf(stderr, "Folder 0x%llx: deleted due to --delempty\n", LLU{rop_util_get_gc_value(fid)});
+		mbop_fprintf(stderr, "Folder 0x%llx: deleted due to --delempty\n", LLU{rop_util_get_gc_value(fid)});
 	}
 	return EXIT_SUCCESS;
 }
 
 int main(int argc, char **argv)
 {
-	if (HX_getopt5(g_options_table, argv, &argc, &argv,
-	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
+	const char *g_time_str = nullptr;
+	HXopt6_auto_result result;
+	if (HX_getopt6(g_options_table, argc, argv, &result, HXOPT_USAGEONERR |
+	    HXOPT_ITER_OA) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
 		return EXIT_PARAM;
-	auto cl_0 = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
+	for (int i = 0; i < result.nopts; ++i)
+		switch (result.desc[i]->val) {
+		case 'M': g_del_flags &= ~DEL_MESSAGES; break;
+		case 'R': g_recurse = true; break;
+		case '1': g_delempty = true; break;
+		case '2': g_del_flags |= DEL_FOLDERS; break;
+		case 'a': g_del_flags |= DEL_ASSOCIATED; break;
+		case 't': g_time_str = result.oarg[i]; break;
+		case '3': g_del_flags &= ~DELETE_HARD_DELETE; break;
+		default: break;
+		}
+
 	if (g_del_flags & DEL_FOLDERS && g_recurse) {
-		fprintf(stderr, "Combining -R and --nuke-folders is unreasonable: when you nuke folders, you cannot recurse into them anymore.\n");
+		mbop_fprintf(stderr, "Combining -R and --nuke-folders is unreasonable: when you nuke folders, you cannot recurse into them anymore.\n");
 		return EXIT_FAILURE;
 	} else if (g_delempty && !g_recurse) {
-		fprintf(stderr, "--delempty requires -R\n");
+		mbop_fprintf(stderr, "--delempty requires -R\n");
 		return EXIT_FAILURE;
 	}
 	if (g_time_str != nullptr) {
 		char *end = nullptr;
 		auto t = HX_strtoull_sec(g_time_str, &end);
 		if (t == ULLONG_MAX && errno == ERANGE) {
-			fprintf(stderr, "Timespec \"%s\" is too damn big\n", g_time_str);
+			mbop_fprintf(stderr, "Timespec \"%s\" is too damn big\n", g_time_str);
 			return EXIT_FAILURE;
 		} else if (end != nullptr && *end != '\0') {
-			fprintf(stderr, "Timespec \"%s\" not fully understood (error at: \"%s\")\n",
+			mbop_fprintf(stderr, "Timespec \"%s\" not fully understood (error at: \"%s\")\n",
 				g_time_str, end);
 			return EXIT_FAILURE;
 		}
 		g_cutoff_time = rop_util_unix_to_nttime(time(nullptr) - t);
 		if (g_del_flags & DEL_FOLDERS) {
-			fprintf(stderr, "Combining -t and --nuke-folders is unreasonable: when you delete folders, it may delete messages therein which are younger than -t.\n");
+			mbop_fprintf(stderr, "Combining -t and --nuke-folders is unreasonable: when you delete folders, it may delete messages therein which are younger than -t.\n");
 			return EXIT_FAILURE;
 		}
 	}
 
 	int ret = EXIT_SUCCESS;
-	while (*++argv != nullptr) {
+	for (int uidx = 0; uidx < result.nargs; ++uidx) {
 		BOOL partial = false;
-		eid_t eid = gi_lookup_eid_by_name(g_storedir, *argv);
+		eid_t eid = gi_lookup_eid_by_name(g_storedir, result.uarg[uidx]);
 		if (eid == 0) {
-			fprintf(stderr, "Not recognized/found: \"%s\"\n", *argv);
+			mbop_fprintf(stderr, "Not recognized/found: \"%s\"\n", result.uarg[uidx]);
 			return EXIT_FAILURE;
 		}
 		if (g_cutoff_time != 0 || g_recurse) {
@@ -220,14 +227,14 @@ int main(int argc, char **argv)
 		auto ok = exmdb_client->empty_folder(g_storedir, CP_UTF8, nullptr,
 		          eid, g_del_flags, &partial);
 		if (!ok) {
-			fprintf(stderr, "empty_folder(%s) failed\n", *argv);
+			mbop_fprintf(stderr, "empty_folder(%s) failed\n", result.uarg[uidx]);
 			ret = EXIT_FAILURE;
 		}
 		delcount(eid, &curr_delc, &curr_fldc);
 		if (partial)
 			printf("Partial completion (e.g. essential permanent folders were not deleted)\n");
-		printf("Folder %s: deleted %d messages, deleted %d subfolders plus messages\n",
-			*argv, curr_delc - prev_delc, prev_fldc - curr_fldc);
+		printf("Folder %s: deleted %d message(s), deleted %d subfolder(s) plus messages\n",
+			result.uarg[uidx], curr_delc - prev_delc, prev_fldc - curr_fldc);
 		if (ret != EXIT_SUCCESS)
 			break;
 	}

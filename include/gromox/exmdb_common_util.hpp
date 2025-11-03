@@ -54,7 +54,6 @@ extern void common_util_pass_service(const char *name, void *func);
 void common_util_init(const char *org_name, unsigned int max_msg,
 	unsigned int max_rule_num, unsigned int max_ext_rule_num);
 extern void common_util_build_tls();
-extern unsigned int common_util_sequence_ID();
 void* common_util_alloc(size_t size);
 template<typename T> T *cu_alloc()
 {
@@ -107,7 +106,7 @@ void common_util_set_message_read(sqlite3 *psqlite,
 	uint64_t message_id, uint8_t is_read);
 BINARY* common_util_username_to_addressbook_entryid(
 	const char *username);
-extern BOOL common_util_parse_addressbook_entryid(const BINARY *, char *address_type, size_t atsize, char *email_address, size_t emsize);
+extern bool cu_parse_abkeid(const BINARY *, std::string &type, std::string &addr);
 BINARY* common_util_to_private_folder_entryid(
 	sqlite3 *psqlite, const char *username,
 	uint64_t folder_id);
@@ -153,6 +152,9 @@ extern uint32_t common_util_calculate_attachment_size(const attachment_content *
 extern const char *exmdb_rpc_idtoname(exmdb_callid);
 extern int need_msg_perm_check(sqlite3 *, const char *user, uint64_t fid);
 extern int have_delete_perm(sqlite3 *, const char *user, uint64_t fid, uint64_t mid = 0);
+extern bool timeindex_delete(sqlite3 *db, uint64_t fid, uint64_t mid);
+extern bool timeindex_insert(sqlite3 *db, uint64_t fid, uint64_t mid);
+extern bool timeindex_refresh(sqlite3 *db, uint64_t fid, uint64_t mid);
 
 extern unsigned int g_max_rule_num, g_max_extrule_num, g_cid_compression;
 extern thread_local unsigned int g_inside_flush_instance;

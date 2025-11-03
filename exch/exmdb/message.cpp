@@ -92,6 +92,21 @@ struct seen_list {
 
 static ec_error_t message_rule_new_message(const rulexec_in &, seen_list &);
 
+/*
+ * gx_collapse_event_storm: When copying or deleting "lots" of messages,
+ * collapse and replace all the new_msg/del_msg event notifications with a
+ * single table_change event.
+ *
+ * Drawback: Upon seeing a table_change event, a MAPI client may re-downloads
+ * the MAPI table. If it does, it has *all* rows already. Upon seeing the
+ * new_msg event, the client might ― erroneously ― add a message to its local
+ * table representation without checking for duplicate entryids.
+ *
+ * EXC2019 behavior can be selected by using collapse=false (the
+ * default).
+ */
+static bool gx_collapse_event_storm;
+
 static constexpr uint8_t fake_true = true;
 static constexpr uint32_t dummy_rcpttype = MAPI_TO;
 static constexpr char dummy_addrtype[] = "NONE", dummy_string[] = "";
@@ -185,6 +200,7 @@ BOOL exmdb_server::movecopy_message(const char *dir, cpid_t cpid,
 			        "is_deleted=1 WHERE message_id=%llu", LLU{mid_val});
 			if (pdb->exec(sql_string) != SQLITE_OK)
 				return FALSE;
+			timeindex_delete(pdb->psqlite, fid_val, mid_val);
 			mlog(LV_DEBUG, "exmdb-audit: moved(PF) message %s:f%llu:m%llu to f%llu:m%llu",
 				dir, LLU{parent_fid}, LLU{mid_val}, LLU{fid_val}, LLU{dst_val});
 			snprintf(sql_string, std::size(sql_string), "DELETE FROM "
@@ -290,7 +306,9 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 		b_check = TRUE;
 	}
 
-	auto b_batch = pmessage_ids->count >= MIN_BATCH_MESSAGE_NUM;
+	auto b_batch = gx_collapse_event_storm && pmessage_ids->count >= MIN_BATCH_MESSAGE_NUM
+	/* Table reload in MFCMAPI is ~700msg/sec, whereas event processing is ~100msgevt/sec */
+	               /* && table_new_content_count / 7 < pmessage_eids->count */;
 	auto dbase = pdb->lock_base_wr();
 	db_conn::NOTIFQ notifq;
 	if (b_batch)
@@ -303,7 +321,7 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 	             "is_associated FROM messages WHERE message_id=?");
 	if (stm_find == nullptr)
 		return FALSE;
-	BOOL b_update = TRUE;
+	bool b_update = true, b_softdel = false;
 	xstmt stm_del;
 	if (!b_copy) {
 		if (exmdb_server::is_private()) {
@@ -311,12 +329,13 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 			b_update = FALSE;
 		} else {
 			strcpy(sql_string, "UPDATE messages SET is_deleted=1 WHERE message_id=?");
+			b_softdel = true;
 		}
 		stm_del = pdb->prep(sql_string);
 		if (stm_del == nullptr)
 			return FALSE;
 	}
-	uint64_t fai_size = 0, normal_size = 0;
+	uint64_t total_adjust[2]{};
 	uint32_t del_count = 0, message_size = 0;
 	std::set<uint64_t> touched_folders;
 	for (auto mid : *pmessage_ids) {
@@ -374,10 +393,7 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 			*pb_partial = TRUE;
 			continue;
 		}
-		if (!is_associated)
-			normal_size += message_size;
-		else
-			fai_size += message_size;
+		total_adjust[is_associated] += message_size;
 		pdb->proc_dynamic_event(cpid, dynamic_event::new_msg,
 			dst_val, tmp_val1, 0, *dbase, notifq);
 		pdb->notify_message_movecopy(b_copy, dst_val, tmp_val1,
@@ -394,6 +410,8 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 		if (stm_del.step() != SQLITE_DONE)
 			return false;
 		stm_del.reset();
+		if (!b_copy && b_softdel)
+			timeindex_delete(pdb->psqlite, parent_fid, tmp_val);
 		mlog(LV_DEBUG, "exmdb-audit: moved(mmv) message %s:f%llu:m%llu to f%llu:m%llu",
 			dir, LLU{src_val}, LLU{tmp_val}, LLU{dst_val}, LLU{tmp_val1});
 		if (!exmdb_server::is_private()) {
@@ -413,8 +431,8 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 	}
 	stm_find.finalize();
 	stm_del.finalize();
-	if (b_update && normal_size + fai_size > 0 &&
-	    !cu_adjust_store_size(pdb->psqlite, ADJ_INCREASE, normal_size, fai_size))
+	if (b_update && total_adjust[0] + total_adjust[1] > 0 &&
+	    !cu_adjust_store_size(pdb->psqlite, ADJ_INCREASE, total_adjust[0], total_adjust[1]))
 		return FALSE;
 	auto nt_time = rop_util_current_nttime();
 	if (!b_copy) for (auto parent_fid : touched_folders) {
@@ -460,11 +478,11 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 		PR_LOCAL_COMMIT_TIME_MAX, &nt_time, &b_result);
 	if (sql_transact.commit() != SQLITE_OK)
 		return false;
-	dg_notify(std::move(notifq));
 	if (b_batch) {
 		b_batch = false;
 		db_conn::commit_batch_mode_release(std::move(pdb),std::move(dbase));
 	}
+	dg_notify(std::move(notifq));
 	return TRUE;
 }
 
@@ -475,6 +493,17 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
     const char *username, uint64_t folder_id, const EID_ARRAY *pmessage_ids,
     BOOL b_hard, BOOL *pb_partial)
 {
+	/*
+	 * When a message is soft-deleted from a EXC2019 Private
+	 * Store, and the message is in or beneath IPM_SUBTREE, the
+	 * message gets moved to "\Recoverable Items\Deletions"
+	 * (new PR_PARENT_ENTRYID, CK/RK/PCL and LastActiveParentEntryId
+	 * properties are assigned).
+	 *
+	 * EXC2019 Public Stores also have \Recoverable Items\Deletions, but
+	 * use \NON_IPM_SUBTREE\DUMPSTER_ROOT\DUMPSTER_EXTEND\RESERVED_1\RESERVED_1\<uuid_of_user>.
+	 * UUID makes sense, but... who comes up with these paths!?
+	 */
 	void *pvalue;
 	BOOL b_check;
 	BOOL b_owner;
@@ -483,6 +512,8 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
 		return FALSE;
+	if (is_private() && !g_exmdb_pvt_folder_softdel)
+		b_hard = true;
 	auto sql_transact = gx_sql_begin(pdb->psqlite, txn_mode::write);
 	if (!sql_transact)
 		return false;
@@ -502,7 +533,7 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 		b_check = (permission & (frightsOwner | frightsDeleteAny)) ? false : TRUE;
 	}
 
-	auto b_batch = pmessage_ids->count >= MIN_BATCH_MESSAGE_NUM;
+	auto b_batch = gx_collapse_event_storm && pmessage_ids->count >= MIN_BATCH_MESSAGE_NUM;
 	auto dbase = pdb->lock_base_wr();
 	db_conn::NOTIFQ notifq;
 	if (b_batch)
@@ -520,7 +551,7 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 	              "UPDATE messages SET is_deleted=1 WHERE message_id=?");
 	if (pstmt1 == nullptr)
 		return FALSE;
-	uint64_t fai_size = 0, normal_size = 0;
+	uint64_t total_adjust[2]{};
 	int del_count = 0;
 	auto nt_time = rop_util_current_nttime();
 	for (auto mid : *pmessage_ids) {
@@ -563,10 +594,7 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 			}
 		}
 		del_count ++;
-		if (is_assoc)
-			fai_size += obj_size;
-		else
-			normal_size += obj_size;
+		total_adjust[is_assoc] += obj_size;
 		pdb->proc_dynamic_event(cpid, dynamic_event::del_msg,
 			parent_fid, tmp_val, 0, *dbase, notifq);
 		if (folder_type == FOLDER_SEARCH)
@@ -577,6 +605,8 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 		if (pstmt1.step() != SQLITE_DONE)
 			return FALSE;
 		sqlite3_reset(pstmt1);
+		if (!b_hard && !is_assoc)
+			timeindex_delete(pdb->psqlite, src_val, tmp_val);
 		mlog(LV_DEBUG, "exmdb-audit: %s-deleted message %s:f%llu:m%llu (actor:%s)",
 			b_hard ? "hard" : "soft", dir, LLU{src_val}, LLU{tmp_val},
 			username != nullptr ? username : "owner");
@@ -617,6 +647,9 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 			const TPROPVAL_ARRAY npropds = {std::size(nprop), nprop};
 			cu_set_properties(MAPI_MESSAGE, tmp_val, CP_ACP, pdb->psqlite,
 				&npropds, &problems);
+
+			/* For GCT(SHOW_SOFTDELETES), this is a new message now */
+			pdb->notify_message_creation(src_val, tmp_val, *dbase, notifq);
 		}
 		if (!b_hard && !is_private()) {
 			char sql_string[256];
@@ -629,7 +662,7 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 	pstmt.finalize();
 	pstmt1.finalize();
 	if (b_hard && !cu_adjust_store_size(pdb->psqlite, ADJ_DECREASE,
-	    normal_size, fai_size))
+	    total_adjust[0], total_adjust[1]))
 		return FALSE;
 	TAGGED_PROPVAL tmp_propvals[5];
 	TPROPVAL_ARRAY propvals;
@@ -668,11 +701,11 @@ BOOL exmdb_server::delete_messages(const char *dir, cpid_t cpid,
 		pdb->psqlite, src_val, del_count);
 	if (sql_transact.commit() != SQLITE_OK)
 		return false;
-	dg_notify(std::move(notifq));
 	if (b_batch) {
 		b_batch = false;
 		db_conn::commit_batch_mode_release(std::move(pdb), std::move(dbase));
 	}
+	dg_notify(std::move(notifq));
 	return TRUE;
 }
 
@@ -874,9 +907,7 @@ BOOL exmdb_server::is_msg_deleted(const char *dir,
 	auto pstmt = pdb->prep(sql_string);
 	if (pstmt == nullptr)
 		return FALSE;
-	*pb_del = pstmt.step() != SQLITE_ROW ||
-	          (!exmdb_server::is_private() &&
-	          sqlite3_column_int64(pstmt, 0) != 0) ? TRUE : false;
+	*pb_del = pstmt.step() != SQLITE_ROW || pstmt.col_uint64(0) ? TRUE : false;
 	return TRUE;
 }
 
@@ -1071,172 +1102,6 @@ BOOL exmdb_server::allocate_message_id(const char *dir,
 		return FALSE;
 	*pmessage_id = rop_util_make_eid_ex(1, eid_val);
 	return sql_transact.commit() == SQLITE_OK ? TRUE : false;
-}
-
-BOOL exmdb_server::get_message_group_id(const char *dir,
-	uint64_t message_id, uint32_t **ppgroup_id)
-{
-	char sql_string[128];
-	auto pdb = db_engine_get_db(dir);
-	if (!pdb)
-		return FALSE;
-	/* Only one SQL operation, no transaction needed. */
-	snprintf(sql_string, std::size(sql_string), "SELECT group_id "
-				"FROM messages WHERE message_id=%llu",
-				LLU{rop_util_get_gc_value(message_id)});
-	auto pstmt = pdb->prep(sql_string);
-	if (pstmt == nullptr)
-		return FALSE;
-	if (pstmt.step() != SQLITE_ROW ||
-		SQLITE_NULL == sqlite3_column_type(pstmt, 0)) {
-		*ppgroup_id = NULL;
-		return TRUE;
-	}
-	*ppgroup_id = cu_alloc<uint32_t>();
-	if (*ppgroup_id == nullptr)
-		return FALSE;
-	**ppgroup_id = sqlite3_column_int64(pstmt, 0);
-	return TRUE;
-}
-
-BOOL exmdb_server::set_message_group_id(const char *dir,
-	uint64_t message_id, uint32_t group_id)
-{
-	char sql_string[128];
-	auto pdb = db_engine_get_db(dir);
-	if (!pdb)
-		return FALSE;
-	/* Only one SQL operation, no transaction needed. */
-	snprintf(sql_string, std::size(sql_string), "UPDATE messages SET"
-		" group_id=%u WHERE message_id=%llu",
-		XUI{group_id}, LLU{rop_util_get_gc_value(message_id)});
-	if (pdb->exec(sql_string) != SQLITE_OK)
-		return FALSE;
-	return TRUE;
-}
-
-/* if count of indices and ungroup_proptags are both 0 means full change */
-BOOL exmdb_server::save_change_indices(const char *dir, uint64_t message_id,
-    uint64_t cn, const INDEX_ARRAY *pindices,
-    const PROPTAG_ARRAY *pungroup_proptags) try
-{
-	EXT_PUSH ext_push;
-	char sql_string[128];
-	static constexpr size_t idbuff_size = 0x8000;
-	auto indices_buff = std::make_unique<uint8_t[]>(idbuff_size);
-	auto proptags_buff = std::make_unique<uint8_t[]>(idbuff_size);
-	
-	auto pdb = db_engine_get_db(dir);
-	if (!pdb)
-		return FALSE;
-	/* Only one SQL operation, no transaction needed. */
-	auto mid_val = rop_util_get_gc_value(message_id);
-	if (0 == pindices->count && 0 == pungroup_proptags->count) {
-		snprintf(sql_string, std::size(sql_string), "UPDATE messages SET "
-		          "group_id=? WHERE message_id=%llu", LLU{mid_val});
-		auto pstmt = pdb->prep(sql_string);
-		if (pstmt == nullptr)
-			return FALSE;
-		sqlite3_bind_null(pstmt, 1);
-		return pstmt.step() == SQLITE_DONE ? TRUE : false;
-	}
-	auto pstmt = pdb->prep("INSERT INTO"
-	             " message_changes VALUES (?, ?, ?, ?)");
-	if (pstmt == nullptr)
-		return FALSE;
-	sqlite3_bind_int64(pstmt, 1, mid_val);
-	sqlite3_bind_int64(pstmt, 2, rop_util_get_gc_value(cn));
-	if (!ext_push.init(indices_buff.get(), idbuff_size, 0) ||
-	    ext_push.p_proptag_a(*pindices) != pack_result::ok)
-		return false;
-	sqlite3_bind_blob(pstmt, 3, ext_push.m_udata, ext_push.m_offset, SQLITE_STATIC);
-	if (!ext_push.init(proptags_buff.get(), idbuff_size, 0) ||
-	    ext_push.p_proptag_a(*pungroup_proptags) != pack_result::ok)
-		return false;
-	sqlite3_bind_blob(pstmt, 4, ext_push.m_udata, ext_push.m_offset, SQLITE_STATIC);
-	return pstmt.step() == SQLITE_DONE ? TRUE : false;
-} catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1162: ENOMEM");
-	return false;
-}
-
-/* if count of indices and ungroup_proptags are both 0 means full change */
-BOOL exmdb_server::get_change_indices(const char *dir,
-	uint64_t message_id, uint64_t cn, INDEX_ARRAY *pindices,
-	PROPTAG_ARRAY *pungroup_proptags)
-{
-	EXT_PULL ext_pull;
-	INDEX_ARRAY tmp_indices;
-	PROPTAG_ARRAY tmp_proptags;
-	
-	auto cn_val = rop_util_get_gc_value(cn);
-	auto pdb = db_engine_get_db(dir);
-	if (!pdb)
-		return FALSE;
-	/* Only one SQL operation, no transaction needed. */
-	auto mid_val = rop_util_get_gc_value(message_id);
-	std::unique_ptr<INDEX_ARRAY, pta_delete> ptmp_indices(proptag_array_init());
-	if (ptmp_indices == nullptr)
-		return FALSE;
-	std::unique_ptr<PROPTAG_ARRAY, pta_delete> ptmp_proptags(proptag_array_init());
-	if (ptmp_proptags == nullptr)
-		return FALSE;
-	char sql_string[128];
-	snprintf(sql_string, std::size(sql_string), "SELECT change_number,"
-				" indices, proptags FROM message_changes"
-				" WHERE message_id=%llu", LLU{mid_val});
-	auto pstmt = pdb->prep(sql_string);
-	if (pstmt == nullptr)
-		return FALSE;
-	while (pstmt.step() == SQLITE_ROW) {
-		if (gx_sql_col_uint64(pstmt, 0) <= cn_val)
-			continue;
-		if (sqlite3_column_bytes(pstmt, 1) > 0) {
-			ext_pull.init(sqlite3_column_blob(pstmt, 1),
-				sqlite3_column_bytes(pstmt, 1),
-				common_util_alloc, 0);
-			if (ext_pull.g_proptag_a(&tmp_indices) != pack_result::ok)
-				return FALSE;
-			for (unsigned int i = 0; i < tmp_indices.count; ++i)
-				if (!proptag_array_append(ptmp_indices.get(),
-				    tmp_indices.pproptag[i]))
-					return FALSE;
-		}
-		if (sqlite3_column_bytes(pstmt, 2) > 0) {
-			ext_pull.init(sqlite3_column_blob(pstmt, 2),
-				sqlite3_column_bytes(pstmt, 2),
-				common_util_alloc, 0);
-			if (ext_pull.g_proptag_a(&tmp_proptags) != pack_result::ok)
-				return FALSE;
-			for (unsigned int i = 0; i < tmp_proptags.count; ++i)
-				if (!proptag_array_append(ptmp_proptags.get(),
-				    tmp_proptags.pproptag[i]))
-					return FALSE;
-		}
-	}
-	pstmt.finalize();
-	pdb.reset();
-	pindices->count = ptmp_indices->count;
-	if (ptmp_indices->count > 0) {
-		pindices->pproptag = cu_alloc<uint32_t>(ptmp_indices->count);
-		if (pindices->pproptag == nullptr)
-			return FALSE;
-		memcpy(pindices->pproptag, ptmp_indices->pproptag,
-			sizeof(uint32_t)*ptmp_indices->count);
-	}
-	ptmp_indices.reset();
-	if (ptmp_proptags->count == 0) {
-		pungroup_proptags->count = 0;
-		pungroup_proptags->pproptag = NULL;
-		return TRUE;
-	}
-	pungroup_proptags->count = ptmp_proptags->count;
-	pungroup_proptags->pproptag = cu_alloc<uint32_t>(ptmp_proptags->count);
-	if (pungroup_proptags->pproptag == nullptr)
-		return FALSE;
-	memcpy(pungroup_proptags->pproptag, ptmp_proptags->pproptag,
-	       sizeof(uint32_t)*ptmp_proptags->count);
-	return TRUE;
 }
 
 BOOL exmdb_server::mark_modified(const char *dir, uint64_t message_id)
@@ -1908,6 +1773,8 @@ static BOOL message_write_message(BOOL b_internal, sqlite3 *psqlite,
 			        " WHERE message_id=%llu", LLU{*pmessage_id});
 			if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK)
 				return FALSE;
+			if (!b_embedded)
+				timeindex_refresh(psqlite, parent_id, *pmessage_id);
 			snprintf(sql_string, std::size(sql_string), "DELETE FROM recipients"
 			        " WHERE message_id=%llu", LLU{*pmessage_id});
 			if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK)
@@ -1983,6 +1850,8 @@ static BOOL message_write_message(BOOL b_internal, sqlite3 *psqlite,
 	if (!cu_set_properties(MAPI_MESSAGE, *pmessage_id, cpid,
 	    psqlite, &pmsgctnt->proplist, &tmp_problems))
 		return FALSE;
+	if (!b_embedded)
+		timeindex_refresh(psqlite, parent_id, *pmessage_id);
 	if (pmsgctnt->proplist.has(PR_BODY) && tmp_problems.has(PR_BODY))
 		*partial_completion = true;
 	if (pmsgctnt->proplist.has(PR_HTML) && tmp_problems.has(PR_HTML))
@@ -2636,9 +2505,7 @@ static ec_error_t message_forward_message(const rulexec_in &rp,
     uint32_t action_flavor, std::vector<std::string> &&rcpt_list) try
 {
 	int offset;
-	char tmp_path[256];
 	struct tm time_buff;
-	char mid_string[128];
 	struct stat node_stat;
 	char tmp_buff[64*1024];
 	MESSAGE_CONTENT *pmsgctnt;
@@ -2646,11 +2513,11 @@ static ec_error_t message_forward_message(const rulexec_in &rp,
 	std::unique_ptr<char[], stdlib_delete> pbuff;
 	MAIL imail;
 	if (rp.digest.has_value()) {
-		if (!get_digest(*rp.digest, "file", mid_string, std::size(mid_string)))
+		std::string mid_string;
+		if (!get_digest(*rp.digest, "file", mid_string))
 			return ecError;
-		snprintf(tmp_path, std::size(tmp_path), "%s/eml/%s",
-		         exmdb_server::get_dir(), mid_string);
-		wrapfd fd = open(tmp_path, O_RDONLY);
+		auto eml_path = exmdb_server::get_dir() + "/eml/"s + mid_string;
+		wrapfd fd = open(eml_path.c_str(), O_RDONLY);
 		if (fd.get() < 0 || fstat(fd.get(), &node_stat) != 0)
 			return ecNotFound;
 		if (!S_ISREG(node_stat.st_mode)) {
@@ -2924,6 +2791,7 @@ static ec_error_t op_move_same(const rulexec_in &rp,
 	if (!cu_adjust_store_size(rp.sqlite, ADJ_INCREASE, message_size, 0))
 		return ecError;
 	seen.fld.emplace_back(dst_fid);
+	seen.msg.emplace_back(dst_fid, dst_mid);
 
 	rulexec_in rex = rp;
 	char *pmid_string = nullptr;
@@ -3087,10 +2955,9 @@ static ec_error_t op_delegate(const rulexec_in &rp, seen_list &seen,
 	std::vector<std::string> rcpt_list;
 	if (!msg_rcpt_blocks_to_list(*pfwddlgt, rcpt_list))
 		return ecError;
-	char mid_string1[128], tmp_path1[256];
-	get_digest(*rp.digest, "file", mid_string1, std::size(mid_string1));
-	snprintf(tmp_path1, std::size(tmp_path1), "%s/eml/%s",
-		 exmdb_server::get_dir(), mid_string1);
+	std::string mid_string_src;
+	get_digest(*rp.digest, "file", mid_string_src);
+	auto eml_path_src = exmdb_server::get_dir() + "/eml/"s + mid_string_src;
 	for (const auto &eaddr : rcpt_list) {
 		sql_meta_result mres;
 		if (mysql_adaptor_meta(eaddr.c_str(), WANTPRIV_METAONLY, mres) != 0)
@@ -3098,16 +2965,22 @@ static ec_error_t op_delegate(const rulexec_in &rp, seen_list &seen,
 		auto maildir = mres.maildir.c_str();
 		if (*maildir == '\0') {
 			mlog(LV_ERR, "E-1740: copy from %s to delegate %s not possible: no homedir",
-				tmp_path1, eaddr.c_str());
+				eml_path_src.c_str(), eaddr.c_str());
 			continue;
 		}
-		auto mid_string = fmt::format("{}.x{}.{}", time(nullptr),
-		                  common_util_sequence_ID(), get_host_ID());
+		char guidtxt[GUIDSTR_SIZE]{};
+		GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+		auto mid_string = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
 		auto eml_path = maildir + "/eml/"s + mid_string;
-		auto ret = HX_copy_file(tmp_path1, eml_path.c_str(), 0);
+		auto ret = gx_mkbasedir(eml_path.c_str(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
+		if (ret < 0) {
+			mlog(LV_ERR, "E-1492: mkbasedir for %s: %s", eml_path.c_str(), strerror(-ret));
+			continue;
+		}
+		ret = HX_copy_file(eml_path_src.c_str(), eml_path.c_str(), 0);
 		if (ret < 0) {
 			mlog(LV_ERR, "E-1606: HX_copy_file %s -> %s: %s",
-			        tmp_path1, eml_path.c_str(), strerror(-ret));
+			        eml_path_src.c_str(), eml_path.c_str(), strerror(-ret));
 			continue;
 		}
 		Json::Value newdigest = *rp.digest;
@@ -3221,9 +3094,9 @@ static ec_error_t op_process(const rulexec_in &rp,
 static ec_error_t opx_move_private(sqlite3 *psqlite, const rule_node &rule,
     const EXT_MOVECOPY_ACTION *pextmvcp)
 {
-	if (pextmvcp->folder_eid.folder_type != EITLT_PRIVATE_FOLDER)
+	if (pextmvcp->folder_eid.eid_type != EITLT_PRIVATE_FOLDER)
 		return message_disable_rule(psqlite, TRUE, rule.id);
-	if (pextmvcp->folder_eid.database_guid !=
+	if (pextmvcp->folder_eid.folder_dbguid !=
 	    rop_util_make_user_guid(exmdb_server::get_account_id()))
 		return message_disable_rule(psqlite, TRUE, rule.id);
 	return ecSuccess;
@@ -3233,9 +3106,9 @@ static ec_error_t opx_move_private(sqlite3 *psqlite, const rule_node &rule,
 static ec_error_t opx_move_public(sqlite3 *psqlite, const rule_node &rule,
     const EXT_MOVECOPY_ACTION *pextmvcp)
 {
-	if (pextmvcp->folder_eid.folder_type != EITLT_PUBLIC_FOLDER)
+	if (pextmvcp->folder_eid.eid_type != EITLT_PUBLIC_FOLDER)
 		return message_disable_rule(psqlite, TRUE, rule.id);
-	if (pextmvcp->folder_eid.database_guid !=
+	if (pextmvcp->folder_eid.folder_dbguid !=
 	    rop_util_make_domain_guid(exmdb_server::get_account_id()))
 		return message_disable_rule(psqlite, TRUE, rule.id);
 	return ecSuccess;
@@ -3251,8 +3124,7 @@ static ec_error_t opx_move(const rulexec_in &rp,
 	          opx_move_public(rp.sqlite, rule, pextmvcp);
 	if (ec != ecSuccess)
 		return ec;
-	auto dst_fid = rop_util_gc_to_value(
-		       pextmvcp->folder_eid.global_counter);
+	auto dst_fid = rop_util_gc_to_value(pextmvcp->folder_eid.folder_gc);
 	if (std::find(seen.fld.cbegin(), seen.fld.cend(), dst_fid) != seen.fld.cend())
 		/* Already moved to this folder once. */
 		return ecSuccess;
@@ -3275,6 +3147,7 @@ static ec_error_t opx_move(const rulexec_in &rp,
 	if (!cu_adjust_store_size(rp.sqlite, ADJ_INCREASE, message_size, 0))
 		return ecError;
 	seen.fld.emplace_back(dst_fid);
+	seen.msg.emplace_back(dst_fid, dst_mid);
 
 	rulexec_in rex = rp;
 	char *pmid_string = nullptr;
@@ -3312,10 +3185,9 @@ static ec_error_t opx_reply(const rulexec_in &rp, const rule_node &rule,
 	auto exp_guid = exmdb_server::is_private() ?
 	                rop_util_make_user_guid(exmdb_server::get_account_id()) :
 	                rop_util_make_domain_guid(exmdb_server::get_account_id());
-	if (exp_guid != pextreply->message_eid.message_database_guid)
+	if (exp_guid != pextreply->message_eid.message_dbguid)
 		return message_disable_rule(rp.sqlite, TRUE, rule.id);
-	auto dst_mid = rop_util_gc_to_value(
-		       pextreply->message_eid.message_global_counter);
+	auto dst_mid = rop_util_gc_to_value(pextreply->message_eid.message_gc);
 	BOOL b_result = false;
 	if (!message_auto_reply(rp, block.type, block.flavor,
 	    dst_mid, pextreply->template_guid, &b_result))
@@ -3398,22 +3270,27 @@ static ec_error_t opx_delegate(const rulexec_in &rp, const rule_node &rule,
 	std::vector<std::string> rcpt_list;
 	if (!msg_rcpt_blocks_to_list(*pextfwddlgt, rcpt_list))
 		return ecError;
-	char mid_string1[128], tmp_path1[256];
-	get_digest(*rp.digest, "file", mid_string1, std::size(mid_string1));
-	snprintf(tmp_path1, std::size(tmp_path1), "%s/eml/%s",
-	         exmdb_server::get_dir(), mid_string1);
+	std::string mid_string_src;
+	get_digest(*rp.digest, "file", mid_string_src);
+	auto eml_path_src = exmdb_server::get_dir() + "/eml/"s + mid_string_src;
 	for (const auto &eaddr : rcpt_list) {
 		sql_meta_result mres;
 		if (mysql_adaptor_meta(eaddr.c_str(), WANTPRIV_METAONLY, mres) != 0)
 			continue;
 		auto maildir = mres.maildir.c_str();
-		auto mid_string = fmt::format("{}.x{}.{}", time(nullptr),
-		                  common_util_sequence_ID(), get_host_ID());
+		char guidtxt[GUIDSTR_SIZE]{};
+		GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+		auto mid_string = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
 		auto eml_path = maildir + "/eml/"s + mid_string;
-		auto ret = HX_copy_file(tmp_path1, eml_path.c_str(), 0);
+		auto ret = gx_mkbasedir(eml_path.c_str(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
+		if (ret < 0) {
+			mlog(LV_ERR, "E-1493: mkbasedir for %s: %s", eml_path.c_str(), strerror(-ret));
+			continue;
+		}
+		ret = HX_copy_file(eml_path_src.c_str(), eml_path.c_str(), 0);
 		if (ret < 0) {
 			mlog(LV_ERR, "E-1607: HX_copy_file %s -> %s: %s",
-			        tmp_path1, eml_path.c_str(), strerror(-ret));
+			        eml_path_src.c_str(), eml_path.c_str(), strerror(-ret));
 			continue;
 		}
 		Json::Value newdigest = *rp.digest;
@@ -3585,12 +3462,11 @@ static ec_error_t message_rule_new_message(const rulexec_in &rp, seen_list &seen
 		return ecError;
 	if (!rp.digest.has_value())
 		return ecSuccess;
-	char mid_string1[128], tmp_path1[256];
-	get_digest(*rp.digest, "file", mid_string1, std::size(mid_string1));
-	snprintf(tmp_path1, std::size(tmp_path1), "%s/eml/%s",
-	         exmdb_server::get_dir(), mid_string1);
-	if (::remove(tmp_path1) != 0 && errno != ENOENT)
-		mlog(LV_WARN, "W-1345: remove %s: %s", tmp_path1, strerror(errno));
+	std::string mid_string_src;
+	get_digest(*rp.digest, "file", mid_string_src);
+	auto eml_path_src = exmdb_server::get_dir() + "/eml/"s + mid_string_src;
+	if (::remove(eml_path_src.c_str()) != 0 && errno != ENOENT)
+		mlog(LV_WARN, "W-1345: remove %s: %s", eml_path_src.c_str(), strerror(errno));
 	return ecSuccess;
 }
 
@@ -3599,11 +3475,16 @@ static unsigned int detect_rcpt_type(const char *account, const TARRAY_SET *rcpt
 	if (rcpts == nullptr)
 		return MAPI_BCC;
 	for (size_t i = 0; i < rcpts->count; ++i) {
-		auto rcpt = rcpts->pparray[i];
-		auto smtpaddr = rcpt->get<const char>(PR_SMTP_ADDRESS);
+		auto &rcpt = *rcpts->pparray[i];
+		auto smtpaddr = rcpt.get<const char>(PR_SMTP_ADDRESS);
+		if (smtpaddr == nullptr) {
+			auto addrtype = rcpt.get<const char>(PR_ADDRTYPE);
+			if (addrtype != nullptr && strcasecmp(addrtype, "SMTP") == 0)
+				smtpaddr = rcpt.get<const char>(PR_EMAIL_ADDRESS);
+		}
 		if (smtpaddr == nullptr || strcasecmp(account, smtpaddr) != 0)
 			continue;
-		auto type = rcpt->get<const uint32_t>(PR_RECIPIENT_TYPE);
+		auto type = rcpt.get<const uint32_t>(PR_RECIPIENT_TYPE);
 		if (type == nullptr)
 			continue;
 		if (*type == MAPI_TO || *type == MAPI_CC)
@@ -3620,7 +3501,6 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 {
 	bool b_oof;
 	uint64_t fid_val;
-	char tmp_path[256];
 	BINARY searchkey_bin;
 	char mid_string[128];
 	std::string account, display_name;
@@ -3758,14 +3638,22 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 	    get_digest(*digest, "file", mid_string, std::size(mid_string))) {
 		Json::Value newdigest = *digest;
 		newdigest["file"] = "";
-		snprintf(tmp_path, std::size(tmp_path), "%s/ext/%s",
-		         exmdb_server::get_dir(), mid_string);
+		auto ext_path = exmdb_server::get_dir() + "/ext/"s + mid_string;
 		auto djson = json_to_str(std::move(newdigest));
-		wrapfd fd = open(tmp_path, O_CREAT | O_TRUNC | O_WRONLY, FMODE_PRIVATE);
+		auto ret = gx_mkbasedir(ext_path.c_str(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
+		if (ret < 0) {
+			mlog(LV_ERR, "E-1942: mkbasedir for %s: %s", ext_path.c_str(), strerror(-ret));
+			return false;
+		}
+		wrapfd fd = open(ext_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, FMODE_PRIVATE);
 		if (fd.get() >= 0) {
-			if (HXio_fullwrite(fd.get(), djson.c_str(), djson.size()) < 0 ||
-			    fd.close_wr() != 0) {
-				mlog(LV_ERR, "E-1319: write %s: %s", tmp_path, strerror(errno));
+			if (HXio_fullwrite(fd.get(), djson.c_str(), djson.size()) < 0) {
+				mlog(LV_ERR, "E-1319: write %s: %s", ext_path.c_str(), strerror(errno));
+				return false;
+			}
+			auto err = fd.close_wr();
+			if (err != 0) {
+				mlog(LV_ERR, "E-1319: close %s: %s", ext_path.c_str(), strerror(err));
 				return false;
 			}
 			if (!common_util_set_mid_string(pdb->psqlite,
@@ -3790,11 +3678,15 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 	for (const auto &mn : seen.msg) {
 		pdb->proc_dynamic_event(cpid, dynamic_event::new_msg,
 			mn.folder_id, mn.message_id, 0, *dbase, notifq);
+		/*
+		 * Hint from <https://groups.google.com/g/microsoft.public.win32.programmer.messaging/c/LPnk0QqNTog>:
+		 * "fnevObjectCreated event arrives [...] when there is a new
+		 * incoming message but also when a new message is created"
+		 */
+		pdb->notify_message_creation(mn.folder_id,
+			mn.message_id, *dbase, notifq);
 		if (message_id == mn.message_id && dlflags & DELIVERY_DO_NOTIF)
 			pdb->notify_new_mail(mn.folder_id,
-				mn.message_id, *dbase, notifq);
-		else
-			pdb->notify_message_creation(mn.folder_id,
 				mn.message_id, *dbase, notifq);
 	}
 	if (sql_transact.commit() != SQLITE_OK)
@@ -3811,6 +3703,22 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 	return false;
 }
 
+BOOL exmdb_server::transport_new_mail(const char *dir, uint64_t folder_id,
+	uint64_t message_id, uint32_t message_flags, const char *pstr_class)
+{
+	auto pdb = db_engine_get_db(dir);
+	if (!pdb)
+		return FALSE;
+	/* No database access, so no transaction. */
+	auto dbase = pdb->lock_base_rd();
+	db_conn::NOTIFQ notifq;
+	pdb->transport_new_mail(rop_util_get_gc_value(folder_id),
+		rop_util_get_gc_value(message_id), message_flags, pstr_class,
+		*dbase, notifq);
+	dg_notify(std::move(notifq));
+	return TRUE;
+}
+
 /**
  * Required properties:
  *
@@ -3822,8 +3730,9 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
  *   replaced.
  * - If PR_LAST_MODIFICATION_TIME is not present, it will be set to now().
  */
-BOOL exmdb_server::write_message_v2(const char *dir, cpid_t cpid,
+BOOL exmdb_server::write_message(const char *dir, cpid_t cpid,
     uint64_t folder_id, const MESSAGE_CONTENT *pmsgctnt,
+    const std::string &digest_stream,
     uint64_t *outmid, uint64_t *outcn, ec_error_t *pe_result)
 {
 	BOOL b_exist = false;
@@ -3868,6 +3777,35 @@ BOOL exmdb_server::write_message_v2(const char *dir, cpid_t cpid,
 		return false;
 	}
 
+	if (digest_stream.size() > 0) {
+		Json::Value digest;
+		std::string mid_string;
+		if (json_from_str(digest_stream, digest) &&
+		    digest["file"].asString().size() > 0) {
+			std::string ext_file = exmdb_server::get_dir() + "/ext/"s + digest["file"].asString();
+			auto ret = gx_mkbasedir(ext_file.c_str(), FMODE_PRIVATE);
+			if (ret < 0) {
+				mlog(LV_ERR, "E-1944: mkbasedir for %s: %s", ext_file.c_str(), strerror(-ret));
+				return false;
+			}
+			wrapfd fd = open(ext_file.c_str(), O_CREAT | O_TRUNC | O_WRONLY, FMODE_PRIVATE);
+			if (fd.get() >= 0) {
+				if (HXio_fullwrite(fd.get(), digest_stream.c_str(), digest_stream.size()) < 0) {
+					mlog(LV_ERR, "E-1319: write %s: %s", ext_file.c_str(), strerror(errno));
+					return false;
+				}
+				auto err = fd.close_wr();
+				if (err != 0) {
+					mlog(LV_ERR, "E-1319: close %s: %s", ext_file.c_str(), strerror(err));
+					return false;
+				}
+				if (!common_util_set_mid_string(pdb->psqlite,
+				    *outmid, digest["file"].asCString()))
+					return false;
+			}
+		}
+	}
+
 	auto dbase = pdb->lock_base_wr();
 	db_conn::NOTIFQ notifq;
 	if (b_exist) {
@@ -3884,18 +3822,6 @@ BOOL exmdb_server::write_message_v2(const char *dir, cpid_t cpid,
 	dg_notify(std::move(notifq));
 	*pe_result = ecSuccess;
 	return TRUE;
-}
-
-BOOL exmdb_server::write_message(const char *dir, cpid_t cpid,
-    uint64_t folder_id, const MESSAGE_CONTENT *ctnt, ec_error_t *e_result)
-{
-	if (!ctnt->proplist.has(PidTagChangeNumber)) {
-		*e_result = ecRpcFailed;
-		return TRUE;
-	}
-	uint64_t outmid = 0, outcn = 0;
-	return write_message_v2(dir, cpid, folder_id, ctnt,
-	       &outmid, &outcn, e_result);
 }
 
 /**
@@ -3929,7 +3855,7 @@ BOOL exmdb_server::read_message(const char *dir, const char *username,
 BOOL exmdb_server::rule_new_message(const char *dir, const char *username,
     cpid_t cpid, uint64_t folder_id, uint64_t message_id) try
 {
-	char *pmid_string = nullptr, tmp_path[256];
+	char *pmid_string = nullptr;
 	
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
@@ -3947,10 +3873,9 @@ BOOL exmdb_server::rule_new_message(const char *dir, const char *username,
 		return FALSE;
 	std::optional<Json::Value> digest;
 	if (NULL != pmid_string) {
-		snprintf(tmp_path, std::size(tmp_path), "%s/ext/%s",
-		         exmdb_server::get_dir(), pmid_string);
+		auto ext_path = exmdb_server::get_dir() + "/ext/"s + pmid_string;
 		size_t slurp_size = 0;
-		std::unique_ptr<char[], stdlib_delete> slurp_data(HX_slurp_file(tmp_path, &slurp_size));
+		std::unique_ptr<char[], stdlib_delete> slurp_data(HX_slurp_file(ext_path.c_str(), &slurp_size));
 		if (slurp_data != nullptr) {
 			digest.emplace();
 			if (!json_from_str({slurp_data.get(), slurp_size}, *digest))

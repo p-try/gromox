@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
 // SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
 // This file is part of Gromox.
-#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstdarg>
@@ -43,21 +42,9 @@ static bool g_lda_twostep, g_lda_mrautoproc;
 static char g_org_name[256];
 static thread_local alloc_context g_alloc_ctx;
 static thread_local const char *g_storedir;
-static std::atomic<int> g_sequence_id;
 
 static ec_error_t (*exmdb_local_rules_execute)(const char *, const char *, const char *, eid_t, eid_t, unsigned int flags);
 static bool was_recipient_directly_addressed(sql_meta_result mres, message_content* pmsg);
-
-static int exmdb_local_sequence_ID()
-{
-	int old = 0, nu = 0;
-	do {
-		old = g_sequence_id.load(std::memory_order_relaxed);
-		nu  = old != INT_MAX ? old + 1 : 1;
-	} while (!g_sequence_id.compare_exchange_weak(old, nu));
-	return nu;
-}
-
 
 void exmdb_local_init(const char *org_name)
 {
@@ -257,8 +244,6 @@ static void lq_report(unsigned int qid, unsigned long long mid, const char *txt,
 delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
     const char *address) try
 {
-	size_t mess_len;
-	int sequence_ID;
 	uint64_t nt_time;
 	char tmzone[64], hostname[UDOM_SIZE];
 	uint32_t tmp_int32;
@@ -280,7 +265,6 @@ delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
 		strcpy(tmzone, GROMOX_FALLBACK_TIMEZONE);
 	
 	auto pmail = &pcontext->mail;
-	sequence_ID = exmdb_local_sequence_ID();
 	gx_strlcpy(hostname, get_host_ID(), std::size(hostname));
 	if ('\0' == hostname[0]) {
 		if (gethostname(hostname, std::size(hostname)) < 0)
@@ -288,8 +272,16 @@ delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
 		else
 			hostname[std::size(hostname)-1] = '\0';
 	}
-	auto mid_string = fmt::format("{}.l{}.{}", time(nullptr), sequence_ID, hostname);
+	char guidtxt[GUIDSTR_SIZE]{};
+	GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+	auto mid_string = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
 	auto eml_path = mres.maildir + "/eml/" + mid_string;
+
+	auto iret = gx_mkbasedir(eml_path.c_str(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
+	if (iret < 0) {
+		mlog(LV_ERR, "E-1493: mkbasedir for %s: %s", eml_path.c_str(), strerror(-iret));
+		return delivery_status::temp_fail;
+	}
 	wrapfd fd = open(eml_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, FMODE_PRIVATE);
 	if (fd.get() < 0) {
 		auto se = errno;
@@ -315,7 +307,7 @@ delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
 		mlog(LV_ERR, "E-1120: close %s: %s", eml_path.c_str(), strerror(ret));
 
 	Json::Value digest;
-	auto result = pmail->make_digest(&mess_len, digest);
+	auto result = pmail->make_digest(digest);
 	if (result <= 0) {
 		if (remove(eml_path.c_str()) < 0 && errno != ENOENT)
 			mlog(LV_WARN, "W-1387: remove %s: %s",
@@ -433,17 +425,16 @@ delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
 		return delivery_status::temp_fail;
 	}
 
-	if (!g_lda_twostep) {
-		if (b_bounce_delivered)
-			return delivery_status::bounce_sent;
-		return delivery_status::ok;
+	if (g_lda_twostep) {
+		if (g_lda_mrautoproc)
+			flags |= DELIVERY_DO_MRAUTOPROC;
+		auto err = exmdb_local_rules_execute(home_dir, pcontext->ctrl.from,
+			   address, folder_id, message_id, flags);
+		if (err != ecSuccess)
+			mlog(LV_ERR, "TWOSTEP ruleproc unsuccessful: %s", mapi_strerror(err));
 	}
-	if (g_lda_mrautoproc)
-		flags |= DELIVERY_DO_MRAUTOPROC;
-	auto err = exmdb_local_rules_execute(home_dir, pcontext->ctrl.from,
-	           address, folder_id, message_id, flags);
-	if (err != ecSuccess)
-		mlog(LV_ERR, "TWOSTEP ruleproc unsuccessful: %s", mapi_strerror(err));
+	if (b_bounce_delivered)
+		return delivery_status::bounce_sent;
 	return delivery_status::ok;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1472: ENOMEM");

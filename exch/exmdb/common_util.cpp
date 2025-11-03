@@ -5,7 +5,6 @@
 #	include "config.h"
 #endif
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <climits>
@@ -84,7 +83,6 @@ static constexpr uint8_t empty_entryid[20]{};
 
 static unsigned int g_max_msg, g_cid_use_xxhash = 1;
 static thread_local prepared_statements *g_opt_key;
-static std::atomic<unsigned int> g_sequence_id;
 
 namespace exmdb {
 
@@ -160,11 +158,6 @@ void common_util_build_tls()
 {
 	g_inside_flush_instance = false;
 	g_sqlite_for_oxcmail = nullptr;
-}
-
-unsigned int common_util_sequence_ID()
-{
-	return ++g_sequence_id;
 }
 
 /* can directly be called in local rpc thread without
@@ -1142,23 +1135,21 @@ static BINARY *cu_fid_to_entryid(sqlite3 *psqlite, uint64_t folder_id)
 		if (pbin == nullptr)
 			return NULL;
 		memcpy(&tmp_entryid.provider_uid, pbin->pb, 16);
-		tmp_entryid.database_guid =
-			rop_util_make_user_guid(account_id);
-		tmp_entryid.folder_type = EITLT_PRIVATE_FOLDER;
+		tmp_entryid.folder_dbguid = rop_util_make_user_guid(account_id);
+		tmp_entryid.eid_type      = EITLT_PRIVATE_FOLDER;
 	} else {
 		tmp_entryid.provider_uid = pbLongTermNonPrivateGuid;
 		replid = folder_id >> 48;
 		if (replid == 0)
-			tmp_entryid.database_guid =
-				rop_util_make_domain_guid(account_id);
+			tmp_entryid.folder_dbguid = rop_util_make_domain_guid(account_id);
 		else if (!common_util_get_mapping_guid(psqlite, replid,
-		    &b_found, &tmp_entryid.database_guid) || !b_found)
+		    &b_found, &tmp_entryid.folder_dbguid) || !b_found)
 			return NULL;
-		tmp_entryid.folder_type = EITLT_PUBLIC_FOLDER;
+		tmp_entryid.eid_type = EITLT_PUBLIC_FOLDER;
 	}
-	tmp_entryid.global_counter = rop_util_value_to_gc(folder_id);
-	tmp_entryid.pad[0] = 0;
-	tmp_entryid.pad[1] = 0;
+	tmp_entryid.folder_gc = rop_util_value_to_gc(folder_id);
+	tmp_entryid.pad1[0] = 0;
+	tmp_entryid.pad1[1] = 0;
 	auto pbin = cu_alloc<BINARY>();
 	if (pbin == nullptr)
 		return NULL;
@@ -1185,18 +1176,16 @@ static BINARY *cu_mid_to_entryid(sqlite3 *psqlite, uint64_t message_id)
 		if (pbin == nullptr)
 			return NULL;
 		memcpy(&tmp_entryid.provider_uid, pbin->pb, 16);
-		tmp_entryid.folder_database_guid =
-			rop_util_make_user_guid(account_id);
-		tmp_entryid.message_type = EITLT_PRIVATE_MESSAGE;
+		tmp_entryid.folder_dbguid = rop_util_make_user_guid(account_id);
+		tmp_entryid.eid_type      = EITLT_PRIVATE_MESSAGE;
 	} else {
 		tmp_entryid.provider_uid = pbLongTermNonPrivateGuid;
-		tmp_entryid.folder_database_guid =
-			rop_util_make_domain_guid(account_id);
-		tmp_entryid.message_type = EITLT_PUBLIC_MESSAGE;
+		tmp_entryid.folder_dbguid = rop_util_make_domain_guid(account_id);
+		tmp_entryid.eid_type      = EITLT_PUBLIC_MESSAGE;
 	}
-	tmp_entryid.message_database_guid = tmp_entryid.folder_database_guid;
-	tmp_entryid.folder_global_counter = rop_util_value_to_gc(folder_id);
-	tmp_entryid.message_global_counter = rop_util_value_to_gc(message_id);
+	tmp_entryid.message_dbguid = tmp_entryid.folder_dbguid;
+	tmp_entryid.folder_gc      = rop_util_value_to_gc(folder_id);
+	tmp_entryid.message_gc     = rop_util_value_to_gc(message_id);
 	tmp_entryid.pad1[0] = 0;
 	tmp_entryid.pad1[1] = 0;
 	tmp_entryid.pad2[0] = 0;
@@ -2992,16 +2981,6 @@ static errno_t cu_cid_writeout(const char *maildir, std::string_view data,
 		maildir = exmdb_server::get_dir();
 	path = maildir + "/cid/"s + hval.str();
 	cid  = hval.str();
-	std::unique_ptr<char[], stdlib_delete> extradir(HX_dirname(path.c_str()));
-	if (extradir == nullptr) {
-		mlog(LV_ERR, "E-5318: ENOMEM");
-		return ENOMEM;
-	}
-	auto ret = HX_mkdir(extradir.get(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
-	if (ret < 0) {
-		mlog(LV_ERR, "E-2009: mkdir %s: %s", extradir.get(), strerror(-ret));
-		return -ret;
-	}
 
 	/* See if the object already exists. (Skip compression.) */
 	wrapfd check_fd = open(path.c_str(), O_RDONLY);
@@ -3011,6 +2990,11 @@ static errno_t cu_cid_writeout(const char *maildir, std::string_view data,
 		return 0;
 	check_fd.close_rd();
 
+	auto ret = gx_mkbasedir(path.c_str(), FMODE_PRIVATE);
+	if (ret < 0) {
+		mlog(LV_ERR, "E-2009: mkbasedir for %s: %s", path.c_str(), strerror(-ret));
+		return -ret;
+	}
 	gromox::tmpfile tmf;
 	ret = tmf.open_linkable(maildir, O_RDWR | O_TRUNC);
 	if (ret < 0) {
@@ -3028,19 +3012,12 @@ static errno_t cu_cid_writeout(const char *maildir, std::string_view data,
 		mlog(LV_ERR, "E-5319: zstd routines have failed for object %s", path.c_str());
 		return err;
 	}
-	/*
-	 * If another thread created a writeout in the meantime, we will now
-	 * overwrite it. Since the contents are the same, that has no ill
-	 * effect (POSIX guarantees atomicity). But it is somewhat inefficient,
-	 * because now the filesystem will writeout our thread's second copy
-	 * and ditch the blocks from the first copy, which is pointless churn.
-	 * It is not too terrible, considering this can only happen for newly
-	 * instantiated @paths.
-	 */
-	err = tmf.link_to(path.c_str());
-	if (err != 0)
-		mlog(LV_ERR, "E-5320: link %s -> %s: %s", tmf.m_path.c_str(),
-			path.c_str(), strerror(err));
+	/* Ditch tmf when another thread created the file in the meantime. */
+	err = tmf.link_to_noreplace(path.c_str());
+	if (err == 0 || err == EEXIST)
+		return 0;
+	mlog(LV_ERR, "E-5320: link %s -> %s: %s", tmf.m_path.c_str(),
+		path.c_str(), strerror(err));
 	return err;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-2065: ENOMEM");
@@ -3941,10 +3918,10 @@ bool cu_get_permission_property(int64_t member_id,
 	case PR_SMTP_ADDRESS: {
 		pusername = pstmt.col_text(0);
 		if ('\0' == pusername[0]) {
-			*ppvalue = deconst("default");
+			*ppvalue = deconst("anonymous");
 			return TRUE;
 		} else if (0 == strcasecmp(pusername, "default")) {
-			*ppvalue = deconst("anonymous");
+			*ppvalue = deconst("default");
 			return TRUE;
 		}
 		std::string display_name;
@@ -3970,8 +3947,7 @@ bool cu_get_permission_property(int64_t member_id,
 	return TRUE;
 }
 
-BOOL common_util_parse_addressbook_entryid(const BINARY *pbin,
-    char *address_type, size_t atsize, char *email_address, size_t emsize)
+bool cu_parse_abkeid(const BINARY *pbin, std::string &type, std::string &addr)
 {
 	uint32_t flags;
 	EXT_PULL ext_pull;
@@ -3986,11 +3962,9 @@ BOOL common_util_parse_addressbook_entryid(const BINARY *pbin,
 	/* Tail functions will use EXT_PULL::*_eid, which parse a full EID */
 	ext_pull.m_offset = 0;
 	if (provider_uid == muidEMSAB)
-		return emsab_to_parts(ext_pull, address_type,
-		       atsize, email_address, emsize) ? TRUE : false;
+		return emsab_to_parts(ext_pull, type, addr);
 	if (provider_uid == muidOOP)
-		return oneoff_to_parts(ext_pull, address_type,
-		       atsize, email_address, emsize) ? TRUE : false;
+		return oneoff_to_parts(ext_pull, type, addr);
 	return FALSE;
 }
 
@@ -4009,11 +3983,11 @@ BINARY* common_util_to_private_folder_entryid(
 	unsigned int user_id = 0;
 	if (!mysql_adaptor_get_user_ids(username, &user_id, nullptr, nullptr))
 		return nullptr;
-	tmp_entryid.database_guid = rop_util_make_user_guid(user_id);
-	tmp_entryid.folder_type = EITLT_PRIVATE_FOLDER;
-	tmp_entryid.global_counter = rop_util_get_gc_array(folder_id);
-	tmp_entryid.pad[0] = 0;
-	tmp_entryid.pad[1] = 0;
+	tmp_entryid.folder_dbguid = rop_util_make_user_guid(user_id);
+	tmp_entryid.eid_type      = EITLT_PRIVATE_FOLDER;
+	tmp_entryid.folder_gc     = rop_util_get_gc_array(folder_id);
+	tmp_entryid.pad1[0] = 0;
+	tmp_entryid.pad1[1] = 0;
 	pbin = cu_alloc<BINARY>();
 	if (pbin == nullptr)
 		return NULL;
@@ -4040,11 +4014,11 @@ BINARY* common_util_to_private_message_entryid(
 	unsigned int user_id = 0;
 	if (!mysql_adaptor_get_user_ids(username, &user_id, nullptr, nullptr))
 		return nullptr;
-	tmp_entryid.folder_database_guid = rop_util_make_user_guid(user_id);
-	tmp_entryid.message_type = EITLT_PRIVATE_MESSAGE;
-	tmp_entryid.message_database_guid = tmp_entryid.folder_database_guid;
-	tmp_entryid.folder_global_counter = rop_util_get_gc_array(folder_id);
-	tmp_entryid.message_global_counter = rop_util_get_gc_array(message_id);
+	tmp_entryid.folder_dbguid  = rop_util_make_user_guid(user_id);
+	tmp_entryid.eid_type       = EITLT_PRIVATE_MESSAGE;
+	tmp_entryid.message_dbguid = tmp_entryid.folder_dbguid;
+	tmp_entryid.folder_gc      = rop_util_get_gc_array(folder_id);
+	tmp_entryid.message_gc     = rop_util_get_gc_array(message_id);
 	tmp_entryid.pad1[0] = 0;
 	tmp_entryid.pad1[1] = 0;
 	tmp_entryid.pad2[0] = 0;
@@ -4683,7 +4657,7 @@ BOOL common_util_check_message_owner(sqlite3 *psqlite,
 		return TRUE;
 	}
 	std::string es_result;
-	auto ret = cvt_essdn_to_username(ab_entryid.px500dn, g_exmdb_org_name,
+	auto ret = cvt_essdn_to_username(ab_entryid.x500dn.c_str(), g_exmdb_org_name,
 	           mysql_adaptor_userid_to_name, es_result);
 	if (ret != ecSuccess) {
 		*pb_owner = false;
@@ -4696,9 +4670,22 @@ BOOL common_util_check_message_owner(sqlite3 *psqlite,
 static errno_t copy_eml_ext(const char *old_midstr, std::string &new_midstr) try
 {
 	auto basedir = exmdb_server::get_dir();
-	new_midstr = fmt::format("{}.x{}.{}", time(nullptr), common_util_sequence_ID(), get_host_ID());
+	char guidtxt[GUIDSTR_SIZE]{};
+	GUID::random_new().to_str(guidtxt, std::size(guidtxt), 32);
+	/*
+	 * The midstr column is UNIQUE in at least midb.sqlite3, so
+	 * unfortunately we always need to generate new midstrs even though
+	 * that is not strictly necessary (EML files are write-once).
+	 * For more notes on midstr format, see mt2exm.cpp.
+	 */
+	new_midstr = fmt::format("R-{}/{}", &guidtxt[30], guidtxt);
 	auto old_eml = fmt::format("{}/eml/{}", basedir, old_midstr);
 	auto new_eml = fmt::format("{}/eml/{}", basedir, new_midstr);
+	auto ret = gx_mkbasedir(new_eml.c_str(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
+	if (ret < 0) {
+		mlog(LV_ERR, "E-1493: mkbasedir for %s: %s", new_eml.c_str(), strerror(-ret));
+		return -ret;
+	}
 	/*
 	 * Partial mailboxes (without cid/-like directories) are
 	 * normal for debugging, don't warn in that case.
@@ -4712,6 +4699,11 @@ static errno_t copy_eml_ext(const char *old_midstr, std::string &new_midstr) try
 	}
 	auto old_ext = fmt::format("{}/ext/{}", basedir, old_midstr);
 	auto new_ext = fmt::format("{}/ext/{}", basedir, new_midstr);
+	ret = gx_mkbasedir(new_ext.c_str(), FMODE_PRIVATE | S_IXUSR | S_IXGRP);
+	if (ret < 0) {
+		mlog(LV_ERR, "E-1495: mkbasedir for %s: %s", new_ext.c_str(), strerror(-ret));
+		return -ret;
+	}
 	if (link(old_ext.c_str(), new_ext.c_str()) < 0) {
 		int se = errno;
 		if (errno != ENOENT || g_dbg_synth_content == 0)
@@ -4722,6 +4714,42 @@ static errno_t copy_eml_ext(const char *old_midstr, std::string &new_midstr) try
 	return 0;
 } catch (const std::bad_alloc &) {
 	return ENOMEM;
+}
+
+bool timeindex_delete(sqlite3 *db, uint64_t fid, uint64_t mid)
+{
+	if (fid == 0)
+		return true;
+	const auto &q = mid == 0 ?
+		fmt::format("DELETE FROM msgtime_index WHERE folder_id={}", fid) :
+		fmt::format("DELETE FROM msgtime_index WHERE folder_id={} AND message_id={}", fid, mid);
+	return gx_sql_exec(db, q) == SQLITE_OK;
+}
+
+bool timeindex_insert(sqlite3 *db, uint64_t fid, uint64_t mid)
+{
+	if (fid == 0)
+		return true; /* embedded message */
+	auto q = fmt::format(
+		"INSERT INTO msgtime_index "
+		"SELECT m.parent_fid, m.message_id, mt.propval, rt.propval, st.propval "
+		"FROM messages AS m "
+		"LEFT JOIN message_properties AS mt ON m.message_id=mt.message_id AND mt.proptag={} "
+		"LEFT JOIN message_properties AS rt ON m.message_id=rt.message_id AND rt.proptag={} "
+		"LEFT JOIN message_properties AS st ON m.message_id=st.message_id AND st.proptag={} "
+		"WHERE m.parent_fid={} AND m.message_id={} "
+		"AND m.is_associated=0 AND m.is_deleted=0",
+		static_cast<uint32_t>(PR_LAST_MODIFICATION_TIME),
+		static_cast<uint32_t>(PR_MESSAGE_DELIVERY_TIME),
+		static_cast<uint32_t>(PR_CLIENT_SUBMIT_TIME), fid, mid);
+	return gx_sql_exec(db, q) == SQLITE_OK;
+}
+
+bool timeindex_refresh(sqlite3 *db, uint64_t fid, uint64_t mid)
+{
+	if (!timeindex_delete(db, fid, mid))
+		/* ignore */;
+	return timeindex_insert(db, fid, mid);
 }
 
 static BOOL common_util_copy_message_internal(sqlite3 *psqlite, 
@@ -4805,12 +4833,15 @@ static BOOL common_util_copy_message_internal(sqlite3 *psqlite,
 		if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK)
 			return FALSE;
 	}
+
 	snprintf(sql_string, std::size(sql_string), "INSERT INTO message_properties (message_id,"
 			" proptag, propval) SELECT %llu, proptag, propval FROM "
 			"message_properties WHERE message_id=%llu",
 			LLU{*pdst_mid}, LLU{message_id});
 	if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK)
 		return FALSE;
+	if (!timeindex_insert(psqlite, parent_id, *pdst_mid))
+		return false;
 	snprintf(sql_string, std::size(sql_string), "SELECT recipient_id FROM"
 	          " recipients WHERE message_id=%llu", LLU{message_id});
 	pstmt = gx_sql_prep(psqlite, sql_string);

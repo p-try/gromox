@@ -84,13 +84,13 @@ struct edb_folder {
 }
 
 static unsigned int g_list_mbox, g_mlog_level = MLOG_DEFAULT_LEVEL;
-static char *g_extract_mbox;
+static const char *g_extract_mbox;
 
 static constexpr HXoption g_options_table[] = {
 	{nullptr, 'l', HXTYPE_NONE, &g_list_mbox, nullptr, nullptr, 0, "Show available mailboxes in database"},
 	{nullptr, 'p', HXTYPE_NONE | HXOPT_INC, &g_show_props, nullptr, nullptr, 0, "Show properties in detail (if -t)"},
 	{nullptr, 't', HXTYPE_NONE, &g_show_tree, nullptr, nullptr, 0, "Show tree-based analysis of the archive"},
-	{nullptr, 'x', HXTYPE_STRING, &g_extract_mbox, nullptr, nullptr, 0, "Extract the given mailbox", "ID/RK/GUID"},
+	{nullptr, 'x', HXTYPE_STRING, {}, {}, {}, 0, "Extract the given mailbox", "ID/RK/GUID"},
 	{"loglevel", 0, HXTYPE_UINT, &g_mlog_level, {}, {}, {}, "Basic loglevel of the program", "N"},
 	HXOPT_AUTOHELP,
 	HXOPT_TABLEEND,
@@ -371,7 +371,7 @@ static void do_namedprops(mbox_state &mbs)
 static void do_propblob(TPROPVAL_ARRAY &props, const std::string &blob)
 {
 	if (blob.size() < 6 || memcmp(&blob[0], "ProP\x00\x04", 6) != 0) {
-		fprintf(stderr, "Unrecognized propblob content: %s\n", bin2hex(blob.data(), blob.size()).c_str());
+		fprintf(stderr, "Unrecognized propblob content: %s\n", bin2hex(blob).c_str());
 		return;
 	}
 	TPROPVAL_ARRAY new_props;
@@ -525,7 +525,7 @@ static void do_folder(mbox_state &mbs, const edb_folder &folder)
 {
 	tree(mbs.depth);
 	if (g_show_tree)
-		tlog("[fld=%s]\n", bin2hex(folder.fid.data(), folder.fid.size()).c_str());
+		tlog("[fld=%s]\n", bin2hex(folder.fid).c_str());
 	++mbs.depth;
 	gi_print(mbs.depth, folder.props, ee_get_propname);
 	for (const auto &child_id : folder.children)
@@ -538,7 +538,7 @@ static void do_folder(mbox_state &mbs, const edb_folder &folder)
  */
 static errno_t do_mbox(mbox_state &mbs)
 {
-	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0003", 8) < 0)
+	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0004", 8) < 0)
 		throw YError("PG-1014: %s", strerror(errno));
 	uint8_t flag = false;
 	if (HXio_fullwrite(STDOUT_FILENO, &flag, sizeof(flag)) < 0) /* splice flag */
@@ -629,7 +629,9 @@ static errno_t do_file(const char *filename) try
 	    ep.p_uint32(1) != pack_result::ok ||
 	    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
 	    ep.p_uint64(parent.folder_id) != pack_result::ok ||
-	    ep.p_msgctnt(*ctnt) != pack_result::ok) {
+	    ep.p_msgctnt(*ctnt) != pack_result::ok ||
+	    ep.p_str("") != pack_result::ok ||
+	    ep.p_str("") != pack_result::ok) {
 		fprintf(stderr, "E-2021\n");
 		return EXIT_FAILURE;
 	}
@@ -661,15 +663,20 @@ static void terse_help()
 
 int main(int argc, char **argv)
 {
+	HXopt6_auto_result argp;
 	setvbuf(stdout, nullptr, _IOLBF, 0);
-	if (HX_getopt5(g_options_table, argv, &argc, &argv,
-	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS)
+	if (HX_getopt6(g_options_table, argc, argv, &argp,
+	    HXOPT_USAGEONERR | HXOPT_ITER_OA) != HXOPT_ERR_SUCCESS)
 		return EXIT_FAILURE;
-	auto cl_0 = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
-	if (argc != 2) {
+	for (int i = 0; i < argp.nopts; ++i)
+		if (argp.desc[i]->sh == 'x')
+			g_extract_mbox = argp.oarg[i];
+	if (argp.nargs != 1) {
+		fprintf(stderr, "Need exactly one edb file as argument.\n");
 		terse_help();
 		return EXIT_FAILURE;
 	}
+
 #if 0
 	if (isatty(STDOUT_FILENO)) {
 		fprintf(stderr, "Refusing to output the binary Mailbox Transfer Data Stream to a terminal.\n"
@@ -682,7 +689,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	textmaps_init(PKGDATADIR);
 
-	auto ret = do_file(argv[1]);
+	auto ret = do_file(argp.uarg[0]);
 	if (ret != 0) {
 		fprintf(stderr, "edb2mt: Import unsuccessful.\n");
 		return EXIT_FAILURE;

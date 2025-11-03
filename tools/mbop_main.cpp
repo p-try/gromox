@@ -14,6 +14,7 @@
 #include <libHX/scope.hpp>
 #include <libHX/string.h>
 #include <gromox/exmdb_client.hpp>
+#include <gromox/exmdb_rpc.hpp>
 #include <gromox/freebusy.hpp>
 #include <gromox/mapidefs.h>
 #include <gromox/mysql_adaptor.hpp>
@@ -53,7 +54,7 @@ void delcount(eid_t fid, uint32_t *delc, uint32_t *fldc)
 	*delc = *fldc = 0;
 	if (!exmdb_client->get_folder_properties(g_storedir, CP_ACP, fid,
 	    &taghdr, &props)) {
-		fprintf(stderr, "delcount: get_folder_properties failed\n");
+		mbop_fprintf(stderr, "delcount: get_folder_properties failed\n");
 		return;
 	}
 	auto c = props.get<const uint32_t>(tags[0]);
@@ -64,12 +65,13 @@ void delcount(eid_t fid, uint32_t *delc, uint32_t *fldc)
 
 namespace global {
 
-char *g_arg_username, *g_arg_userdir;
-unsigned int g_continuous_mode;
+const char *g_arg_username, *g_arg_userdir;
+unsigned int g_continuous_mode, g_verbose_mode, g_command_num;
 static constexpr HXoption g_options_table[] = {
 	{nullptr, 'c', HXTYPE_NONE, &g_continuous_mode, {}, {}, {}, "Do not stop on errors"},
-	{nullptr, 'd', HXTYPE_STRING, &g_arg_userdir, nullptr, nullptr, 0, "Directory of the mailbox", "DIR"},
-	{nullptr, 'u', HXTYPE_STRING, &g_arg_username, nullptr, nullptr, 0, "Username of store to import to", "EMAILADDR"},
+	{nullptr, 'v', HXTYPE_NONE, &g_verbose_mode, {}, {}, {}, "Be a little more talkative"},
+	{{}, 'd', HXTYPE_STRING, {}, {}, {}, 0, "Directory of the mailbox", "DIR"},
+	{{}, 'u', HXTYPE_STRING, {}, {}, {}, 0, "Username of store to import to", "EMAILADDR"},
 	MBOP_AUTOHELP,
 	HXOPT_TABLEEND,
 };
@@ -78,12 +80,12 @@ void command_overview()
 {
 	fprintf(stderr, "Commands:\n\tcgkreset clear-photo clear-profile clear-rwz delmsg "
 		"echo-maildir echo-username "
-		"emptyfld get-freebusy get-photo get-websettings "
+		"emptyfld freeze get-freebusy get-photo get-websettings "
 		"get-websettings-persistent "
 		"get-websettings-recipients ping "
 		"purge-datafiles purge-softdelete recalc-sizes set-locale "
 		"set-photo set-websettings set-websettings-persistent "
-		"set-websettings-recipients unload vacuum\n");
+		"set-websettings-recipients thaw unload vacuum\n");
 	fprintf(stderr, "Command chaining: ( command1 c1args... ) ( command2 c2args... )...\n");
 }
 
@@ -145,10 +147,9 @@ static bool recalc_sizes(const char *dir)
 static int main(int argc, char **argv)
 {
 	bool ok = false;
-	if (HX_getopt5(g_options_table, argv, &argc, &argv,
+	if (HX_getopt6(g_options_table, argc, argv, nullptr,
 	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
 		return EXIT_PARAM;
-	auto cl_0 = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
 	if (strcmp(argv[0], "purge-datafiles") == 0)
 		ok = exmdb_client->purge_datafiles(g_storedir);
 	else if (strcmp(argv[0], "echo-username") == 0) {
@@ -161,16 +162,48 @@ static int main(int argc, char **argv)
 		ok = exmdb_client->ping_store(g_storedir);
 	else if (strcmp(argv[0], "unload") == 0)
 		ok = exmdb_client->unload_store(g_storedir);
+	else if (strcmp(argv[0], "thaw") == 0)
+		ok = exmdb_client->set_maintenance(g_storedir, static_cast<uint32_t>(db_maint_mode::usable));
 	else if (strcmp(argv[0], "vacuum") == 0)
 		ok = exmdb_client->vacuum(g_storedir);
 	else if (strcmp(argv[0], "recalc-sizes") == 0)
 		ok = recalc_sizes(g_storedir);
 	else {
-		fprintf(stderr, "Unrecognized subcommand \"%s\"\n", argv[0]);
+		mbop_fprintf(stderr, "Unrecognized subcommand \"%s\"\n", argv[0]);
 		return EXIT_PARAM;
 	}
 	if (!ok) {
-		fprintf(stderr, "%s: the operation failed\n", argv[0]);
+		mbop_fprintf(stderr, "%s: the operation failed\n", argv[0]);
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+
+} /* namespace simple_rpc */
+
+namespace set_maint {
+
+static unsigned int g_fast;
+static constexpr HXoption g_options_table[] = {
+	{"no-wait", 0, HXTYPE_NONE, &g_fast, {}, {}, 0, "Do not wait for reference count to reach zero"},
+	MBOP_AUTOHELP,
+	HXOPT_TABLEEND,
+};
+
+static int freeze_main(int argc, char **argv)
+{
+	if (HX_getopt6(g_options_table, argc, argv, nullptr,
+	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
+		return EXIT_PARAM;
+	/*
+	 * db_maint_mode::hold is not offered presently, since exmdb is prone
+	 * to get into out-of-memory situations when used.
+	 */
+	enum db_maint_mode mode = g_fast ? db_maint_mode::reject :
+	                          db_maint_mode::reject_waitforexcl;
+	auto ok = exmdb_client->set_maintenance(g_storedir, static_cast<uint32_t>(mode));
+	if (!ok) {
+		mbop_fprintf(stderr, "%s: the operation failed\n", argv[0]);
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -197,10 +230,9 @@ static errno_t resolvename(const GUID &guid, const char *name, bool create,
 static int delstoreprop(int argc, char **argv, const GUID &guid,
     const char *name, uint16_t type)
 {
-	if (HX_getopt5(empty_options_table, argv, &argc, &argv,
+	if (HX_getopt6(empty_options_table, argc, argv, nullptr,
 	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
 		return EXIT_PARAM;
-	auto cl_0a = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
 
 	propid_t propid = 0;
 	auto err = resolvename(guid, name, false, &propid);
@@ -230,11 +262,11 @@ static errno_t showstoreprop(proptag_t proptag)
 		auto bv = vals.get<const BINARY>(proptag);
 		if (bv == nullptr) {
 			if (isatty(STDERR_FILENO))
-				fprintf(stderr, "Property is unset\n");
+				mbop_fprintf(stderr, "Property is unset\n");
 			return 0;
 		}
 		if (isatty(STDOUT_FILENO) && isatty(STDERR_FILENO))
-			fprintf(stderr, "[%u bytes of binary data]\n", bv->cb);
+			mbop_fprintf(stderr, "[%u bytes of binary data]\n", bv->cb);
 		if (!isatty(STDOUT_FILENO)) {
 			auto ret = HXio_fullwrite(STDOUT_FILENO, bv->pc, bv->cb);
 			if (ret < 0 || static_cast<size_t>(ret) != bv->cb)
@@ -258,10 +290,9 @@ static errno_t showstoreprop(proptag_t proptag)
 static int showstoreprop(int argc, char **argv, const GUID guid,
     const char *name, proptype_t proptype)
 {
-	if (HX_getopt5(empty_options_table, argv, &argc, &argv,
+	if (HX_getopt6(empty_options_table, argc, argv, nullptr,
 	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
 		return EXIT_PARAM;
-	auto cl_0a = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
 
 	propid_t propid = 0;
 	auto err = resolvename(guid, name, false, &propid);
@@ -310,18 +341,17 @@ static errno_t setstoreprop(proptag_t proptag)
 static int setstoreprop(int argc, char **argv, const GUID guid,
     const char *name, proptype_t proptype)
 {
-	if (HX_getopt5(empty_options_table, argv, &argc, &argv,
+	if (HX_getopt6(empty_options_table, argc, argv, nullptr,
 	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS || g_exit_after_optparse)
 		return EXIT_PARAM;
-	auto cl_0a = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
 
 	propid_t propid = 0;
 	auto err = resolvename(guid, name, true, &propid);
 	if (err == ENOENT) {
-		fprintf(stderr, "namedprop %s not found\n", name);
+		mbop_fprintf(stderr, "namedprop %s not found\n", name);
 		return EXIT_FAILURE;
 	} else if (err != 0) {
-		fprintf(stderr, "%s\n", strerror(-err));
+		mbop_fprintf(stderr, "%s\n", strerror(-err));
 		return EXIT_FAILURE;
 	}
 	return setstoreprop(PROP_TAG(proptype, propid));
@@ -363,7 +393,7 @@ static errno_t clear_rwz()
 	ea_info.count = ids.size();
 	ea_info.pids  = ids.data();
 	BOOL partial = false;
-	printf("Deleting %u messages...\n", ea_info.count);
+	printf("Deleting %u message(s)...\n", ea_info.count);
 	if (!exmdb_client->delete_messages(g_storedir, CP_ACP, nullptr, inbox,
 	    &ea_info, 1, &partial))
 		return EIO;
@@ -402,13 +432,19 @@ static constexpr static_module g_dfl_svc_plugins[] =
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
-	if (HX_getopt5(global::g_options_table, argv, &argc, &argv,
-	    HXOPT_RQ_ORDER | HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS ||
+	HXopt6_auto_result result;
+	if (HX_getopt6(global::g_options_table, argc, argv, &result,
+	    HXOPT_USAGEONERR | HXOPT_RQ_ORDER | HXOPT_ITER_OA) != HXOPT_ERR_SUCCESS ||
 	    g_exit_after_optparse)
 		return EXIT_PARAM;
-	auto cl_0 = HX::make_scope_exit([=]() { HX_zvecfree(argv); });
-	--argc;
-	++argv;
+	for (int i = 0; i < result.nopts; ++i) {
+		if (result.desc[i]->sh == 'd')
+			global::g_arg_userdir = result.oarg[i];
+		else if (result.desc[i]->sh == 'u')
+			global::g_arg_username = result.oarg[i];
+	}
+	argc = result.nargs;
+	argv = result.uarg;
 	if (argc == 0)
 		return global::help();
 	service_init({nullptr, g_dfl_svc_plugins, 1});
@@ -468,7 +504,8 @@ int cmd_parser(int argc, char **argv)
 		return EXIT_FAILURE;
 	if (strcmp(argv[0], "(") == 0)
 		return parens_parser(argc, argv);
-	else if (strcmp(argv[0], "delmsg") == 0)
+	++g_command_num;
+	if (strcmp(argv[0], "delmsg") == 0)
 		return delmsg::main(argc, argv);
 	else if (strcmp(argv[0], "emptyfld") == 0)
 		return emptyfld::main(argc, argv);
@@ -516,6 +553,8 @@ int cmd_parser(int argc, char **argv)
 		return EXIT_SUCCESS;
 	} else if (strcmp(argv[0], "cgkreset") == 0) {
 		return cgkreset::main(argc, argv);
+	} else if (strcmp(argv[0], "freeze") == 0) {
+		return set_maint::freeze_main(argc, argv);
 	}
 	return simple_rpc::main(argc, argv);
 }

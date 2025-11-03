@@ -35,7 +35,6 @@
 #include <gromox/exmdb_rpc.hpp>
 #include <gromox/fileio.h>
 #include <gromox/mail_func.hpp>
-#include <gromox/msgchg_grouping.hpp>
 #include <gromox/oxcmail.hpp>
 #include <gromox/paths.h>
 #include <gromox/process.hpp>
@@ -58,15 +57,15 @@ int (*system_services_add_timer)(const char *, int);
 
 gromox::atomic_bool g_main_notify_stop;
 std::shared_ptr<CONFIG_FILE> g_config_file;
-static char *opt_config_file;
+static const char *opt_config_file;
 static unsigned int opt_show_version;
 static gromox::atomic_bool g_hup_signalled;
 static gromox::atomic_bool g_listener_notify_stop;
 static int g_listen_sockd;
 static pthread_t g_listener_id;
 
-static constexpr struct HXoption g_options_table[] = {
-	{nullptr, 'c', HXTYPE_STRING, &opt_config_file, nullptr, nullptr, 0, "Config file to read", "FILE"},
+static constexpr HXoption g_options_table[] = {
+	{nullptr, 'c', HXTYPE_STRING, {}, {}, {}, 0, "Config file to read", "FILE"},
 	{"version", 0, HXTYPE_NONE, &opt_show_version, nullptr, nullptr, 0, "Output version information and exit"},
 	HXOPT_AUTOHELP,
 	HXOPT_TABLEEND,
@@ -97,12 +96,11 @@ static constexpr cfg_directive zcore_cfg_defaults[] = {
 	{"mail_max_length", "64M", CFG_SIZE, "1"},
 	{"mailbox_ping_interval", "5min", CFG_TIME, "1min", "1h"},
 	{"max_ext_rule_length", "510K", CFG_SIZE, "1"},
-	{"max_mail_num", "1000000", CFG_SIZE, "1"},
 	{"max_rcpt_num", "256", CFG_SIZE, "1"},
 	{"notify_stub_threads_num", "10", CFG_SIZE, "1", "100"},
 	{"oxcical_allday_ymd", "1", CFG_BOOL},
 	{"rpc_proxy_connection_num", "10", CFG_SIZE, "1", "100"},
-	{"submit_command", "/usr/bin/php " PKGDATADIR "/sa/submit.php"},
+	{"submit_command", "/usr/bin/php " PKGDATADIR "/submit.php"},
 	{"user_cache_interval", "1h", CFG_TIME, "1min", "1day"},
 	{"user_table_size", "5000", CFG_SIZE, "100", "50000"},
 	{"x500_org_name", "Gromox default"},
@@ -243,13 +241,17 @@ int main(int argc, char **argv)
 {
 	char temp_buff[45];
 	std::shared_ptr<CONFIG_FILE> pconfig;
+	HXopt6_auto_result argp;
 	
 	exmdb_rpc_alloc = common_util_alloc;
 	exmdb_rpc_free = [](void *) {};
 	setvbuf(stdout, nullptr, _IOLBF, 0);
-	if (HX_getopt5(g_options_table, argv, nullptr, nullptr,
-	    HXOPT_USAGEONERR) != HXOPT_ERR_SUCCESS)
+	if (HX_getopt6(g_options_table, argc, argv, &argp,
+	    HXOPT_USAGEONERR | HXOPT_ITER_OPTS) != HXOPT_ERR_SUCCESS)
 		return EXIT_FAILURE;
+	for (int i = 0; i < argp.nopts; ++i)
+		if (argp.desc[i]->sh == 'c')
+			opt_config_file = argp.oarg[i];
 
 	startup_banner("gromox-zcore");
 	if (opt_show_version)
@@ -297,9 +299,6 @@ int main(int argc, char **argv)
 	auto max_rcpt = pconfig->get_ll("max_rcpt_num");
 	mlog(LV_INFO, "system: maximum rcpt number is %lld", max_rcpt);
 	
-	auto max_mail = pconfig->get_ll("max_mail_num");
-	mlog(LV_INFO, "system: maximum mail number is %lld", max_mail);
-	
 	auto max_length = pconfig->get_ll("mail_max_length");
 	HX_unit_size(temp_buff, std::size(temp_buff), max_length, 1024, 0);
 	mlog(LV_INFO, "system: maximum mail length is %s", temp_buff);
@@ -321,7 +320,7 @@ int main(int argc, char **argv)
 	
 	common_util_init(g_config_file->get_value("x500_org_name"),
 		g_config_file->get_value("default_charset"),
-		max_rcpt, max_mail, max_length, max_rule_len, std::move(smtp_url),
+		max_rcpt, max_length, max_rule_len, std::move(smtp_url),
 		g_config_file->get_value("submit_command"));
 	
 	int proxy_num = pconfig->get_ll("rpc_proxy_connection_num");
@@ -381,10 +380,6 @@ int main(int argc, char **argv)
 	if (bounce_gen_init(g_config_file->get_value("config_file_path"),
 	    g_config_file->get_value("data_file_path"), "notify_bounce") != 0) {
 		mlog(LV_ERR, "system: failed to start bounce producer");
-		return EXIT_FAILURE;
-	}
-	if (msgchg_grouping_run(g_config_file->get_value("data_file_path")) != 0) {
-		mlog(LV_ERR, "system: failed to start msgchg grouping");
 		return EXIT_FAILURE;
 	}
 	if (!ab_tree::AB.run()) {

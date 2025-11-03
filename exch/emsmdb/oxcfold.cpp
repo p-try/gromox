@@ -58,6 +58,11 @@ ec_error_t rop_openfolder(uint64_t folder_id, uint8_t open_flags,
 		return ecError;
 	if (!b_exist)
 		return ecNotFound;
+	/*
+	 * Even if "register for notifications" is disabled in MFCMAPI,
+	 * emsmdb32.dll still uses notifications towards the server and does
+	 * not pass TABLE_FLAG_NONOTIFICATIONS to OpenFolder/GHT/GCT.
+	 */
 	if (!plogon->is_private()) {
 		if (!exmdb_client->is_folder_deleted(dir, folder_id, &b_del))
 			return ecError;
@@ -382,12 +387,12 @@ ec_error_t rop_setsearchcriteria(RESTRICTION *pres,
 				cannot be changed */
 			return ecSuccess;
 	}
-	for (size_t i = 0; i < pfolder_ids->count; ++i) {
-		if (rop_util_get_replid(pfolder_ids->pll[i]) != 1)
+	for (const auto folder_id : *pfolder_ids) {
+		if (rop_util_get_replid(folder_id) != 1)
 			return ecSearchFolderScopeViolation;
 		if (username != STORE_OWNER_GRANTED) {
 			if (!exmdb_client->get_folder_perm(plogon->get_dir(),
-			    pfolder_ids->pll[i], username, &permission))
+			    folder_id, username, &permission))
 				return ecError;
 			if (!(permission & (frightsOwner | frightsReadAny)))
 				return ecAccessDenied;
@@ -747,10 +752,9 @@ static ec_error_t oxcfold_deletemessages(BOOL b_hard, uint8_t want_asynchronous,
 	EID_ARRAY ids = {0, cu_alloc<uint64_t>(pmessage_ids->count)};
 	if (ids.pids == nullptr)
 		return ecError;
-	for (size_t i = 0; i < pmessage_ids->count; ++i) {
+	for (const auto msgid : *pmessage_ids) {
 		if (username != STORE_OWNER_GRANTED) {
-			if (!exmdb_client->is_message_owner(dir,
-			    pmessage_ids->pll[i], username, &b_owner))
+			if (!exmdb_client->is_message_owner(dir, msgid, username, &b_owner))
 				return ecError;
 			if (!b_owner) {
 				b_partial = TRUE;
@@ -761,7 +765,7 @@ static ec_error_t oxcfold_deletemessages(BOOL b_hard, uint8_t want_asynchronous,
 		static constexpr PROPTAG_ARRAY tmp_proptags = {std::size(proptag_buff), deconst(proptag_buff)};
 		TPROPVAL_ARRAY tmp_propvals;
 		if (!exmdb_client->get_message_properties(dir, nullptr, CP_ACP,
-		    pmessage_ids->pll[i], &tmp_proptags, &tmp_propvals))
+		    msgid, &tmp_proptags, &tmp_propvals))
 			return ecError;
 		pbrief = NULL;
 		auto pvalue = tmp_propvals.get<uint8_t>(PR_NON_RECEIPT_NOTIFICATION_REQUESTED);
@@ -769,10 +773,10 @@ static ec_error_t oxcfold_deletemessages(BOOL b_hard, uint8_t want_asynchronous,
 			pvalue = tmp_propvals.get<uint8_t>(PR_READ);
 			if ((pvalue == nullptr || *pvalue == 0) &&
 			    !exmdb_client->get_message_brief(dir,
-			     pinfo->cpid, pmessage_ids->pll[i], &pbrief))
+			     pinfo->cpid, msgid, &pbrief))
 				return ecError;
 		}
-		ids.pids[ids.count++] = pmessage_ids->pll[i];
+		ids.pids[ids.count++] = msgid;
 		if (pbrief != nullptr)
 			common_util_notify_receipt(dir,
 				NOTIFY_RECEIPT_NON_READ, pbrief);
@@ -788,7 +792,7 @@ ec_error_t rop_deletemessages(uint8_t want_asynchronous, uint8_t notify_non_read
     const LONGLONG_ARRAY *pmessage_ids, uint8_t *ppartial_completion,
     LOGMAP *plogmap, uint8_t logon_id, uint32_t hin)
 {
-	return oxcfold_deletemessages(FALSE, want_asynchronous,
+	return oxcfold_deletemessages(!emsmdb_pvt_folder_softdel, want_asynchronous,
 			notify_non_read, pmessage_ids, ppartial_completion,
 			plogmap, logon_id, hin);
 }

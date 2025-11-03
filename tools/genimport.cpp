@@ -48,7 +48,7 @@ const char *g_storedir;
 unsigned int g_user_id, g_wet_run = 1;
 unsigned int g_public_folder, g_verbose_create;
 static thread_local alloc_context g_alloc_mgr;
-static ec_error_t (*exmdb_local_rules_execute)(const char *, const char *, const char *, eid_t, eid_t, unsigned int);
+ec_error_t (*exmdb_local_rules_execute)(const char *, const char *, const char *, eid_t, eid_t, unsigned int);
 
 YError::YError(const std::string &s) : m_str(s)
 {}
@@ -223,7 +223,7 @@ int exm_set_change_keys(TPROPVAL_ARRAY *props, eid_t change_num,
 		return -ENOMEM;
 	}
 	std::unique_ptr<BINARY, gi_delete> pclbin(pcl.serialize());
-	if (pclbin == nullptr){
+	if (pclbin == nullptr) {
 		fprintf(stderr, "exm: pcl_serialize: ENOMEM\n");
 		return -ENOMEM;
 	}
@@ -237,66 +237,6 @@ int exm_set_change_keys(TPROPVAL_ARRAY *props, eid_t change_num,
 	return 0;
 }
 
-/**
- * @o_excl:	Enforce that we are the first to create the folder, just like
- * 		open(2)'s %O_EXCL flag.
- */
-int exm_create_folder(uint64_t parent_fld, TPROPVAL_ARRAY *props, bool o_excl,
-    uint64_t *new_fld_id)
-{
-	uint64_t change_num = 0;
-	if (!exmdb_client->allocate_cn(g_storedir, &change_num)) {
-		fprintf(stderr, "exm: allocate_cn(fld) RPC failed\n");
-		return -EIO;
-	}
-	if (!props->has(PR_LAST_MODIFICATION_TIME)) {
-		auto last_time = rop_util_current_nttime();
-		auto ret = props->set(PR_LAST_MODIFICATION_TIME, &last_time);
-		if (ret == ecServerOOM)
-			return -ENOMEM;
-		else if (ret != ecSuccess)
-			return -EIO;
-	}
-	auto err = props->set(PidTagParentFolderId, &parent_fld);
-	if (err == ecServerOOM)
-		return -ENOMEM;
-	else if (err != ecSuccess)
-		return -EIO;
-	auto ret = exm_set_change_keys(props, change_num);
-	if (ret != 0) {
-		fprintf(stderr, "exm: tpropval: %s\n", strerror(-ret));
-		return ret;
-	}
-	auto dn = props->get<const char>(PR_DISPLAY_NAME);
-	if (!o_excl && dn != nullptr) {
-		if (!exmdb_client->get_folder_by_name(g_storedir,
-		    parent_fld, dn, new_fld_id)) {
-			fprintf(stderr, "exm: get_folder_by_name \"%s\" RPC/network failed\n", dn);
-			return -EIO;
-		}
-		if (*new_fld_id != 0)
-			return 0;
-	}
-	if (dn == nullptr)
-		dn = "";
-	if (!exmdb_client->create_folder(g_storedir, CP_ACP, props, new_fld_id, &err)) {
-		fprintf(stderr, "exm: create_folder_by_properties \"%s\" RPC failed\n", dn);
-		return -EIO;
-	} else if (err != ecSuccess) {
-		fprintf(stderr, "exm: create_folder_by_properties \"%s\" RPC failed: %s\n",
-			dn, mapi_strerror(err));
-		return -EIO;
-	} else if (*new_fld_id == 0) {
-		fprintf(stderr, "exm: Could not create folder \"%s\". "
-			"Either it already existed or some there was some other unspecified problem.\n", dn);
-		return -EEXIST;
-	} else if (g_verbose_create) {
-		fprintf(stderr, "exm: Created folder \"%s\" (fid=0x%llx)\n", dn,
-			LLU{rop_util_get_gc_value(*new_fld_id)});
-	}
-	return 0;
-}
-
 int exm_permissions(eid_t fid, const std::vector<PERMISSION_DATA> &perms)
 {
 	if (perms.size() == 0)
@@ -305,120 +245,6 @@ int exm_permissions(eid_t fid, const std::vector<PERMISSION_DATA> &perms)
 	    perms.size(), perms.data())) {
 		fprintf(stderr, "exm: update_folder_perm(%llxh) RPC failed\n", LLU{fid});
 		return -EIO;
-	}
-	return 0;
-}
-
-int exm_deliver_msg(const char *target, MESSAGE_CONTENT *ct, unsigned int mode)
-{
-	ct->proplist.erase(PidTagChangeNumber);
-	auto ts = rop_util_current_nttime();
-	auto ret = ct->proplist.set(PR_MESSAGE_DELIVERY_TIME, &ts);
-	if (ret != ecSuccess)
-		return ece2nerrno(ret);
-	uint64_t folder_id = 0, msg_id = 0;
-	uint32_t r32 = 0;
-	if (mode & DELIVERY_TWOSTEP)
-		mode &= ~(DELIVERY_DO_RULES | DELIVERY_DO_NOTIF);
-	if (!exmdb_client->deliver_message(g_storedir, ENVELOPE_FROM_NULL,
-	    target, CP_ACP, mode, ct, "", &folder_id, &msg_id, &r32)) {
-		fprintf(stderr, "exm: deliver_message RPC failed: code %u\n",
-		        r32);
-		return -EIO;
-	}
-	auto dm_status = static_cast<deliver_message_result>(r32);
-	switch (dm_status) {
-	case deliver_message_result::result_ok:
-		if (g_verbose_create)
-			fprintf(stderr, "Created/delivered new message 0x%llx:0x%llx\n",
-				LLU{rop_util_get_gc_value(folder_id)},
-				LLU{rop_util_get_gc_value(msg_id)});
-		break;
-	case deliver_message_result::result_error:
-		fprintf(stderr, "Message rejected - unspecified reason\n");
-		return EXIT_FAILURE;
-	case deliver_message_result::mailbox_full_bysize:
-		fprintf(stderr, "Message rejected - mailbox has reached quota limit");
-		return EXIT_FAILURE;
-	case deliver_message_result::mailbox_full_bymsg:
-		fprintf(stderr, "Message rejected - mailbox has reached maximum message count (cf. exmdb_provider.cfg:max_store_message_count)");
-		return EXIT_FAILURE;
-	case deliver_message_result::partial_completion:
-		fprintf(stderr, "Partial completion - The server could not save all of the message (wrong permissions/disk full/...)\n");
-		return EXIT_FAILURE;
-	}
-	if (!(mode & DELIVERY_TWOSTEP))
-		return EXIT_SUCCESS;
-	if (exmdb_local_rules_execute == nullptr) {
-		fprintf(stderr, "Programmer's error: libgxs_ruleproc.so was not activated, cannot perform rule processing");
-		return EXIT_FAILURE;
-	}
-	fprintf(stderr, "Exercising TWOSTEP ruleprocessor:\n");
-	if (msg_id == 0) {
-		fprintf(stderr, "deliver_message RPC did not give us a message_id -- not executing any rules.\n");
-		return EXIT_SUCCESS;
-	}
-	auto err = exmdb_local_rules_execute(g_storedir, ENVELOPE_FROM_NULL,
-	           target, folder_id, msg_id, mode);
-	if (err != ecSuccess) {
-		fprintf(stderr, "Rule execution not successful: %s\n", mapi_strerror(err));
-		return EXIT_FAILURE;
-	}
-	return EXIT_SUCCESS;
-}
-
-int exm_create_msg(uint64_t parent_fld, MESSAGE_CONTENT *ctnt)
-{
-	uint64_t msg_id = 0, change_num = 0;
-	if (!exmdb_client->allocate_message_id(g_storedir, parent_fld, &msg_id)) {
-		fprintf(stderr, "exm: allocate_message_id RPC failed (timeout?)\n");
-		return -EIO;
-	} else if (!exmdb_client->allocate_cn(g_storedir, &change_num)) {
-		fprintf(stderr, "exm: allocate_cn(msg) RPC failed\n");
-		return -EIO;
-	}
-
-	XID zxid{g_public_folder ? rop_util_make_domain_guid(g_user_id) :
-	         rop_util_make_user_guid(g_user_id), change_num};
-	char tmp_buff[22];
-	BINARY bxid;
-	EXT_PUSH ep;
-	if (!ep.init(tmp_buff, std::size(tmp_buff), 0) ||
-	    ep.p_xid(zxid) != pack_result::ok) {
-		fprintf(stderr, "exm: ext_push: ENOMEM\n");
-		return -ENOMEM;
-	}
-	bxid.pv = tmp_buff;
-	bxid.cb = ep.m_offset;
-	PCL pcl;
-	if (!pcl.append(zxid)) {
-		fprintf(stderr, "exm: pcl_append: ENOMEM\n");
-		return -ENOMEM;
-	}
-	std::unique_ptr<BINARY, gi_delete> pclbin(pcl.serialize());
-	if (pclbin == nullptr){
-		fprintf(stderr, "exm: pcl_serialize: ENOMEM\n");
-		return -ENOMEM;
-	}
-	auto props = &ctnt->proplist;
-	ec_error_t ret;
-	if ((ret = props->set(PidTagMid, &msg_id)) != ecSuccess ||
-	    (ret = props->set(PidTagChangeNumber, &change_num)) != ecSuccess ||
-	    (ret = props->set(PR_CHANGE_KEY, &bxid)) != ecSuccess ||
-	    (ret = props->set(PR_PREDECESSOR_CHANGE_LIST, pclbin.get())) != ecSuccess) {
-		fprintf(stderr, "exm: tpropval: %s\n", mapi_strerror(ret));
-		return ece2nerrno(ret);
-	}
-	if (!exmdb_client->write_message(g_storedir, CP_UTF8, parent_fld, ctnt, &ret)) {
-		fprintf(stderr, "exm: write_message RPC failed\n");
-		return -EIO;
-	} else if (ret != ecSuccess) {
-		fprintf(stderr, "exm: write_message: %s\n", mapi_strerror(ret));
-		return -EIO;
-	} else if (g_verbose_create) {
-		fprintf(stderr, "Created new message 0x%llx:0x%llx\n",
-			LLU{rop_util_get_gc_value(parent_fld)},
-			LLU{rop_util_get_gc_value(msg_id)});
 	}
 	return 0;
 }

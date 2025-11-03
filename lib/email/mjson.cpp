@@ -179,7 +179,10 @@ BOOL MJSON::load_from_json(const Json::Value &root) try
 		pjson->flag         = root["flag"].asBool();
 		pjson->priority     = root["priority"].asUInt();
 		pjson->ref          = base64_decode(root["ref"].asString());
-		if (!mjson_parse_array(pjson, root["structure"], TYPE_STRUCTURE) ||
+		if (root.isMember("structure") &&
+		    !mjson_parse_array(pjson, root["structure"], TYPE_STRUCTURE))
+			return false;
+		if (root.isMember("mimes") &&
 		    !mjson_parse_array(pjson, root["mimes"], TYPE_MIMES))
 			return false;
 		pjson->size         = root["size"].asUInt();
@@ -590,7 +593,6 @@ static void mjson_enum_build(const MJSON_MIME *pmime, BUILD_PARAM *pbuild) { try
 		pbuild->build_result = FALSE;
 		return;
 	}
-	size_t mess_len;
 	std::string regurg;
 	auto err = imail.to_str(regurg);
 	if (err != 0) {
@@ -600,7 +602,7 @@ static void mjson_enum_build(const MJSON_MIME *pmime, BUILD_PARAM *pbuild) { try
 	}
 	pbuild->io.place(msg_path, std::move(regurg));
 	Json::Value digest;
-	auto result = imail.make_digest(&mess_len, digest);
+	auto result = imail.make_digest(digest);
 	imail.clear();
 	if (result <= 0) {
 		pbuild->build_result = FALSE;

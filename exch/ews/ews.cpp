@@ -230,6 +230,7 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"ConvertId", process<Structures::mConvertIdRequest>},
 	{"CopyFolder", process<Structures::mCopyFolderRequest>},
 	{"CopyItem", process<Structures::mCopyItemRequest>},
+	{"CreateAttachment", process<Structures::mCreateAttachmentRequest>},
 	{"CreateFolder", process<Structures::mCreateFolderRequest>},
 	{"CreateItem", process<Structures::mCreateItemRequest>},
 	{"DeleteFolder", process<Structures::mDeleteFolderRequest>},
@@ -237,8 +238,10 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"EmptyFolder", process<Structures::mEmptyFolderRequest>},
 	{"FindFolder", process<Structures::mFindFolderRequest>},
 	{"FindItem", process<Structures::mFindItemRequest>},
+	{"FindPeople", process<Structures::mFindPeopleRequest>},
 	{"GetAppManifests", process<Structures::mGetAppManifestsRequest>},
 	{"GetAttachment", process<Structures::mGetAttachmentRequest>},
+	{"GetDelegate", process<Structures::mGetDelegateRequest>},
 	{"GetEvents", process<Structures::mGetEventsRequest>},
 	{"GetFolder", process<Structures::mGetFolderRequest>},
 	{"GetInboxRules", process<Structures::mGetInboxRulesRequest>},
@@ -248,8 +251,8 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"GetStreamingEvents", process<Structures::mGetStreamingEventsRequest>},
 	{"GetUserAvailabilityRequest", process<Structures::mGetUserAvailabilityRequest>},
 	{"GetUserConfiguration", process<Structures::mGetUserConfigurationRequest>},
-	{"GetUserPhoto", process<Structures::mGetUserPhotoRequest>},
 	{"GetUserOofSettingsRequest", process<Structures::mGetUserOofSettingsRequest>},
+	{"GetUserPhoto", process<Structures::mGetUserPhotoRequest>},
 	{"MoveFolder", process<Structures::mMoveFolderRequest>},
 	{"MoveItem", process<Structures::mMoveItemRequest>},
 	{"ResolveNames", process<Structures::mResolveNamesRequest>},
@@ -258,9 +261,9 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"Subscribe", process<Structures::mSubscribeRequest>},
 	{"SyncFolderHierarchy", process<Structures::mSyncFolderHierarchyRequest>},
 	{"SyncFolderItems", process<Structures::mSyncFolderItemsRequest>},
+	{"Unsubscribe", process<Structures::mUnsubscribeRequest>},
 	{"UpdateFolder", process<Structures::mUpdateFolderRequest>},
 	{"UpdateItem", process<Structures::mUpdateItemRequest>},
-	{"Unsubscribe", process<Structures::mUnsubscribeRequest>},
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -633,7 +636,7 @@ int EWSContext::notify()
 
 	mGetStreamingEventsResponse data;
 	mGetStreamingEventsResponseMessage& msg = data.ResponseMessages.emplace_back();
-	SOAP::Envelope envelope(m_plugin.server_version());
+	SOAP::Envelope envelope(m_plugin.server_version(), SOAP::Envelope::WITHOUT_DECL);
 	tinyxml2::XMLElement* response = envelope.body->InsertNewChildElement("m:GetStreamingEventsResponse");
 	response->SetAttribute("xmlns:m", Structures::NS_EWS_Messages::NS_URL);
 	response->SetAttribute("xmlns:t", Structures::NS_EWS_Types::NS_URL);
@@ -1105,10 +1108,10 @@ void EWSPlugin::wakeContext(int ID, std::chrono::milliseconds timeout) const
 gromox::EWS::Structures::sFolderEntryId EWSPlugin::mkFolderEntryId(const Structures::sMailboxInfo& mbinfo, uint64_t fid) const
 {
 	Structures::sFolderEntryId feid{};
-	feid.provider_uid = mbinfo.mailboxGuid;
-	feid.folder_type = mbinfo.isPublic ? EITLT_PUBLIC_FOLDER : EITLT_PRIVATE_FOLDER;
-	feid.database_guid = replid_to_replguid(mbinfo, rop_util_get_replid(fid));
-	feid.global_counter = rop_util_get_gc_array(fid);
+	feid.provider_uid  = mbinfo.mailboxGuid;
+	feid.eid_type      = mbinfo.isPublic ? EITLT_PUBLIC_FOLDER : EITLT_PRIVATE_FOLDER;
+	feid.folder_dbguid = replid_to_replguid(mbinfo, rop_util_get_replid(fid));
+	feid.folder_gc     = rop_util_get_gc_array(fid);
 	return feid;
 }
 
@@ -1124,12 +1127,12 @@ gromox::EWS::Structures::sFolderEntryId EWSPlugin::mkFolderEntryId(const Structu
 Structures::sMessageEntryId EWSPlugin::mkMessageEntryId(const Structures::sMailboxInfo& mbinfo, uint64_t fid, uint64_t mid) const
 {
 	Structures::sMessageEntryId meid{};
-	meid.provider_uid = mbinfo.mailboxGuid;
-	meid.message_type = mbinfo.isPublic ? EITLT_PUBLIC_MESSAGE : EITLT_PRIVATE_MESSAGE;
-	meid.folder_database_guid = replid_to_replguid(mbinfo, rop_util_get_replid(fid));
-	meid.folder_global_counter = rop_util_get_gc_array(fid);
-	meid.message_database_guid = replid_to_replguid(mbinfo, rop_util_get_replid(mid));
-	meid.message_global_counter = rop_util_get_gc_array(mid);
+	meid.provider_uid   = mbinfo.mailboxGuid;
+	meid.eid_type       = mbinfo.isPublic ? EITLT_PUBLIC_MESSAGE : EITLT_PRIVATE_MESSAGE;
+	meid.folder_dbguid  = replid_to_replguid(mbinfo, rop_util_get_replid(fid));
+	meid.folder_gc      = rop_util_get_gc_array(fid);
+	meid.message_dbguid = replid_to_replguid(mbinfo, rop_util_get_replid(mid));
+	meid.message_gc     = rop_util_get_gc_array(mid);
 	return meid;
 }
 

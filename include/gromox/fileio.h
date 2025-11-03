@@ -52,7 +52,8 @@ class GX_EXPORT tmpfile {
 	void close();
 	int open_anon(const char *dir, unsigned int flags, unsigned int mode = FMODE_PRIVATE);
 	int open_linkable(const char *dir, unsigned int flags, unsigned int mode = FMODE_PRIVATE);
-	errno_t link_to(const char *newpath);
+	errno_t link_to_overwrite(const char *newpath);
+	errno_t link_to_noreplace(const char *newpath);
 
 	int m_fd = -1;
 	std::string m_path;
@@ -97,5 +98,6 @@ extern GX_EXPORT std::string base64_encode(const std::string_view &);
 extern GX_EXPORT std::string base64_decode(const std::string_view &);
 extern GX_EXPORT std::string sss_obf_reverse(const std::string_view &);
 extern GX_EXPORT int haproxy_intervene(int fd, unsigned int level, struct sockaddr_storage *);
+extern GX_EXPORT int gx_mkbasedir(const char *file, unsigned int mode);
 
 }

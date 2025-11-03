@@ -674,11 +674,11 @@ static ec_error_t op_copy_other(rxparam &par, const rule_node &rule,
 		ep.init(fid_bin.pb, fid_bin.cb, malloc, EXT_FLAG_WCOUNT | EXT_FLAG_UTF16);
 		if (ep.g_folder_eid(&folder_eid) != pack_result::success)
 			return ecNotFound;
-		else if (folder_eid.folder_type == EITLT_PUBLIC_FOLDER && !tgt_public)
+		else if (folder_eid.eid_type == EITLT_PUBLIC_FOLDER && !tgt_public)
 			return ecNotFound;
-		else if (folder_eid.folder_type == EITLT_PRIVATE_FOLDER && tgt_public)
+		else if (folder_eid.eid_type == EITLT_PRIVATE_FOLDER && tgt_public)
 			return ecNotFound;
-		dst_fid = rop_util_make_eid_ex(1, rop_util_gc_to_value(folder_eid.global_counter));
+		dst_fid = rop_util_make_eid_ex(1, rop_util_gc_to_value(folder_eid.folder_gc));
 	}
 
 	/*
@@ -733,8 +733,9 @@ static ec_error_t op_copy_other(rxparam &par, const rule_node &rule,
 
 	/* Writeout */
 	ec_error_t e_result = ecRpcFailed;
+	uint64_t outmid = 0, outcn = 0;
 	if (!exmdb_client->write_message(newdir, CP_UTF8, dst_fid,
-	    dst.get(), &e_result)) {
+	    dst.get(), {}, &outmid, &outcn, &e_result)) {
 		mlog(LV_DEBUG, "ruleproc: write_message failed");
 		return ecRpcFailed;
 	} else if (e_result != ecSuccess) {
@@ -971,8 +972,8 @@ static ec_error_t mr_mark_done(rxparam &par)
 		return err;
 	uint64_t cal_mid = par.cur.mid, cal_cn = 0;
 	err = ecSuccess;
-	if (!exmdb_client->write_message_v2(par.cur.dir.c_str(), CP_ACP,
-	    par.cur.fid, par.ctnt, &cal_mid, &cal_cn, &err))
+	if (!exmdb_client->write_message(par.cur.dir.c_str(), CP_ACP,
+	    par.cur.fid, par.ctnt, {}, &cal_mid, &cal_cn, &err))
 		return ecRpcFailed;
 	return err;
 }
@@ -1004,8 +1005,8 @@ static ec_error_t mr_insert_to_cal(rxparam &par, const PROPID_ARRAY &propids,
 	    (err = prop.set(PR_MESSAGE_CLASS, "IPM.Appointment")) != ecSuccess)
 		return err;
 	uint64_t cal_mid = 0, cal_cn = 0;
-	if (!exmdb_client->write_message_v2(par.cur.dir.c_str(), CP_ACP,
-	    cal_fid, msg.get(), &cal_mid, &cal_cn, &err))
+	if (!exmdb_client->write_message(par.cur.dir.c_str(), CP_ACP,
+	    cal_fid, msg.get(), std::string(), &cal_mid, &cal_cn, &err))
 		return ecRpcFailed;
 	return err;
 }
@@ -1173,7 +1174,7 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 	}
 
 	/* Lookup conflict state */
-	bool res_in_use = false;
+	bool res_in_use = false, response_allowed = false;
 	auto start_nt = rq_prop.get<uint64_t>(PR_START_DATE);
 	auto end_nt   = rq_prop.get<uint64_t>(PR_END_DATE);
 	if (start_nt != nullptr && end_nt != nullptr) {
@@ -1181,7 +1182,8 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 		auto start_ts = rop_util_nttime_to_unix(*start_nt);
 		auto end_ts   = rop_util_nttime_to_unix(*end_nt);
 		/* XXX: May need PR_SENDER rather than Envelope-From */
-		if (!get_freebusy(par.ev_from, par.cur.dirc(), start_ts, end_ts, fbdata))
+		response_allowed = freebusy_perms(par.ev_from, par.cur.dirc()) != 0;
+		if (!get_freebusy(nullptr, par.cur.dirc(), start_ts, end_ts, fbdata))
 			mlog(LV_ERR, "W-PREC: cannot retrieve freebusy %s", par.cur.dirc());
 
 		for (const freebusy_event &event : fbdata)
@@ -1196,9 +1198,11 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 
 	/* Decline double-booking if so configured */
 	if (res_in_use && policy.decline_overlap) {
-		auto err = mr_send_response(par, recurring_flg, propids, respDeclined);
-		if (err != ecSuccess)
-			return err;
+		if (response_allowed) {
+			auto err = mr_send_response(par, recurring_flg, propids, respDeclined);
+			if (err != ecSuccess)
+				return err;
+		}
 		return mr_mark_done(par);
 	}
 
@@ -1211,9 +1215,11 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 	if (policy.is_resource())
 		return mr_mark_done(par);
 	if (tent == respAccepted) {
-		err = mr_send_response(par, recurring_flg, propids, tent);
-		if (err != ecSuccess)
-			return err;
+		if (response_allowed) {
+			err = mr_send_response(par, recurring_flg, propids, tent);
+			if (err != ecSuccess)
+				return err;
+		}
 		return mr_mark_done(par);
 	}
 	return ecSuccess;

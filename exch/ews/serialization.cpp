@@ -905,6 +905,24 @@ void tEmailAddressDictionaryEntry::serialize(tinyxml2::XMLElement* xml) const
 	XMLDUMPA(MailboxType);
 }
 
+void tItemAttachment::serialize(tinyxml2::XMLElement *xml) const
+{
+	tAttachment::serialize(xml);
+	XMLDUMPT(Item);
+}
+
+tFileAttachment::tFileAttachment(const XMLElement *xml)
+{
+	if (const XMLElement *xp = xml->FirstChildElement("Name"))
+		Name = fromXMLNode<std::string>(xp);
+	if (const XMLElement *xp = xml->FirstChildElement("IsInline"))
+		IsInline.emplace(fromXMLNode<bool>(xp));
+	if (const XMLElement *xp = xml->FirstChildElement("IsContactPhoto"))
+		IsContactPhoto.emplace(fromXMLNode<bool>(xp));
+	if (const XMLElement *xp = xml->FirstChildElement("Content"))
+		Content.emplace(xp);
+}
+
 void tFileAttachment::serialize(tinyxml2::XMLElement* xml) const
 {
 	tAttachment::serialize(xml);
@@ -936,9 +954,28 @@ void tPhoneNumberDictionaryEntry::serialize(tinyxml2::XMLElement* xml) const
 	XMLDUMPA(Key);
 }
 
+void tPersona::serialize(XMLElement *xml) const
+{
+	XMLDUMPT(DisplayName);
+	XMLDUMPT(EmailAddress);
+	XMLDUMPT(Title);
+	XMLDUMPT(Nickname);
+	XMLDUMPT(BusinessPhoneNumber);
+	XMLDUMPT(MobilePhoneNumber);
+	XMLDUMPT(HomeAddress);
+	XMLDUMPT(Comment);
+}
+
 tPullSubscriptionRequest::tPullSubscriptionRequest(const tinyxml2::XMLElement* xml) :
 	tBaseSubscriptionRequest(xml),
 	XMLINIT(Timeout)
+{}
+
+tPushSubscriptionRequest::tPushSubscriptionRequest(const tinyxml2::XMLElement *xml) :
+	tBaseSubscriptionRequest(xml),
+	XMLINIT(StatusFrequency),
+	XMLINIT(URL),
+	XMLINIT(CallerData)
 {}
 
 tExtendedFieldURI::tExtendedFieldURI(const tinyxml2::XMLElement* xml) :
@@ -1178,10 +1215,18 @@ tMailboxData::tMailboxData(const tinyxml2::XMLElement* xml) :
 	XMLINIT(Email), XMLINIT(AttendeeType), XMLINIT(ExcludeConflicts)
 {}
 
+void tOutOfOfficeMailTip::serialize(XMLElement* xml) const
+{
+	XMLDUMPT(OofState);
+	XMLDUMPT(Duration);
+	XMLDUMPT(OofReply);
+}
+
 void tMailTips::serialize(XMLElement* xml) const
 {
 	XMLDUMPT(RecipientAddress);
 	XMLDUMPT(PendingMailTips);
+	XMLDUMPT(OutOfOffice);
 }
 
 void tMailTipsServiceConfiguration::serialize(tinyxml2::XMLElement* xml) const
@@ -1233,6 +1278,60 @@ void tMessage::serialize(tinyxml2::XMLElement* xml) const
 	XMLDUMPT(ReplyTo);
 	XMLDUMPT(ReceivedBy);
 	XMLDUMPT(ReceivedRepresenting);
+}
+
+tAcceptItem::tAcceptItem(const tinyxml2::XMLElement *xml) :
+	tMessage(xml),
+	XMLINIT(ProposedStart),
+	XMLINIT(ProposedEnd),
+	XMLINIT(ReferenceItemId)
+{
+	if (!ItemClass)
+		ItemClass.emplace("IPM.Schedule.Meeting.Resp.Pos");
+}
+
+void tAcceptItem::serialize(tinyxml2::XMLElement *xml) const
+{
+	tMessage::serialize(xml);
+	XMLDUMPT(ProposedStart);
+	XMLDUMPT(ProposedEnd);
+	XMLDUMPT(ReferenceItemId);
+}
+
+tTentativelyAcceptItem::tTentativelyAcceptItem(const tinyxml2::XMLElement *xml) :
+	tMessage(xml),
+	XMLINIT(ProposedStart),
+	XMLINIT(ProposedEnd),
+	XMLINIT(ReferenceItemId)
+{
+	if (!ItemClass)
+		ItemClass.emplace("IPM.Schedule.Meeting.Resp.Tent");
+}
+
+void tTentativelyAcceptItem::serialize(tinyxml2::XMLElement *xml) const
+{
+	tMessage::serialize(xml);
+	XMLDUMPT(ProposedStart);
+	XMLDUMPT(ProposedEnd);
+	XMLDUMPT(ReferenceItemId);
+}
+
+tDeclineItem::tDeclineItem(const tinyxml2::XMLElement *xml) :
+	tMessage(xml),
+	XMLINIT(ProposedStart),
+	XMLINIT(ProposedEnd),
+	XMLINIT(ReferenceItemId)
+{
+	if (!ItemClass)
+		ItemClass.emplace("IPM.Schedule.Meeting.Resp.Neg");
+}
+
+void tDeclineItem::serialize(tinyxml2::XMLElement *xml) const
+{
+	tMessage::serialize(xml);
+	XMLDUMPT(ProposedStart);
+	XMLDUMPT(ProposedEnd);
+	XMLDUMPT(ReferenceItemId);
 }
 
 void tModifiedEvent::serialize(tinyxml2::XMLElement* xml) const
@@ -1652,6 +1751,27 @@ void mGetAppManifestsResponse::serialize(tinyxml2::XMLElement* xml) const
 	xml->InsertNewChildElement("m:Manifests");
 }
 
+mCreateAttachmentRequest::mCreateAttachmentRequest(const XMLElement *xml) :
+	XMLINIT(ParentItemId)
+{
+	const XMLElement *attachments = xml->FirstChildElement("Attachments");
+	if (attachments != nullptr)
+		for (const XMLElement *fa = attachments->FirstChildElement("FileAttachment");
+		    fa != nullptr; fa = fa->NextSiblingElement("FileAttachment"))
+		        Attachments.emplace_back(fa);
+}
+
+void mCreateAttachmentResponseMessage::serialize(XMLElement *xml) const
+{
+	mResponseMessageType::serialize(xml);
+	XMLDUMPM(Attachments);
+}
+
+void mCreateAttachmentResponse::serialize(XMLElement *xml) const
+{
+	XMLDUMPM(ResponseMessages);
+}
+
 mGetAttachmentRequest::mGetAttachmentRequest(const XMLElement* xml) :
 	XMLINIT(AttachmentIds)
 {}
@@ -1776,6 +1896,28 @@ mGetUserConfigurationRequest::mGetUserConfigurationRequest(const tinyxml2::XMLEl
 {}
 
 void mGetUserConfigurationResponse::serialize(XMLElement* xml) const
+{
+	XMLDUMPM(ResponseMessages);
+}
+
+void tDelegateUser::serialize(XMLElement* xml) const
+{
+	XMLDUMPT(UserId);
+}
+
+mGetDelegateRequest::mGetDelegateRequest(const XMLElement* xml) :
+	XMLINIT(Mailbox),
+	XMLINIT(UserIds),
+	XMLINIT(IncludePermissions)
+{}
+
+void mDelegateUserResponseMessage::serialize(XMLElement* xml) const
+{
+	mResponseMessageType::serialize(xml);
+	XMLDUMPT(DelegateUser);
+}
+
+void mGetDelegateResponse::serialize(XMLElement* xml) const
 {
 	XMLDUMPM(ResponseMessages);
 }
@@ -1916,6 +2058,22 @@ void mGetItemResponseMessage::serialize(XMLElement* xml) const
 	XMLDUMPM(Items);
 }
 
+mFindPeopleRequest::mFindPeopleRequest(const XMLElement *xml) :
+	XMLINIT(QueryString)
+{}
+
+void mFindPeopleResponseMessage::serialize(XMLElement *xml) const
+{
+	mResponseMessageType::serialize(xml);
+	XMLDUMPM(People);
+	XMLDUMPM(TotalNumberOfPeopleInView);
+}
+
+void mFindPeopleResponse::serialize(XMLElement *xml) const
+{
+	XMLDUMPM(ResponseMessages);
+}
+
 void tFindResponsePagingAttributes::serialize(XMLElement* xml) const
 {
 	XMLDUMPA(IndexedPagingOffset);
@@ -1927,10 +2085,14 @@ void tFindResponsePagingAttributes::serialize(XMLElement* xml) const
 
 void tResolution::serialize(XMLElement* xml) const
 {
-	tFindResponsePagingAttributes::serialize(xml);
-
 	XMLDUMPT(Mailbox);
 	XMLDUMPT(Contact);
+}
+
+void tResolutionSet::serialize(XMLElement* xml) const
+{
+	tFindResponsePagingAttributes::serialize(xml);
+	XMLDUMPT(Resolution);
 }
 
 mResolveNamesRequest::mResolveNamesRequest(const XMLElement* xml) :

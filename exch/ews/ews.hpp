@@ -224,10 +224,12 @@ class EWSContext {
 
 	Structures::sFolder create(const std::string&, const Structures::sFolderSpec&, const Structures::sFolder&) const;
 	Structures::sItem create(const std::string&, const Structures::sFolderSpec&, const MESSAGE_CONTENT&) const;
+	void createCalendarItemFromMeetingRequest(const Structures::tItemId&, uint32_t) const;
 	void disableEventStream();
 	const char* effectiveUser(const Structures::sFolderSpec&) const;
 	void enableEventStream(int);
 	std::string essdn_to_username(const std::string&) const;
+	std::string exportContent(const std::string&, const MESSAGE_CONTENT&, const std::string&) const;
 	std::string get_maildir(const Structures::tMailbox&) const;
 	std::string get_maildir(const std::string&) const;
 	uint32_t getAccountId(const std::string&, bool) const;
@@ -275,6 +277,7 @@ class EWSContext {
 	MCONT_PTR toContent(const std::string&, std::string&) const;
 	MCONT_PTR toContent(const std::string&, const Structures::sFolderSpec&, Structures::sItem&, bool) const;
 	Structures::tSubscriptionId subscribe(const Structures::tPullSubscriptionRequest&) const;
+	Structures::tSubscriptionId subscribe(const Structures::tPushSubscriptionRequest &) const;
 	Structures::tSubscriptionId subscribe(const Structures::tStreamingSubscriptionRequest&) const;
 	bool unsubscribe(const Structures::tSubscriptionId&) const;
 	void updated(const std::string&, const Structures::sFolderSpec&) const;
@@ -334,6 +337,10 @@ private:
 	void toContent(const std::string&, Structures::tContact&, Structures::sShape&, MCONT_PTR&) const;
 	void toContent(const std::string&, Structures::tItem&, Structures::sShape&, MCONT_PTR&) const;
 	void toContent(const std::string&, Structures::tMessage&, Structures::sShape&, MCONT_PTR&) const;
+	void toContent(const std::string &, Structures::tAcceptItem &, Structures::sShape &, MCONT_PTR &) const;
+	void toContent(const std::string &, Structures::tTentativelyAcceptItem &, Structures::sShape &, MCONT_PTR &) const;
+	void toContent(const std::string &, Structures::tDeclineItem &, Structures::sShape &, MCONT_PTR &) const;
+	std::optional<uint64_t> findExistingByGoid(const Structures::sFolderSpec&, const std::string&, const MESSAGE_CONTENT&) const;
 
 	inline void updateProps(Structures::tItem&, Structures::sShape&, const TPROPVAL_ARRAY&) const {}
 	void updateProps(Structures::tCalendarItem&, Structures::sShape&, const TPROPVAL_ARRAY&) const;

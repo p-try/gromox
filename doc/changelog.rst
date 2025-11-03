@@ -1,10 +1,111 @@
-Development 2.48.5
-==================
+Gromox 3.1 (2025-10-26)
+=======================
+
+Enhancements:
+
+* http: support for SPNEGO authentication (Kerberos-in-SPNEGO or NTLMSSP-in-SPNEGO)
+  with the HTTP "Authorization: Negotiate" header.
+* dscli: try all oxdisco URLs until one succeeds
+* exmdb: support repeated import of permission data (e.g. from kdb2mt)
+* ews: create calendar item after accepting a MR with MacMail
 
 Fixes:
 
-* fnevObjectCreate notifications were not sent when a mail was processed
-  through TWOSTEP Rule Processor, now fixed
+* emsmdb: the total mail count in a contents view was not updated
+* emsmdb,zcore: Send-As mail now correctly has the delegator in Envelope-From
+* email_lib: deal with MIME parts with zero header lines
+* tools: reinstate submit.php for delayed sending
+* nsp: avoid buffer overruns in nsp_interface_fetch_property
+* emsmdb: Partial message change tracking was bug-ridden and deleted. Standard
+  transfers are now used instead. (E.g. an IPM.Task object where only the
+  percentage-completed field was changed would be mis-synchronized to another
+  Cached Mode client as "delete start/end dates".)
+* exmdb: Public folders were missing timeindex queries and their content tables
+  might have shown fewer messages.
+* http: A workaround was added for OpenSSL 3.0 so that connections from
+  Outlook 2010 once again succeed.
+* mysql_adaptor: Improve the time needed to compute the composite mailbox
+  permission for user in a case of a mailbox with 100K ACL entries.
+
+Changes:
+
+* exmdb: deactivate movecopy/deletemessages event storm compaction
+* emsmdb: outgoing lzxpress compression in the EMSMDB protocol is now
+  disabled as it does not compress well for the time invested.
+* http: the ``ntlm_program_helper`` config directive was removed;
+  your ``gss_program`` simply needs to handle both GSS and NTLM.
+* event: support for reading the old event_acl.txt was deleted.
+  The replacement is the ``event_hosts_allow`` config directive.
+* timer: support for reading the old timer_acl.txt was deleted.
+  The replacement is the ``timer_hosts_allow`` config directive.
+
+
+Gromox 3.0 (2025-10-01)
+=======================
+
+Enhancements:
+
+* eml2mt now transmits the RFC5322 representation into the message store so
+  that IMAP clients can serve that instead of representation synthesized from
+  MAPI data. / Messages imported via eml2mt no longer "lose" their original
+  structure and headers when viewed in IMAP.
+* midb now transmits the RFC5322 representations of messages created via IMAP
+  into the message store. (Previously: just into the midb cache.) / Messages
+  which have been client-side copied in IMAP, i.e. with FETCH+STORE rather than
+  COPY, no longer "lose" their structure and headers.
+* oxcical: implement support for VTODO and VJOURNAL
+* mbop: add "freeze" and "thaw" commands
+* mbop: support UTC/zone suffixes for getfreebusy -a/-b arguments
+* mbop: using the -v option will now additionaly report the mailbox and
+  subcommand in error messages
+* exmdb: new config directive ``exmdb_eph_prefix`` to put ephmeral files like
+  tables.sqlite3 on a local disk (in case a mailbox is regularly on NFS).
+* exmdb: add a time index over messages to speed up common cases of
+  grommunio-web GetContentsTable requests.
+* exmdb: the derivation for the PR_MESSAGE_*_ME property value, upon delivery,
+  now includes PR_EMAIL_ADDRESS as a fallback if PR_SMTP_ADDRESS is unset.
+* oxdisco: the AutoConfig mechanism now emits an EWS server information block
+* ews: include ParentFolderId in FindFolder/GetFolder response
+* ews: implemented GetDelegate, CreateAttachment, FindPeople (GAL lookup),
+  PushSubscriptionRequest request handlers
+* ews: implemented oofReply responses like EX/365
+* ews: Direct Meeting Response related serialization was added
+* ews: referenced calendar items are now updated when a CreateItem request
+  contains AcceptItem or DeclineItem tags.
+* ews: support GetUserAvailabilityRequest request TimeZoneContext tag.
+* zcore: Out of Office configuration reading and writing is now performed over
+  the network rather than through direct filesystem access.
+
+Fixes:
+
+* fnevObjectCreate event notifications were not created when a mail was processed
+  through TWOSTEP Rule Processor, now fixed.
+* fnevObjectCreated event notifications were not created when a mail was
+  processed by ONESTEP Rule Processor when that executed a OP_COPY operation.
+* oxcical: iCal events with a date in DTSTART & DTEND but without
+  X-MICROSOFT-CDO-ALLDAYEVENT are now transformed into Allday events even if
+  the event is longer than one day.
+* delivery: emit MDN-RRT messages even with ``lda_twostep_ruleproc`` is set.
+* oxdisco: config-v1.1.xml now contains the homeservers as it should.
+* oxdisco: AutoConfig XML now features the incomingServer type parameter
+  in the right place.
+* oxdisco: AutoConfig now emits outgoing server port 587 as type smtp.
+* ruleproc: auto-enter MRs into target calender even if the sender is not going
+  to get a response.
+* ews: Avoid sending multiple ``<?xml ?>`` lines into the notification stream
+  HTTP response body.
+* ews: trim "duplicate" recipients when a newly-created item has recipients in
+  both <mimeContent> and <To>/<Cc>
+* ews: prevent FAI messages from polluting the Normal Message Set during ICS
+* ews: when the FindItem requests finds no objects, an empty RootFolder tag
+  is now still returned.
+* ews: delete excess NUL byte from tCalendarItem:UID tags
+
+Changes:
+
+* kdb2mt no longer imports LocalFreebusy control messages, since dangling
+  references in those can make delegate permission editing via OL
+  nonfunctional.
 
 
 Gromox 2.48 (2025-07-31)
@@ -481,3 +582,12 @@ Changes:
 * oxcmail: priorities for MIME parts have been rectified for
   multipart/alternative and non-alternative containers; the conversion routine
   is no longer making picks across multiple container siblings.
+
+
+Gromox 2.16 (2023-10-29)
+========================
+
+Enhancements:
+
+* http: support for NTLM authentication with the HTTP "Authorization:
+  Negotiate" header.
