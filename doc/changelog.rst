@@ -1,4 +1,4 @@
-Inbetween releases / 3.1.37
+Inbetween releases / 3.1.43
 ===========================
 
 Enhancements:
@@ -18,11 +18,13 @@ Fixes:
   cases, which has been rectified
 * ews: avoid dereference of unenganged std::optional, which had led to
   spurious use-after-free/crash
+* ews: avoid sending out emClient's draft messages
 * ab_tree: rework our Minimal EntryID encoding to avoid values >= 0x80000000,
   solving a hypothetical problem reading the addressbook data
   for the 589821th domain in the user database
 * exmdb: MAPI table row deletion events were not being delivered,
   which was fixed
+* oxvcard: fix crash when importing/exporting PR_HOBBIES property
 
 Changes:
 
