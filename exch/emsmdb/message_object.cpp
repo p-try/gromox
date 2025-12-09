@@ -42,7 +42,7 @@ static BOOL message_object_get_recipient_all_proptags(message_object *pmessage,
 	    pmessage->instance_id, &tmp_proptags))
 		return FALSE;
 	pproptags->count = 0;
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags.count);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags.count);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
 	for (const auto tag : tmp_proptags) {
@@ -458,7 +458,7 @@ ec_error_t message_object::save() try
 			pmessage->message_id);
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2906: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return ecServerOOM;
 }
 
@@ -694,7 +694,7 @@ BOOL message_object::get_all_proptags(PROPTAG_ARRAY *pproptags) const
 	auto nodes_num = stream_list.size();
 	nodes_num += 10;
 	pproptags->count = 0;
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags.count + nodes_num);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags.count + nodes_num);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
 	for (const auto tag : tmp_proptags) {
@@ -857,7 +857,7 @@ BOOL message_object::get_properties(uint32_t size_limit,
 	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
-	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<uint32_t>(pproptags->count)};
+	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<proptag_t>(pproptags->count)};
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	ppropvals->count = 0;
@@ -1007,7 +1007,7 @@ static BOOL message_object_set_properties_internal(message_object *pmessage,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1745: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -1030,7 +1030,7 @@ BOOL message_object::remove_properties(const PROPTAG_ARRAY *pproptags,
 	pproblems->pproblem = cu_alloc<PROPERTY_PROBLEM>(pproptags->count);
 	if (pproblems->pproblem == nullptr)
 		return FALSE;
-	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<uint32_t>(pproptags->count)};
+	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<proptag_t>(pproptags->count)};
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	std::vector<uint16_t> poriginal_indices;
@@ -1082,7 +1082,7 @@ BOOL message_object::remove_properties(const PROPTAG_ARRAY *pproptags,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1746: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -1106,7 +1106,7 @@ BOOL message_object::copy_to(message_object *pmessage_src,
 	if (!exmdb_client->read_message_instance(pmessage_src->plogon->get_dir(),
 	    pmessage_src->instance_id, &msgctnt))
 		return FALSE;
-	static constexpr uint32_t tags[] = {
+	static constexpr proptag_t tags[] = {
 		PidTagMid, PR_DISPLAY_TO, PR_DISPLAY_TO_A,
 		PR_DISPLAY_CC, PR_DISPLAY_CC_A, PR_DISPLAY_BCC,
 		PR_DISPLAY_BCC_A, PR_MESSAGE_SIZE,

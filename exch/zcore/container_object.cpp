@@ -180,7 +180,7 @@ BOOL container_object::load_user_table(const RESTRICTION *prestriction) try
 	BINARY *pparent_entryid = nullptr;
 	LONG_ARRAY *pminid_array;
 	proptag_t proptag_buff[25];
-	static constexpr uint32_t tmp_proptags[] = {
+	static constexpr proptag_t tmp_proptags[] = {
 		PR_NICKNAME, PR_SURNAME, PR_GIVEN_NAME, PR_MIDDLE_NAME,
 		PR_TITLE, PR_PRIMARY_TELEPHONE_NUMBER,
 		PR_MOBILE_TELEPHONE_NUMBER, PR_HOME_ADDRESS_STREET, PR_COMMENT,
@@ -234,22 +234,17 @@ BOOL container_object::load_user_table(const RESTRICTION *prestriction) try
 		proptags.pproptag = proptag_buff;
 		if (!container_object_get_pidlids(&proptags))
 			return FALSE;
-		proptags.pproptag[proptags.count++] = PR_DISPLAY_NAME;
-		proptags.pproptag[proptags.count++] = PR_NICKNAME;
-		proptags.pproptag[proptags.count++] = PR_TITLE;
-		proptags.pproptag[proptags.count++] = PR_SURNAME;
-		proptags.pproptag[proptags.count++] = PR_GIVEN_NAME;
-		proptags.pproptag[proptags.count++] = PR_MIDDLE_NAME;
-		proptags.pproptag[proptags.count++] = PR_PRIMARY_TELEPHONE_NUMBER;
-		proptags.pproptag[proptags.count++] = PR_MOBILE_TELEPHONE_NUMBER;
-		proptags.pproptag[proptags.count++] = PR_HOME_ADDRESS_STREET;
-		proptags.pproptag[proptags.count++] = PR_COMMENT;
-		proptags.pproptag[proptags.count++] = PR_COMPANY_NAME;
-		proptags.pproptag[proptags.count++] = PR_DEPARTMENT_NAME;
-		proptags.pproptag[proptags.count++] = PR_OFFICE_LOCATION;
-		proptags.pproptag[proptags.count++] = PR_CREATION_TIME;
-		proptags.pproptag[proptags.count++] = PR_MESSAGE_CLASS;
-		proptags.pproptag[proptags.count++] = PidTagMid;
+		static constexpr proptag_t ntags[] = {
+			PR_DISPLAY_NAME, PR_NICKNAME, PR_TITLE, PR_SURNAME,
+			PR_GIVEN_NAME, PR_MIDDLE_NAME,
+			PR_PRIMARY_TELEPHONE_NUMBER,
+			PR_MOBILE_TELEPHONE_NUMBER, PR_HOME_ADDRESS_STREET,
+			PR_COMMENT, PR_COMPANY_NAME, PR_DEPARTMENT_NAME,
+			PR_OFFICE_LOCATION, PR_CREATION_TIME, PR_MESSAGE_CLASS,
+			PidTagMid,
+		};
+		for (auto t : ntags)
+			proptags.emplace_back(t);
 		if (!exmdb_client->query_table(pinfo->get_maildir(), nullptr,
 		    pinfo->cpid, table_id, &proptags, 0, row_num, &tmp_set))
 			return FALSE;
@@ -555,7 +550,7 @@ static BOOL container_object_fetch_folder_properties(
 
 static const PROPTAG_ARRAY* container_object_get_folder_proptags()
 {
-	static constexpr uint32_t p[] = {
+	static constexpr proptag_t p[] = {
 		PidTagFolderId, PR_SUBFOLDERS, PR_DISPLAY_NAME,
 		PR_CONTAINER_CLASS, PR_FOLDER_PATHNAME,
 		PidTagParentFolderId, PR_ATTR_HIDDEN,
@@ -611,7 +606,7 @@ BOOL container_object::get_container_table_num(BOOL b_depth, uint32_t *pnum)
 void container_object_get_container_table_all_proptags(
 	PROPTAG_ARRAY *pproptags)
 {
-	static constexpr uint32_t p[] = {
+	static constexpr proptag_t p[] = {
 		PR_ENTRYID, PR_CONTAINER_FLAGS, PR_DEPTH, PR_INSTANCE_KEY,
 		PR_EMS_AB_CONTAINERID, PR_DISPLAY_NAME, PR_EMS_AB_IS_MASTER,
 		PR_EMS_AB_PARENT_ENTRYID, PR_AB_PROVIDER_ID,
@@ -620,9 +615,9 @@ void container_object_get_container_table_all_proptags(
 	pproptags->pproptag = deconst(p);
 }
 
-static BOOL
+static bool
 container_object_get_specialtables_from_node(const ab_tree::ab_node& node,
-    const PROPTAG_ARRAY *pproptags, BOOL b_depth, TARRAY_SET *pset)
+    const PROPTAG_ARRAY *pproptags, TARRAY_SET *pset)
 {
 	TPROPVAL_ARRAY **pparray;
 	auto count = strange_roundup(pset->count, SR_GROW_TPROPVAL_ARRAY);
@@ -646,9 +641,8 @@ container_object_get_specialtables_from_node(const ab_tree::ab_node& node,
 	return TRUE;
 }
 
-static BOOL container_object_query_folder_hierarchy(
-	uint64_t folder_id, const PROPTAG_ARRAY *pproptags,
-	BOOL b_depth, TARRAY_SET *pset)
+static bool container_object_query_folder_hierarchy(uint64_t folder_id,
+    const PROPTAG_ARRAY *pproptags, TARRAY_SET *pset)
 {
 	uint32_t row_num;
 	uint32_t table_id;
@@ -713,7 +707,7 @@ BOOL container_object::query_container_table(const PROPTAG_ARRAY *pproptags,
 		return FALSE;
 	if (CONTAINER_TYPE_FOLDER == pcontainer->type) {
 		if (!container_object_query_folder_hierarchy(pcontainer->id.exmdb_id.folder_id,
-		    pproptags, b_depth, &tmp_set))
+		    pproptags, &tmp_set))
 			return FALSE;	
 	} else {
 		auto pbase = ab_tree::AB.get(pcontainer->id.abtree_id.base_id);
@@ -749,11 +743,11 @@ BOOL container_object::query_container_table(const PROPTAG_ARRAY *pproptags,
 			tmp_set.count ++;
 			if (b_depth && !container_object_query_folder_hierarchy(
 			    rop_util_make_eid_ex(1, PRIVATE_FID_CONTACTS),
-			    pproptags, TRUE, &tmp_set))
+			    pproptags, &tmp_set))
 				return FALSE;
 			for (auto it = pbase->dbegin(); it != pbase->dend(); ++it)
 				if (!container_object_get_specialtables_from_node(it,
-				    pproptags, b_depth, &tmp_set))
+				    pproptags, &tmp_set))
 					return FALSE;
 		} else if (pcontainer->id.abtree_id.minid == ab_tree::minid::SC_GAL) {
 			/* no subordinates */
@@ -823,7 +817,7 @@ BOOL container_object::get_user_table_num(uint32_t *pnum)
 void container_object_get_user_table_all_proptags(
 	PROPTAG_ARRAY *pproptags)
 {
-	static constexpr uint32_t p[] = {
+	static constexpr proptag_t p[] = {
 		PR_DISPLAY_NAME, PR_NICKNAME, PR_SURNAME, PR_GIVEN_NAME,
 		PR_MIDDLE_NAME, PR_TITLE, PR_PRIMARY_TELEPHONE_NUMBER,
 		PR_MOBILE_TELEPHONE_NUMBER, PR_HOME_ADDRESS_STREET, PR_COMMENT,

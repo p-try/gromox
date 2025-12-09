@@ -53,20 +53,20 @@ extern GX_EXPORT BOOL parse_rfc822_timestamp(const char *str_time, time_t *ptime
 extern GX_EXPORT BOOL mime_string_to_utf8(const char *charset, const char *mime_string, char *out_string, size_t out_len);
 extern GX_EXPORT void enriched_to_html(const char *enriched_txt,
 	char *html, int max_len);
-extern GX_EXPORT int html_to_plain(const void *inbuf, size_t inlen, cpid_t, std::string &outbuf);
-extern GX_EXPORT char *plain_to_html(const char *rbuf);
+extern GX_EXPORT int html_to_plain(std::string_view in, cpid_t, std::string &out);
+extern GX_EXPORT ec_error_t plain_to_html(const char *in, std::string &out);
 extern GX_EXPORT ec_error_t html_init_library();
-extern GX_EXPORT ec_error_t html_to_rtf(const void *in, size_t inlen, cpid_t, char **outp, size_t *outlen);
+extern GX_EXPORT ec_error_t html_to_rtf(std::string_view in, cpid_t, std::string &out);
 extern GX_EXPORT bool rtf_init_library();
-extern GX_EXPORT bool rtf_to_html(const char *in, size_t inlen, const char *charset, std::string &out, attachment_list *);
-extern GX_EXPORT bool rtfcp_uncompress(const BINARY *rtf, char *out, size_t *outlen);
-extern GX_EXPORT BINARY *rtfcp_compress(const char *in, size_t in_len);
-extern GX_EXPORT ssize_t rtfcp_uncompressed_size(const BINARY *);
+extern GX_EXPORT ec_error_t rtf_to_html(std::string_view in, const char *charset, std::string &out, attachment_list *);
+extern GX_EXPORT ec_error_t rtfcp_uncompress(std::string_view in, std::string &out);
+extern GX_EXPORT ec_error_t rtfcp_encode(std::string_view in, std::string &out);
+extern GX_EXPORT ssize_t rtfcp_uncompressed_size(std::string_view);
 
 namespace gromox {
 
 extern GX_EXPORT ec_error_t cu_rcpt_to_list(const TPROPVAL_ARRAY &, const char *org, std::vector<std::string> &outlist, GET_USERNAME, bool resend);
-extern GX_EXPORT ec_error_t cu_send_mail(MAIL &, const char *smtp_url, const char *sender, const std::vector<std::string> &rcpt);
+extern GX_EXPORT ec_error_t cu_send_mail(const MAIL &, const char *smtp_url, const char *sender, const std::vector<std::string> &rcpt);
 extern GX_EXPORT ec_error_t cu_send_vmail(vmime::shared_ptr<vmime::message>, const char *smtp_url, const char *sender, const std::vector<std::string> &rcpt);
 
 }

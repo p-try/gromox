@@ -9,9 +9,9 @@ AM_DISTCHECK_CONFIGURE_FLAGS = --with-dcprefix='$${prefix}'
 AM_TESTS_ENVIRONMENT = export TEST_PATH=${top_srcdir}/data;
 
 # lib_LTL must be dependency-ordered, or make install fails
-lib_LTLIBRARIES = libgromox_common.la libgromox_dbop.la libgromox_epoll.la libgromox_mapi.la libgromox_exrpc.la libgromox_rpc.la libgxs_mysql_adaptor.la libgromox_abtree.la libgromox_auth.la libgromox_authz.la libgxm_alias_resolve.la libgxm_exmdb_local.la libgxh_ews.la libgxh_mh_emsmdb.la libgxh_mh_nsp.la libgxh_oab.la libgxh_oxdisco.la libgxp_exchange_emsmdb.la libgxp_exchange_nsp.la libgxp_exchange_rfr.la libgxs_exmdb_provider.la libgxs_event_proxy.la libgxs_event_stub.la libgxs_midb_agent.la libgxs_timer_agent.la libgxs_ruleproc.la
+lib_LTLIBRARIES = libgromox_common.la libgromox_dbop.la libgromox_epoll.la libgromox_mapi.la libgromox_exrpc.la libgromox_ndr.la libgxs_mysql_adaptor.la libgromox_abtree.la libgromox_auth.la libgromox_authz.la libgxm_alias_resolve.la libgxm_exmdb_local.la libgromox_ews.la libgromox_mh_emsmdb.la libgromox_mh_nsp.la libgromox_oab.la libgromox_oxdisco.la libgromox_emsmdb.la libgromox_nsp.la libgromox_rfr.la libgxs_exmdb_provider.la libgxs_event_proxy.la libgxs_event_stub.la libgxs_midb_agent.la libgxs_timer_agent.la libgxs_ruleproc.la
 
-pkglibexec_PROGRAMS = delivery delivery-queue event gromox-snapshot http imap midb pop3 timer zcore tools/authtry tools/eidprint tools/textmapquery
+pkglibexec_PROGRAMS = delivery delivery-queue event gromox-snapshot http imap istore midb pop3 timer zcore tools/authtry tools/ddbg tools/textmapquery
 if WITH_GNU_LD
 version_sc_SYFLAGS = -Wl,--version-script=${srcdir}/default.sym
 endif
@@ -33,6 +33,7 @@ dist_unit_DATA = system/gromox-cleaner.service system/gromox-cleaner.timer \
 	system/gromox-delivery.service \
 	system/gromox-delivery-queue.service system/gromox-event.service \
 	system/gromox-http.service system/gromox-imap.service \
+	system/gromox-istore.service \
 	system/gromox-midb.service system/gromox-pop3.service \
 	system/gromox-snapshot.service system/gromox-snapshot.timer \
 	system/gromox-timer.service system/gromox-zcore.service
@@ -77,8 +78,8 @@ libgromox_exrpc_la_SOURCES = lib/exmdb_client.cpp lib/exmdb_ext.cpp lib/exmdb_rp
 libgromox_exrpc_la_LIBADD = libgromox_mapi.la
 libgromox_mapi_la_SOURCES = lib/email/dsn.cpp lib/email/ical.cpp lib/email/ical2.cpp lib/email/mail.cpp lib/email/mime.cpp lib/email/mjson.cpp lib/email/send.cpp lib/email/vcard.cpp lib/mapi/eid_array.cpp lib/mapi/element_data.cpp lib/mapi/html.cpp lib/mapi/idset.cpp lib/mapi/lzxpress.cpp lib/mapi/oxcical.cpp lib/mapi/oxcmail.cpp lib/mapi/oxcmail2.cpp lib/mapi/oxvcard.cpp lib/mapi/pcl.cpp lib/mapi/proptag_array.cpp lib/mapi/propval.cpp lib/mapi/restriction.cpp lib/mapi/restriction2.cpp lib/mapi/rop_util.cpp lib/mapi/rtf.cpp lib/mapi/rtfcp.cpp lib/mapi/rule_actions.cpp lib/mapi/sortorder_set.cpp lib/mapi/tarray_set.cpp lib/mapi/tnef.cpp lib/mapi/tpropval_array.cpp lib/mapi/usercvt.cpp
 libgromox_mapi_la_LIBADD = ${fmt_LIBS} ${libHX_LIBS} ${iconv_LIBS} ${vmime_LIBS} ${libxml2_LIBS} libgromox_common.la
-libgromox_rpc_la_SOURCES = lib/rpc/arcfour.cpp lib/rpc/ndr.cpp lib/rpc/ntlmssp.cpp
-libgromox_rpc_la_LIBADD = ${libcrypto_LIBS} ${libHX_LIBS} ${iconv_LIBS} libgromox_common.la
+libgromox_ndr_la_SOURCES = exch/ndr.cpp
+libgromox_ndr_la_LIBADD = libgromox_common.la
 
 delivery_SOURCES = mda/delivery_app/delivery.hpp mda/delivery_app/main.cpp mda/delivery_app/message_dequeue.cpp mda/delivery_app/transporter.cpp
 delivery_LDADD = -lpthread ${libHX_LIBS} ${libssl_LIBS} ${vmime_LIBS} libgromox_auth.la libgromox_common.la libgromox_mapi.la libgxm_alias_resolve.la libgxm_exmdb_local.la libgxs_mysql_adaptor.la libgxs_ruleproc.la
@@ -110,8 +111,10 @@ libgxs_midb_agent_la_LDFLAGS = ${default_SYFLAGS}
 libgxs_midb_agent_la_LIBADD = -lpthread ${fmt_LIBS} ${libHX_LIBS} libgromox_common.la
 EXTRA_libgxs_midb_agent_la_DEPENDENCIES = default.sym
 
-http_SOURCES = exch/http/cache.cpp exch/http/cache.hpp exch/http/fastcgi.cpp exch/http/fastcgi.hpp exch/http/hpm_processor.cpp exch/http/hpm_processor.hpp exch/http/http_parser.cpp exch/http/http_parser.hpp exch/http/listener.cpp exch/http/listener.hpp exch/http/main.cpp exch/http/pdu_ndr.cpp exch/http/pdu_ndr.hpp exch/http/pdu_ndr_ids.hpp exch/http/pdu_processor.cpp exch/http/pdu_processor.hpp exch/http/resource.hpp exch/http/rewrite.cpp exch/http/rewrite.hpp exch/http/system_services.cpp exch/http/system_services.hpp
-http_LDADD = -lpthread ${libcrypto_LIBS} ${fmt_LIBS} ${gss_LIBS} ${libHX_LIBS} ${libssl_LIBS} libgromox_auth.la libgromox_authz.la libgromox_common.la libgromox_epoll.la libgromox_rpc.la libgromox_mapi.la libgxh_ews.la libgxh_mh_emsmdb.la libgxh_mh_nsp.la libgxh_oab.la libgxh_oxdisco.la libgxp_exchange_emsmdb.la libgxp_exchange_nsp.la libgxp_exchange_rfr.la libgxs_exmdb_provider.la libgxs_mysql_adaptor.la libgxs_timer_agent.la
+http_SOURCES = exch/http/cache.cpp exch/http/cache.hpp exch/http/fastcgi.cpp exch/http/fastcgi.hpp exch/http/hpm_processor.cpp exch/http/hpm_processor.hpp exch/http/http_parser.cpp exch/http/http_parser.hpp exch/http/listener.cpp exch/http/listener.hpp exch/http/main.cpp exch/http/ntlmssp.cpp exch/http/ntlmssp.hpp exch/http/pdu_ndr.cpp exch/http/pdu_ndr.hpp exch/http/pdu_ndr_ids.hpp exch/http/pdu_processor.cpp exch/http/pdu_processor.hpp exch/http/resource.hpp exch/http/rewrite2.cpp exch/http/rewrite.hpp exch/http/system_services.cpp exch/http/system_services.hpp
+http_LDADD = -lpthread ${libcrypto_LIBS} ${fmt_LIBS} ${gss_LIBS} ${iconv_LIBS} ${libHX_LIBS} ${libssl_LIBS} libgromox_auth.la libgromox_authz.la libgromox_common.la libgromox_epoll.la libgromox_ndr.la libgromox_mapi.la libgromox_ews.la libgromox_mh_emsmdb.la libgromox_mh_nsp.la libgromox_oab.la libgromox_oxdisco.la libgromox_emsmdb.la libgromox_nsp.la libgromox_rfr.la libgxs_exmdb_provider.la libgxs_mysql_adaptor.la libgxs_timer_agent.la
+istore_SOURCES = exch/istore.cpp
+istore_LDADD = -lpthread ${libHX_LIBS} libgromox_common.la libgromox_mapi.la libgxs_exmdb_provider.la libgxs_mysql_adaptor.la
 midb_SOURCES = exch/midb/cmd_parser.cpp exch/midb/cmd_parser.hpp exch/midb/common_util.cpp exch/midb/common_util.hpp exch/midb/exmdb_client.hpp exch/midb/mail_engine.cpp exch/midb/mail_engine.hpp exch/midb/main.cpp exch/midb/system_services.hpp
 midb_LDADD = -lpthread ${libHX_LIBS} ${fmt_LIBS} ${iconv_LIBS} ${jsoncpp_LIBS} ${libssl_LIBS} ${sqlite_LIBS} ${vmime_LIBS} libgromox_auth.la libgromox_common.la libgromox_dbop.la libgromox_exrpc.la libgromox_mapi.la libgxs_event_proxy.la libgxs_mysql_adaptor.la
 zcore_SOURCES = exch/gab.cpp exch/zcore/ab_tree.cpp exch/zcore/ab_tree.hpp exch/zcore/attachment_object.cpp exch/zcore/bounce_producer.hpp exch/zcore/common_util.cpp exch/zcore/common_util.hpp exch/zcore/container_object.cpp exch/zcore/exmdb_client.cpp exch/zcore/exmdb_client.hpp exch/zcore/folder_object.cpp exch/zcore/ics_state.cpp exch/zcore/ics_state.hpp exch/zcore/icsdownctx_object.cpp exch/zcore/icsupctx_object.cpp exch/zcore/main.cpp exch/zcore/message_object.cpp exch/zcore/names.cpp exch/zcore/object_tree.cpp exch/zcore/object_tree.hpp exch/zcore/objects.hpp exch/zcore/rpc_ext.cpp exch/zcore/rpc_ext.hpp exch/zcore/rpc_parser.cpp exch/zcore/rpc_parser.hpp exch/zcore/store_object.cpp exch/zcore/store_object.hpp exch/zcore/system_services.hpp exch/zcore/table_object.cpp exch/zcore/table_object.hpp exch/zcore/user_object.cpp exch/zcore/zserver.cpp exch/zcore/zserver.hpp
@@ -125,39 +128,39 @@ libgxs_timer_agent_la_SOURCES = exch/timer_agent.cpp
 libgxs_timer_agent_la_LDFLAGS = ${default_SYFLAGS}
 libgxs_timer_agent_la_LIBADD = -lpthread ${libHX_LIBS} libgromox_common.la
 EXTRA_libgxs_timer_agent_la_DEPENDENCIES = default.sym
-libgxp_exchange_emsmdb_la_SOURCES = exch/emsmdb/asyncemsmdb_interface.cpp exch/emsmdb/asyncemsmdb_interface.hpp exch/emsmdb/attachment_object.cpp exch/emsmdb/attachment_object.hpp exch/emsmdb/aux_ext.cpp exch/emsmdb/aux_types.hpp exch/emsmdb/common_util.cpp exch/emsmdb/common_util.hpp exch/emsmdb/emsmdb_interface.cpp exch/emsmdb/emsmdb_interface.hpp exch/emsmdb/emsmdb_ndr.cpp exch/emsmdb/emsmdb_ndr.hpp exch/emsmdb/exmdb_client.cpp exch/emsmdb/exmdb_client.hpp exch/emsmdb/fastdownctx_object.cpp exch/emsmdb/fastdownctx_object.hpp exch/emsmdb/fastupctx_object.cpp exch/emsmdb/fastupctx_object.hpp exch/emsmdb/folder_object.cpp exch/emsmdb/folder_object.hpp exch/emsmdb/ftstream_parser.cpp exch/emsmdb/ftstream_parser.hpp exch/emsmdb/ftstream_producer.cpp exch/emsmdb/ftstream_producer.hpp exch/emsmdb/ics_state.cpp exch/emsmdb/ics_state.hpp exch/emsmdb/icsdownctx_object.cpp exch/emsmdb/icsdownctx_object.hpp exch/emsmdb/logon_object.cpp exch/emsmdb/logon_object.hpp exch/emsmdb/main.cpp exch/emsmdb/message_object.cpp exch/emsmdb/message_object.hpp exch/emsmdb/names.cpp exch/emsmdb/notify.cpp exch/emsmdb/notify_response.hpp exch/emsmdb/oxcfold.cpp exch/emsmdb/oxcfxics.cpp exch/emsmdb/oxcmsg.cpp exch/emsmdb/oxcprpt.cpp exch/emsmdb/oxcstore.cpp exch/emsmdb/oxctabl.cpp exch/emsmdb/oxomsg.cpp exch/emsmdb/processor_types.hpp exch/emsmdb/rop_dispatch.cpp exch/emsmdb/rop_dispatch.hpp exch/emsmdb/rop_ext.cpp exch/emsmdb/rop_ext.hpp exch/emsmdb/rop_funcs.hpp exch/emsmdb/rop_ids.hpp exch/emsmdb/rop_processor.cpp exch/emsmdb/rop_processor.hpp exch/emsmdb/stream_object.cpp exch/emsmdb/stream_object.hpp exch/emsmdb/table_object.cpp exch/emsmdb/table_object.hpp
-libgxp_exchange_emsmdb_la_LDFLAGS = ${default_SYFLAGS}
-libgxp_exchange_emsmdb_la_LIBADD = -lpthread ${libHX_LIBS} ${iconv_LIBS} ${vmime_LIBS} libgromox_common.la libgromox_mapi.la libgromox_rpc.la libgxs_mysql_adaptor.la
-EXTRA_libgxp_exchange_emsmdb_la_DEPENDENCIES = default.sym
-libgxp_exchange_nsp_la_SOURCES = exch/nsp/common_util.cpp exch/nsp/common_util.hpp exch/nsp/main.cpp exch/nsp/nsp_interface.cpp exch/nsp/nsp_interface.hpp exch/nsp/nsp_ndr.cpp exch/nsp/nsp_ndr.hpp exch/nsp/nsp_types.hpp
-libgxp_exchange_nsp_la_LDFLAGS = ${default_SYFLAGS}
-libgxp_exchange_nsp_la_LIBADD = -lpthread ${libcrypto_LIBS} ${fmt_LIBS} ${libHX_LIBS} ${iconv_LIBS} libgromox_common.la libgromox_mapi.la libgromox_rpc.la libgxs_mysql_adaptor.la libgromox_abtree.la
-EXTRA_libgxp_exchange_nsp_la_DEPENDENCIES = default.sym
+libgromox_emsmdb_la_SOURCES = exch/emsmdb/asyncemsmdb_interface.cpp exch/emsmdb/asyncemsmdb_interface.hpp exch/emsmdb/attachment_object.cpp exch/emsmdb/attachment_object.hpp exch/emsmdb/aux_ext.cpp exch/emsmdb/aux_types.hpp exch/emsmdb/common_util.cpp exch/emsmdb/common_util.hpp exch/emsmdb/emsmdb_interface.cpp exch/emsmdb/emsmdb_interface.hpp exch/emsmdb/emsmdb_ndr.cpp exch/emsmdb/emsmdb_ndr.hpp exch/emsmdb/exmdb_client.cpp exch/emsmdb/exmdb_client.hpp exch/emsmdb/fastdownctx_object.cpp exch/emsmdb/fastdownctx_object.hpp exch/emsmdb/fastupctx_object.cpp exch/emsmdb/fastupctx_object.hpp exch/emsmdb/folder_object.cpp exch/emsmdb/folder_object.hpp exch/emsmdb/ftstream_parser.cpp exch/emsmdb/ftstream_parser.hpp exch/emsmdb/ftstream_producer.cpp exch/emsmdb/ftstream_producer.hpp exch/emsmdb/ics_state.cpp exch/emsmdb/ics_state.hpp exch/emsmdb/icsdownctx_object.cpp exch/emsmdb/icsdownctx_object.hpp exch/emsmdb/logon_object.cpp exch/emsmdb/logon_object.hpp exch/emsmdb/main.cpp exch/emsmdb/message_object.cpp exch/emsmdb/message_object.hpp exch/emsmdb/names.cpp exch/emsmdb/notify.cpp exch/emsmdb/notify_response.hpp exch/emsmdb/oxcfold.cpp exch/emsmdb/oxcfxics.cpp exch/emsmdb/oxcmsg.cpp exch/emsmdb/oxcprpt.cpp exch/emsmdb/oxcstore.cpp exch/emsmdb/oxctabl.cpp exch/emsmdb/oxomsg.cpp exch/emsmdb/processor_types.hpp exch/emsmdb/rop_dispatch.cpp exch/emsmdb/rop_dispatch.hpp exch/emsmdb/rop_ext.cpp exch/emsmdb/rop_ext.hpp exch/emsmdb/rop_funcs.hpp exch/emsmdb/rop_ids.hpp exch/emsmdb/rop_processor.cpp exch/emsmdb/rop_processor.hpp exch/emsmdb/stream_object.cpp exch/emsmdb/stream_object.hpp exch/emsmdb/table_object.cpp exch/emsmdb/table_object.hpp
+libgromox_emsmdb_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_emsmdb_la_LIBADD = -lpthread ${libHX_LIBS} ${iconv_LIBS} ${vmime_LIBS} libgromox_common.la libgromox_mapi.la libgromox_ndr.la libgxs_mysql_adaptor.la
+EXTRA_libgromox_emsmdb_la_DEPENDENCIES = default.sym
+libgromox_nsp_la_SOURCES = exch/nsp/common_util.cpp exch/nsp/common_util.hpp exch/nsp/main.cpp exch/nsp/nsp_interface.cpp exch/nsp/nsp_interface.hpp exch/nsp/nsp_ndr.cpp exch/nsp/nsp_ndr.hpp exch/nsp/nsp_types.hpp
+libgromox_nsp_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_nsp_la_LIBADD = -lpthread ${libcrypto_LIBS} ${fmt_LIBS} ${libHX_LIBS} ${iconv_LIBS} libgromox_common.la libgromox_mapi.la libgromox_ndr.la libgxs_mysql_adaptor.la libgromox_abtree.la
+EXTRA_libgromox_nsp_la_DEPENDENCIES = default.sym
 EXTRA_DIST += exch/nsp/repr.cpp
-libgxp_exchange_rfr_la_SOURCES = exch/rfr.cpp
-libgxp_exchange_rfr_la_LDFLAGS = ${default_SYFLAGS}
-libgxp_exchange_rfr_la_LIBADD = ${fmt_LIBS} ${libHX_LIBS} libgromox_common.la libgromox_rpc.la libgxs_mysql_adaptor.la
-EXTRA_libgxp_exchange_rfr_la_DEPENDENCIES = default.sym
-libgxh_ews_la_SOURCES = exch/ews/ObjectCache.hpp exch/ews/context.cpp exch/ews/enums.hpp exch/ews/ews.cpp exch/ews/ews.hpp exch/ews/exceptions.hpp exch/ews/hash.hpp exch/ews/namedtags.hpp exch/ews/requests.cpp exch/ews/requests.hpp exch/ews/serialization.cpp exch/ews/serialization.hpp exch/ews/soaputil.cpp exch/ews/soaputil.hpp exch/ews/structures.cpp exch/ews/structures.hpp
-libgxh_ews_la_LDFLAGS = ${default_SYFLAGS}
-libgxh_ews_la_LIBADD = ${libHX_LIBS} ${fmt_LIBS} ${tinyxml2_LIBS} ${vmime_LIBS} libgromox_abtree.la libgromox_common.la libgromox_mapi.la libgromox_exrpc.la libgxs_mysql_adaptor.la
-EXTRA_libgxh_ews_la_DEPENDENCIES = default.sym
-libgxh_mh_emsmdb_la_SOURCES = exch/mh/emsmdb.cpp exch/mh/mh_common.cpp exch/mh/mh_common.hpp 
-libgxh_mh_emsmdb_la_LDFLAGS = ${default_SYFLAGS}
-libgxh_mh_emsmdb_la_LIBADD = -lpthread ${fmt_LIBS} libgromox_common.la libgromox_mapi.la
-EXTRA_libgxh_mh_emsmdb_la_DEPENDENCIES = default.sym
-libgxh_mh_nsp_la_SOURCES = exch/mh/mh_common.cpp exch/mh/mh_common.hpp exch/mh/nsp.cpp exch/mh/nsp_bridge.cpp exch/mh/nsp_bridge.hpp exch/mh/nsp_common.cpp exch/mh/nsp_common.hpp exch/mh/nsp_ops.cpp exch/mh/nsp_ops.hpp
-libgxh_mh_nsp_la_LDFLAGS = ${default_SYFLAGS}
-libgxh_mh_nsp_la_LIBADD = -lpthread ${fmt_LIBS} libgromox_common.la libgromox_mapi.la libgxs_mysql_adaptor.la
-EXTRA_libgxh_mh_nsp_la_DEPENDENCIES = default.sym
-libgxh_oxdisco_la_SOURCES = exch/oxdisco.cpp
-libgxh_oxdisco_la_LDFLAGS = ${default_SYFLAGS}
-libgxh_oxdisco_la_LIBADD = ${libHX_LIBS} ${fmt_LIBS} ${tinyxml2_LIBS} libgromox_common.la libgromox_mapi.la libgxs_mysql_adaptor.la
-EXTRA_libgxh_oxdisco_la_DEPENDENCIES = default.sym
-libgxh_oab_la_SOURCES = exch/oab.cpp
-libgxh_oab_la_LDFLAGS = ${default_SYFLAGS}
-libgxh_oab_la_LIBADD = libgromox_common.la
-EXTRA_libgxh_oab_la_DEPENDENCIES = default.sym
+libgromox_rfr_la_SOURCES = exch/rfr.cpp
+libgromox_rfr_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_rfr_la_LIBADD = ${fmt_LIBS} ${libHX_LIBS} libgromox_common.la libgromox_ndr.la libgxs_mysql_adaptor.la
+EXTRA_libgromox_rfr_la_DEPENDENCIES = default.sym
+libgromox_ews_la_SOURCES = exch/ews/ObjectCache.hpp exch/ews/context.cpp exch/ews/enums.hpp exch/ews/ews.cpp exch/ews/ews.hpp exch/ews/exceptions.hpp exch/ews/hash.hpp exch/ews/namedtags.hpp exch/ews/requests.cpp exch/ews/requests.hpp exch/ews/serialization.cpp exch/ews/serialization.hpp exch/ews/soaputil.cpp exch/ews/soaputil.hpp exch/ews/structures.cpp exch/ews/structures.hpp
+libgromox_ews_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_ews_la_LIBADD = ${libHX_LIBS} ${fmt_LIBS} ${tinyxml2_LIBS} ${vmime_LIBS} libgromox_abtree.la libgromox_common.la libgromox_mapi.la libgromox_exrpc.la libgxs_mysql_adaptor.la
+EXTRA_libgromox_ews_la_DEPENDENCIES = default.sym
+libgromox_mh_emsmdb_la_SOURCES = exch/mh/emsmdb.cpp exch/mh/mh_common.cpp exch/mh/mh_common.hpp
+libgromox_mh_emsmdb_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_mh_emsmdb_la_LIBADD = -lpthread ${fmt_LIBS} libgromox_common.la libgromox_mapi.la
+EXTRA_libgromox_mh_emsmdb_la_DEPENDENCIES = default.sym
+libgromox_mh_nsp_la_SOURCES = exch/mh/mh_common.cpp exch/mh/mh_common.hpp exch/mh/nsp.cpp exch/mh/nsp_bridge.cpp exch/mh/nsp_bridge.hpp exch/mh/nsp_common.cpp exch/mh/nsp_common.hpp exch/mh/nsp_ops.cpp exch/mh/nsp_ops.hpp
+libgromox_mh_nsp_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_mh_nsp_la_LIBADD = -lpthread ${fmt_LIBS} libgromox_common.la libgromox_mapi.la libgxs_mysql_adaptor.la
+EXTRA_libgromox_mh_nsp_la_DEPENDENCIES = default.sym
+libgromox_oxdisco_la_SOURCES = exch/oxdisco.cpp
+libgromox_oxdisco_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_oxdisco_la_LIBADD = ${libHX_LIBS} ${fmt_LIBS} ${tinyxml2_LIBS} libgromox_common.la libgromox_mapi.la libgxs_mysql_adaptor.la
+EXTRA_libgromox_oxdisco_la_DEPENDENCIES = default.sym
+libgromox_oab_la_SOURCES = exch/oab.cpp
+libgromox_oab_la_LDFLAGS = ${default_SYFLAGS}
+libgromox_oab_la_LIBADD = libgromox_common.la
+EXTRA_libgromox_oab_la_DEPENDENCIES = default.sym
 libgxs_mysql_adaptor_la_SOURCES = exch/mysql_adaptor/mysql_adaptor.cpp exch/mysql_adaptor/sql2.cpp exch/mysql_adaptor/sql2.hpp
 libgxs_mysql_adaptor_la_LDFLAGS = ${default_SYFLAGS}
 libgxs_mysql_adaptor_la_LIBADD = -lpthread ${crypt_LIBS} ${libHX_LIBS} ${fmt_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_dbop.la libgromox_mapi.la
@@ -196,7 +199,7 @@ gromox_mbck_SOURCES = tools/mbck.cpp
 gromox_mbck_LDADD = ${libHX_LIBS} ${fmt_LIBS} ${sqlite_LIBS} libgromox_common.la
 gromox_mbop_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/mbop.hpp tools/mbop.cpp
 EXTRA_DIST += tools/mbop_delmsg.cpp tools/mbop_emptyfld.cpp tools/mbop_foreach.cpp tools/mbop_freebusy.cpp tools/mbop_locale.cpp tools/mbop_main.cpp tools/mbop_purge.cpp tools/staticnpmap.cpp
-gromox_mbop_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la
+gromox_mbop_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la libgxs_midb_agent.la
 gromox_mbsize_SOURCES = tools/mbsize.cpp
 gromox_mbsize_LDADD = ${sqlite_LIBS} libgromox_common.la
 gromox_mkmidb_SOURCES = tools/mkmidb.cpp tools/mkshared.cpp tools/mkshared.hpp
@@ -227,7 +230,7 @@ mapi_la_LDFLAGS += -Wl,--allow-shlib-undefined
 endif
 EXTRA_mapi_la_DEPENDENCIES = default.sym
 
-noinst_PROGRAMS = dldcheck tests/bdump tests/bodyconv tests/compress tests/dnsbl_check tests/exrpctest tests/gxl-383 tests/jsontest tests/lzxpress tests/oxcmail_ie tests/ucvttest tests/udb tests/utf8filter tests/utiltest tests/vcard tools/tzdump
+noinst_PROGRAMS = dldcheck tests/compress tests/dnsbl_check tests/exrpctest tests/gxl-383 tests/jsontest tests/oxcmail_ie tests/ucvttest tests/udb tests/utf8filter tests/utiltest tests/vcard tools/tzdump
 if HAVE_ESEDB
 noinst_PROGRAMS += tests/epv_unpack
 endif
@@ -239,10 +242,6 @@ dldcheck_LDADD = ${dl_LIBS}
 TESTS = tests/utiltest
 tests_udb_SOURCES = tests/userdb.cpp
 tests_udb_LDADD = ${libHX_LIBS} libgromox_common.la libgxs_mysql_adaptor.la
-tests_bdump_SOURCES = tests/bdump.cpp
-tests_bdump_LDADD = ${libHX_LIBS} libgromox_common.la libgromox_mapi.la
-tests_bodyconv_SOURCES = tests/bodyconv.cpp
-tests_bodyconv_LDADD = ${libHX_LIBS} libgromox_common.la libgromox_mapi.la
 tests_compress_SOURCES = tests/compress.cpp
 tests_compress_LDADD = libgromox_common.la
 tests_dnsbl_check_SOURCES = tests/dnsbl_check.cpp
@@ -257,8 +256,6 @@ tests_gxl_383_SOURCES = tests/gxl-383.cpp
 tests_gxl_383_LDADD = libgromox_common.la libgromox_exrpc.la libgromox_mapi.la
 tests_jsontest_SOURCES = tests/jsontest.cpp
 tests_jsontest_LDADD = ${jsoncpp_LIBS} libgromox_common.la libgromox_mapi.la
-tests_lzxpress_SOURCES = tests/lzxpress.cpp
-tests_lzxpress_LDADD = ${libHX_LIBS} libgromox_mapi.la
 tests_oxcmail_ie_SOURCES = tests/oxcmail_ie.cpp
 tests_oxcmail_ie_LDADD = ${libHX_LIBS} libgromox_common.la libgromox_mapi.la
 tests_ucvttest_SOURCES = tests/ucvttest.cpp
@@ -271,8 +268,8 @@ tests_vcard_SOURCES = tests/vcard.cpp
 tests_vcard_LDADD = ${libHX_LIBS} libgromox_common.la libgromox_mapi.la
 tools_authtry_SOURCES = tools/authtry.cpp
 tools_authtry_LDADD = ${libHX_LIBS} ${libldap_LIBS} libgromox_auth.la libgromox_authz.la libgromox_common.la libgxs_mysql_adaptor.la
-tools_eidprint_SOURCES = tools/eidprint.cpp
-tools_eidprint_LDADD = libgromox_common.la libgromox_mapi.la
+tools_ddbg_SOURCES = tools/ddbg.cpp
+tools_ddbg_LDADD = ${libHX_LIBS} libgromox_common.la libgromox_mapi.la
 tools_textmapquery_SOURCES = tools/textmapquery.cpp
 tools_textmapquery_LDADD = libgromox_common.la
 tools_tzdump_SOURCES = tools/tzdump.cpp
@@ -282,6 +279,7 @@ dist_man_MANS = \
 	doc/alias_resolve.4gx \
 	doc/authmgr.4gx doc/authtry.8gx doc/autoconfig.7 doc/autodiscover.4gx \
 	doc/autodiscover.7 doc/cgkrepair.8gx doc/gromox-compress.8 \
+	doc/ddbg.1gx \
 	doc/delivery.8gx doc/delivery-queue.8gx doc/dnsbl_filter.4gx \
 	doc/event.8gx doc/event_stub.4gx doc/event_proxy.4gx \
 	doc/ews.4gx doc/exchange_emsmdb.4gx \
@@ -299,7 +297,7 @@ dist_man_MANS = \
 	doc/gromox-mkmidb.8 doc/gromox-mkprivate.8 doc/gromox-mkpublic.8 \
 	doc/gromox-mt2exm.8 doc/gromox-selinux.5 \
 	doc/gromox-snapshot.8 doc/gromox-vcf2mt.8 doc/http.8gx \
-	doc/imap.8gx \
+	doc/imap.8gx doc/istore.8gx \
 	doc/kdb-uidextract.8 doc/kdb-uidextract-limited.8 \
 	doc/ldap_adaptor.4gx \
 	doc/mapi.4gx doc/mapi.7gx doc/midb.8gx doc/midb_agent.4gx \
@@ -327,8 +325,8 @@ tzd_files = data/AUS_Central.tzd data/AUS_Eastern.tzd data/Afghanistan.tzd data/
 tzd_files += data/Greenwich.tzd data/Haiti.tzd data/Hawaiian.tzd data/India.tzd data/Iran.tzd data/Israel.tzd data/Jordan.tzd data/Kaliningrad.tzd data/Korea.tzd data/Libya.tzd data/Line_Islands.tzd data/Lord_Howe.tzd data/Magadan.tzd data/Magallanes.tzd data/Marquesas.tzd data/Mauritius.tzd data/Middle_East.tzd data/Montevideo.tzd data/Morocco.tzd data/Mountain.tzd data/Mountain__Mexico_.tzd data/Myanmar.tzd data/N__Central_Asia.tzd data/Namibia.tzd data/Nepal.tzd data/New_Zealand.tzd data/Newfoundland.tzd data/Norfolk.tzd data/North_Asia.tzd data/North_Asia_East.tzd data/North_Korea.tzd data/Omsk.tzd data/Pacific.tzd data/Pacific_SA.tzd data/Pacific__Mexico_.tzd data/Pakistan.tzd data/Paraguay.tzd data/Qyzylorda.tzd data/Romance.tzd data/Russia_Time_Zone_10.tzd data/Russia_Time_Zone_11.tzd data/Russia_Time_Zone_3.tzd data/Russian.tzd data/SA_Eastern.tzd data/SA_Pacific.tzd data/SA_Western.tzd data/SE_Asia.tzd data/Saint_Pierre.tzd data/Sakhalin.tzd data/Samoa.tzd data/Sao_Tome.tzd
 tzd_files += data/Saratov.tzd data/Singapore.tzd data/South_Africa.tzd data/South_Sudan.tzd data/Sri_Lanka.tzd data/Sudan.tzd data/Syria.tzd data/Taipei.tzd data/Tasmania.tzd data/Tocantins.tzd data/Tokyo.tzd data/Tomsk.tzd data/Tonga.tzd data/Transbaikal.tzd data/Turkey.tzd data/Turks_And_Caicos.tzd data/US_Eastern.tzd data/US_Mountain.tzd data/UTC+12.tzd data/UTC+13.tzd data/UTC-02.tzd data/UTC-08.tzd data/UTC-09.tzd data/UTC-11.tzd data/UTC.tzd data/Ulaanbaatar.tzd data/Venezuela.tzd data/Vladivostok.tzd data/Volgograd.tzd data/W__Australia.tzd data/W__Central_Africa.tzd data/W__Europe.tzd data/W__Mongolia.tzd data/West_Asia.tzd data/West_Bank.tzd data/West_Pacific.tzd data/Yakutsk.tzd data/Yukon.tzd
 tzd_files += data/windowsZones.xml
-header_files = include/gromox/ab_tree.hpp include/gromox/algorithm.hpp include/gromox/arcfour.hpp include/gromox/archive.hpp include/gromox/atomic.hpp include/gromox/authmgr.hpp include/gromox/bounce_gen.hpp include/gromox/clock.hpp include/gromox/common_types.hpp include/gromox/config_file.hpp include/gromox/contexts_pool.hpp include/gromox/cookie_parser.hpp include/gromox/cryptoutil.hpp include/gromox/database.h include/gromox/database_mysql.hpp include/gromox/dbop.h include/gromox/dcerpc.hpp include/gromox/defs.h include/gromox/double_list.hpp include/gromox/dsn.hpp include/gromox/eid_array.hpp include/gromox/element_data.hpp include/gromox/exmdb_client.hpp include/gromox/exmdb_common_util.hpp include/gromox/exmdb_ext.hpp include/gromox/exmdb_idef.hpp include/gromox/exmdb_provider_client.hpp include/gromox/exmdb_rpc.hpp include/gromox/exmdb_server.hpp include/gromox/ext_buffer.hpp
-header_files += include/gromox/fileio.h include/gromox/flat_set.hpp include/gromox/flusher_common.h include/gromox/freebusy.hpp include/gromox/gab.hpp include/gromox/generic_connection.hpp include/gromox/hook_common.h include/gromox/hpm_common.h include/gromox/http.hpp include/gromox/ical.hpp include/gromox/icase.hpp include/gromox/json.hpp include/gromox/list_file.hpp include/gromox/lzxpress.hpp include/gromox/mail.hpp include/gromox/mail_func.hpp include/gromox/mapi_types.hpp include/gromox/mapidefs.h include/gromox/mapierr.hpp include/gromox/mapitags.hpp include/gromox/midb.hpp include/gromox/midb_agent.hpp include/gromox/mime.hpp include/gromox/mjson.hpp include/gromox/mysql_adaptor.hpp include/gromox/ndr.hpp include/gromox/ntlmssp.hpp include/gromox/oxcmail.hpp include/gromox/oxoabkt.hpp
+header_files = include/gromox/ab_tree.hpp include/gromox/algorithm.hpp include/gromox/archive.hpp include/gromox/atomic.hpp include/gromox/authmgr.hpp include/gromox/bounce_gen.hpp include/gromox/clock.hpp include/gromox/common_types.hpp include/gromox/config_file.hpp include/gromox/contexts_pool.hpp include/gromox/cookie_parser.hpp include/gromox/cryptoutil.hpp include/gromox/database.h include/gromox/database_mysql.hpp include/gromox/dbop.h include/gromox/dcerpc.hpp include/gromox/defs.h include/gromox/double_list.hpp include/gromox/dsn.hpp include/gromox/eid_array.hpp include/gromox/element_data.hpp include/gromox/exmdb_client.hpp include/gromox/exmdb_common_util.hpp include/gromox/exmdb_ext.hpp include/gromox/exmdb_idef.hpp include/gromox/exmdb_provider_client.hpp include/gromox/exmdb_rpc.hpp include/gromox/exmdb_server.hpp include/gromox/ext_buffer.hpp
+header_files += include/gromox/fileio.h include/gromox/flat_set.hpp include/gromox/flusher_common.h include/gromox/freebusy.hpp include/gromox/gab.hpp include/gromox/generic_connection.hpp include/gromox/hook_common.h include/gromox/hpm_common.h include/gromox/http.hpp include/gromox/ical.hpp include/gromox/icase.hpp include/gromox/idset.hpp include/gromox/json.hpp include/gromox/list_file.hpp include/gromox/lzxpress.hpp include/gromox/mail.hpp include/gromox/mail_func.hpp include/gromox/mapi_types.hpp include/gromox/mapidefs.h include/gromox/mapierr.hpp include/gromox/mapitags.hpp include/gromox/midb.hpp include/gromox/midb_agent.hpp include/gromox/mime.hpp include/gromox/mjson.hpp include/gromox/mysql_adaptor.hpp include/gromox/ndr.hpp include/gromox/oxcmail.hpp include/gromox/oxoabkt.hpp
 header_files += include/gromox/paths.h include/gromox/pcl.hpp include/gromox/plugin.hpp include/gromox/proc_common.h include/gromox/process.hpp include/gromox/proptag_array.hpp include/gromox/propval.hpp include/gromox/range_set.hpp include/gromox/resource_pool.hpp include/gromox/restriction.hpp include/gromox/rop_util.hpp include/gromox/rpc_types.hpp include/gromox/rule_actions.hpp include/gromox/safeint.hpp include/gromox/simple_tree.hpp include/gromox/sortorder_set.hpp include/gromox/stream.hpp include/gromox/svc_common.h include/gromox/svc_loader.hpp include/gromox/textmaps.hpp include/gromox/threads_pool.hpp include/gromox/tie.hpp include/gromox/tnef.hpp include/gromox/usercvt.hpp include/gromox/util.hpp include/gromox/vcard.hpp include/gromox/xarray2.hpp include/gromox/zcore_client.hpp include/gromox/zcore_rpc.hpp include/gromox/zcore_types.hpp include/gromox/zz_ndr_stack.hpp
 if ENABLE_PRIVATE_HEADERS
 pkginclude_HEADERS = ${header_files}
@@ -343,7 +341,7 @@ EXTRA_DIST += \
 	doc/changelog.rst doc/charset.rst doc/commchan.svg doc/downgrade.rst doc/error_codes.rst doc/exmdb.html doc/ews_spec.rst doc/faq.rst doc/folderrefs.txt doc/glossary.rst doc/install.rst doc/known_bugs.rst doc/mascot.svg doc/mtformat.rst doc/outlook_oof_spec.rst doc/outlook_rule_spec.rst doc/oxoabkt.rst doc/oxocal_notes.rst doc/protocols.rst doc/string_props.rst doc/user_properties.rst \
 	${header_files} include/gromox/paths.h.in lib/mapi/oxcmail_int.hpp \
 	php_mapi/mapi.stub.php \
-	system/gromox-delivery-queue.tps system/gromox-delivery.tps system/gromox-event.tps system/gromox-http.tps system/gromox-imap.tps system/gromox-midb.tps system/gromox-pop3.tps system/gromox-snapshot.tps system/gromox-timer.tps system/gromox-zcore.tps \
+	system/gromox-delivery-queue.tps system/gromox-delivery.tps system/gromox-event.tps system/gromox-http.tps system/gromox-imap.tps system/gromox-istore.tps system/gromox-midb.tps system/gromox-pop3.tps system/gromox-snapshot.tps system/gromox-timer.tps system/gromox-zcore.tps \
 	system/selinux/gromox.fc system/selinux/gromox.if system/selinux/gromox.te system/selinux/readme.rst \
 	tests/eps_1_01_03.b tests/eps_1_02.b tests/eps_1_04.b tests/eps_2_05.b tests/epv_1.b tests/epv_2.b tests/epv_3.b tests/epv_4.b \
 	tests/gxl-475.ics tests/gxl-598.ics tests/httppipe.pl tests/mainstub.cpp tests/zlogin.php \

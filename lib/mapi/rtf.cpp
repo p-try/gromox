@@ -22,6 +22,7 @@
 #include <gromox/textmaps.hpp>
 #include <gromox/util.hpp>
 #define QRF(expr) do { if (pack_result{expr} != pack_result::ok) return false; } while (false)
+#define QRF2(expr) do { if (pack_result{expr} != pack_result::ok) return ecInvalidParam; } while (false)
 
 #define MAX_ATTRS						10000
 #define MAX_GROUP_DEPTH					1000
@@ -224,7 +225,7 @@ struct rtf_reader final {
 	~rtf_reader();
 	NOMOVE(rtf_reader);
 
-	bool init_reader(const char *, uint32_t, ATTACHMENT_LIST *);
+	bool init_reader(std::string_view, ATTACHMENT_LIST *);
 	bool riconv_open(const char *);
 	bool riconv_flush();
 	bool put_iconv_cache(int);
@@ -255,6 +256,7 @@ struct rtf_reader final {
 	const FONTENTRY *lookup_font(int) const;
 	bool build_font_table(SIMPLE_TREE_NODE *);
 	bool escape_output(char *);
+	bool push_text_encoded(const char *, size_t);
 	bool word_output_date(SIMPLE_TREE_NODE *);
 	int push_da_pic(EXT_PUSH &, const char *, const char *, const char *, const char *);
 
@@ -277,12 +279,12 @@ struct rtf_reader final {
 	bool is_within_table = false, b_printed_row_begin = false;
 	bool b_printed_cell_begin = false, b_printed_row_end = false;
 	bool b_printed_cell_end = false, b_simulate_smallcaps = false;
-	bool b_simulate_allcaps = false, b_ubytes_switch = false;
+	bool b_simulate_allcaps = false, b_ubytes_switch = true;
 	bool is_within_picture = false, have_printed_body = false;
 	bool is_within_header = true, have_ansicpg = false;
 	bool have_fromhtml = false, is_within_htmltag = false;
 	bool is_within_htmlrtf = false;
-	int coming_pars_tabular = 0, ubytes_num = 0, ubytes_left = 0;
+	int coming_pars_tabular = 0, ubytes_num = 1, ubytes_left = 0;
 	int picture_file_number = 1;
 	char picture_path[256]{};
 	int picture_width = 0, picture_height = 0, picture_bits_per_pixel = 1;
@@ -366,10 +368,16 @@ bool rtf_reader::riconv_open(const char *fromcode)
 bool rtf_reader::escape_output(char *string)
 {
 	auto preader = this;
-	int i;
-	int tmp_len;
+	size_t tmp_len = strlen(string);
+	if (ubytes_left > 0 && tmp_len > 0) {
+		auto skip = std::min(static_cast<size_t>(ubytes_left), tmp_len);
+		ubytes_left -= skip;
+		if (skip >= tmp_len)
+			return true;
+		string += skip;
+		tmp_len -= skip;
+	}
 	
-	tmp_len = strlen(string);
 	if (preader->is_within_htmltag) {
 		QRF(preader->ext_push.p_bytes(string, tmp_len));
 		return true;
@@ -378,7 +386,7 @@ bool rtf_reader::escape_output(char *string)
 		HX_strupper(string);
 	if (preader->b_simulate_smallcaps)
 		HX_strlower(string);
-	for (i=0; i<tmp_len; i++) {
+	for (size_t i = 0; i < tmp_len; ++i) {
 		switch (string[i]) {
 		case '<':
 			QRF(preader->ext_push.p_bytes("&lt;", 4));
@@ -395,6 +403,23 @@ bool rtf_reader::escape_output(char *string)
 		}
 	}
 	return true;
+}
+
+bool rtf_reader::push_text_encoded(const char *string, size_t len)
+{
+	if (b_ubytes_switch && ubytes_left > 0 && len > 0) {
+		auto skip = std::min(static_cast<size_t>(ubytes_left), len);
+		string += skip;
+		len -= skip;
+		ubytes_left -= skip;
+		if (len == 0)
+			return true;
+	}
+	if (len == 0)
+		return true;
+	if (iconv_push.p_bytes(string, len) != pack_result::ok)
+		return false;
+	return riconv_flush();
 }
 
 bool rtf_reader::riconv_flush()
@@ -526,15 +551,18 @@ const FONTENTRY *rtf_reader::lookup_font(int num) const
 	return i != preader->pfont_hash.cend() ? &i->second : nullptr;
 }
 
-bool rtf_reader::init_reader(const char *prtf_buff, uint32_t rtf_length,
+bool rtf_reader::init_reader(std::string_view buf_in,
     ATTACHMENT_LIST *pattachments)
 {
 	auto preader = this;
 	preader->attr_stack_list.clear();
-	preader->ext_pull.init(prtf_buff, rtf_length, [](size_t) -> void * { return nullptr; }, 0);
+	preader->ext_pull.init(buf_in.data(), buf_in.size(), [](size_t) -> void * { return nullptr; }, 0);
 	if (!preader->ext_push.init(nullptr, 0, 0) ||
 	    !preader->iconv_push.init(nullptr, 0, 0))
 		return false;
+	b_ubytes_switch = true;
+	ubytes_num = 1;
+	ubytes_left = 0;
 	preader->pattachments = pattachments;
 	return true;
 }
@@ -1554,11 +1582,13 @@ bool rtf_reader::process_info_group(SIMPLE_TREE_NODE *pword)
 				if (pword2->cdata[0] != '\\') {
 					if (!riconv_flush())
 						return false;
-					if (!escape_output(pword2->cdata))
+					auto slen = strlen(pword2->cdata);
+					if (!push_text_encoded(pword2->cdata, slen))
 						return false;
 				} else if (pword2->cdata[1] == '\'') {
 					ch = rtf_decode_hex_char(&pword2->cdata[2]);
-					QRF(preader->iconv_push.p_uint8(ch));
+					if (!put_iconv_cache(ch))
+						return false;
 				}
 			}
 			if (!riconv_flush())
@@ -1573,11 +1603,13 @@ bool rtf_reader::process_info_group(SIMPLE_TREE_NODE *pword)
 				if (pword2->cdata[0] != '\\') {
 					if (!riconv_flush())
 						return false;
-					if (!escape_output(pword2->cdata))
+					auto slen = strlen(pword2->cdata);
+					if (!push_text_encoded(pword2->cdata, slen))
 						return false;
 				} else if (pword2->cdata[1] == '\'') {
 					ch = rtf_decode_hex_char(&pword2->cdata[2]);
-					QRF(preader->iconv_push.p_uint8(ch));
+					if (!put_iconv_cache(ch))
+						return false;
 				}
 			}
 			if (!riconv_flush())
@@ -2231,7 +2263,14 @@ int rtf_reader::cmd_u(SIMPLE_TREE_NODE *pword, int align,
 int rtf_reader::cmd_uc(SIMPLE_TREE_NODE *pword, int align,
     bool have_param, int num)
 {
-	return astk_pushx(ATTR_UBYTES, num) ? CMD_RESULT_CONTINUE : CMD_RESULT_ERROR;
+	if (!have_param)
+		num = ubytes_num != 0 ? ubytes_num : 1;
+	if (num < 0)
+		num = 0;
+	b_ubytes_switch = true;
+	ubytes_num = num;
+	ubytes_left = 0;
+	return CMD_RESULT_CONTINUE;
 }
 
 int rtf_reader::cmd_dn(SIMPLE_TREE_NODE *pword, int align,
@@ -2641,6 +2680,13 @@ int rtf_reader::convert_group_node(SIMPLE_TREE_NODE *pnode)
 	if (!check_for_table())
 		return -EINVAL;
 	auto preader = this;
+	auto uc_prev_active = b_ubytes_switch;
+	auto uc_prev_num = ubytes_num;
+	auto uc_guard = HX::make_scope_exit([&,this]() {
+		b_ubytes_switch = uc_prev_active;
+		ubytes_num = uc_prev_num;
+		ubytes_left = 0;
+	});
 	try {
 		preader->attr_stack_list.emplace_back();
 	} catch (const std::bad_alloc &) {
@@ -2695,14 +2741,16 @@ int rtf_reader::convert_group_node(SIMPLE_TREE_NODE *pnode)
 						return -ENOBUFS;
 				} else {
 					rtf_unescape_string(string);
-					preader->total_chars_in_line += strlen(string);
-					if (!escape_output(string))
+					auto slen = strlen(string);
+					total_chars_in_line += slen;
+					if (!push_text_encoded(string, slen))
 						return -ENOMEM;
 				}
 			} else if (string[1] == '\\' || string[1] == '{' || string[1] == '}') {
 				rtf_unescape_string(string);
-				preader->total_chars_in_line += strlen(string);
-				if (!escape_output(string))
+				auto slen = strlen(string);
+				total_chars_in_line += slen;
+				if (!push_text_encoded(string, slen))
 					return -EINVAL;
 			} else {
 				string ++;
@@ -2819,22 +2867,24 @@ int rtf_reader::convert_group_node(SIMPLE_TREE_NODE *pnode)
 	return 0;
 }
 
-bool rtf_to_html(const char *pbuff_in, size_t length, const char *charset,
+/**
+ * It is allowed for @input to refer to the same object as @buf_out.
+ */
+ec_error_t rtf_to_html(std::string_view input, const char *charset,
     std::string &buf_out, ATTACHMENT_LIST *pattachments) try
 {
 	int i;
 	int tmp_len;
-	iconv_t conv_id;
 	RTF_READER reader;
 	char tmp_buff[128];
 	SIMPLE_TREE_NODE *pnode;
 	
-	if (!reader.init_reader(pbuff_in, length, pattachments) ||
+	if (!reader.init_reader(input, pattachments) ||
 	    !reader.load_element_tree())
-		return false;
+		return ecInvalidParam;
 	auto proot = reader.element_tree.get_root();
 	if (proot == nullptr)
-		return false;
+		return ecInvalidParam;
 	for (pnode = proot->get_child(), i = 1; i <= 10 && pnode != nullptr; ++i) {
 		if (pnode->pdata == nullptr)
 			break;
@@ -2843,48 +2893,32 @@ bool rtf_to_html(const char *pbuff_in, size_t length, const char *charset,
 		pnode = pnode->get_sibling();
 	}
 	if (!reader.have_fromhtml) {
-		QRF(reader.ext_push.p_bytes(TAG_DOCUMENT_BEGIN, sizeof(TAG_DOCUMENT_BEGIN) - 1));
-		QRF(reader.ext_push.p_bytes(TAG_HEADER_BEGIN, sizeof(TAG_HEADER_BEGIN) - 1));
+		QRF2(reader.ext_push.p_bytes(TAG_DOCUMENT_BEGIN, sizeof(TAG_DOCUMENT_BEGIN) - 1));
+		QRF2(reader.ext_push.p_bytes(TAG_HEADER_BEGIN, sizeof(TAG_HEADER_BEGIN) - 1));
 		tmp_len = snprintf(tmp_buff, std::size(tmp_buff),
 		          TAG_HTML_CHARSET, charset);
-		QRF(reader.ext_push.p_bytes(tmp_buff, tmp_len));
+		QRF2(reader.ext_push.p_bytes(tmp_buff, tmp_len));
 	}
 	auto ret = reader.convert_group_node(proot);
 	if (ret != 0 || !reader.end_table())
-		return false;
+		return ecError;
 	if (!reader.have_fromhtml) {
-		QRF(reader.ext_push.p_bytes(TAG_BODY_END, sizeof(TAG_BODY_END) - 1));
-		QRF(reader.ext_push.p_bytes(TAG_DOCUMENT_END, sizeof(TAG_DOCUMENT_END) - 1));
+		QRF2(reader.ext_push.p_bytes(TAG_BODY_END, sizeof(TAG_BODY_END) - 1));
+		QRF2(reader.ext_push.p_bytes(TAG_DOCUMENT_END, sizeof(TAG_DOCUMENT_END) - 1));
 	}
 	if (0 == strcasecmp(charset, "UTF-8") ||
 		0 == strcasecmp(charset, "ASCII") ||
 		0 == strcasecmp(charset, "US-ASCII")) {
-		buf_out.resize(reader.ext_push.m_offset);
-		memcpy(buf_out.data(), reader.ext_push.m_udata, reader.ext_push.m_offset);
-		return true;
+		buf_out.assign(reader.ext_push.m_cdata, reader.ext_push.m_offset);
+		return ecSuccess;
 	}
 	snprintf(tmp_buff, 128, "%s//TRANSLIT",
 		replace_iconv_charset(charset));
-	conv_id = iconv_open(tmp_buff, "UTF-8");
-	if ((iconv_t)-1 == conv_id) {
-		mlog(LV_ERR, "E-2115: iconv_open %s: %s",
-		        tmp_buff, strerror(errno));
-		return false;
-	}
-	auto cl_0 = HX::make_scope_exit([&]() { iconv_close(conv_id); });
-	auto pin = reader.ext_push.m_cdata;
-	/* Assumption for 3x is that no codepage maps to points beyond BMP */
-	size_t out_len = 3 * reader.ext_push.m_offset;
-	buf_out.resize(out_len);
-	auto pout = buf_out.data();
-	size_t in_len = reader.ext_push.m_offset;
-	if (iconv(conv_id, &pin, &in_len, &pout, &out_len) == static_cast<size_t>(-1))
-		return false;
-	buf_out.resize(buf_out.size() - out_len);
-	return true;
+	buf_out = iconvtext(reader.ext_push.m_cdata, reader.ext_push.m_offset, "UTF-8", tmp_buff);
+	return ecSuccess;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1205: ENOMEM");
-	return false;
+	return ecMAPIOOM;
 }
 
 static constexpr std::pair<const char *, CMD_PROC_FUNC> g_cmd_map[] = {

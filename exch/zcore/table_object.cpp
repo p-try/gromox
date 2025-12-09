@@ -211,22 +211,21 @@ static BOOL table_object_get_store_table_all_proptags(
 	if (!exmdb_client->get_store_all_proptags(pinfo->get_maildir(), &tmp_proptags1) ||
 	    !exmdb_client->get_store_all_proptags(pinfo->get_homedir(), &tmp_proptags2))
 		return FALSE;
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags1.count + tmp_proptags2.count + 25);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags1.count + tmp_proptags2.count + 25);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
-	memcpy(pproptags->pproptag, tmp_proptags1.pproptag,
-				sizeof(uint32_t)*tmp_proptags1.count);
+	memcpy(pproptags->pproptag, tmp_proptags1.pproptag, sizeof(proptag_t) * tmp_proptags1.count);
 	pproptags->count = tmp_proptags1.count;
 	for (size_t i = 0; i < tmp_proptags2.count; ++i) {
 		if (tmp_proptags1.has(tmp_proptags2.pproptag[i]))
 			continue;	
-		pproptags->pproptag[pproptags->count++] = tmp_proptags2.pproptag[i];
+		pproptags->emplace_back(tmp_proptags2.pproptag[i]);
 	}
 	for (size_t i = 0; i < std::size(proptag_buff); ++i) {
 		if (tmp_proptags1.has(proptag_buff[i]) ||
 		    tmp_proptags2.has(proptag_buff[i]))
 			continue;	
-		pproptags->pproptag[pproptags->count++] = proptag_buff[i];
+		pproptags->emplace_back(proptag_buff[i]);
 	}
 	return TRUE;
 }
@@ -476,12 +475,11 @@ static BOOL hierconttbl_query_rows(const table_object *ptable,
 
 	if (idx_sk != pcolumns->npos || idx_acc != pcolumns->npos ||
 	    idx_rig != pcolumns->npos) {
-		tmp_columns.pproptag = cu_alloc<uint32_t>(pcolumns->count);
+		tmp_columns.pproptag = cu_alloc<proptag_t>(pcolumns->count);
 		if (tmp_columns.pproptag == nullptr)
 			return FALSE;
 		tmp_columns.count = pcolumns->count;
-		memcpy(tmp_columns.pproptag, pcolumns->pproptag,
-			sizeof(uint32_t)*pcolumns->count);
+		memcpy(tmp_columns.pproptag, pcolumns->pproptag, sizeof(proptag_t) * pcolumns->count);
 		/*
 		 * For source_key/access/rights, we need the MID/FID,
 		 * so do some substitution (which will be "undone")
@@ -778,7 +776,7 @@ BOOL table_object::create_bookmark(uint32_t *pindex) try
 	*pindex = bookmark_list.back().index;
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1635: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -907,8 +905,8 @@ static bool table_object_evaluate_restriction(const TPROPVAL_ARRAY *ppropvals,
 	return FALSE;
 }
 
-BOOL table_object::filter_rows(uint32_t count, const RESTRICTION *pres,
-	const PROPTAG_ARRAY *cols, TARRAY_SET *pset)
+bool table_object::filter_rows(uint32_t count, const RESTRICTION *pres,
+    TARRAY_SET *pset)
 {
 	auto ptable = this;
 	TARRAY_SET tmp_set{};

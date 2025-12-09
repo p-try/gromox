@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2024 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cerrno>
@@ -41,11 +41,6 @@ static pthread_t g_listener_id;
 
 static void *sockaccept_thread(void *param)
 {
-	while (ems_send_mail == nullptr || ems_send_vmail == nullptr) {
-		if (g_notify_stop)
-			break;
-		sleep(1);	
-	}
 	while (!g_notify_stop) {
 		auto conn = generic_connection::accept(g_listen_sockd, false, &g_notify_stop);
 		if (conn.sockd == -2)
@@ -110,7 +105,7 @@ int exmdb_listener_run(const char *config_path, const char *hosts_allow)
 		return -5;
 	}
 	std::sort(acl.begin(), acl.end());
-	acl.erase(std::remove(acl.begin(), acl.end(), ""), acl.end());
+	std::erase(acl, "");
 	acl.erase(std::unique(acl.begin(), acl.end()), acl.end());
 	if (acl.size() == 0) {
 		mlog(LV_NOTICE, "exmdb_provider: defaulting to implicit access ACL containing ::1.");

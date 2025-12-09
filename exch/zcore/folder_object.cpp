@@ -61,11 +61,10 @@ BOOL folder_object::get_all_proptags(PROPTAG_ARRAY *pproptags)
 	if (!exmdb_client->get_folder_all_proptags(pfolder->pstore->get_dir(),
 	    pfolder->folder_id, &tmp_proptags))
 		return FALSE;		
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags.count + 30);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags.count + 30);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
-	memcpy(pproptags->pproptag, tmp_proptags.pproptag,
-		sizeof(uint32_t)*tmp_proptags.count);
+	memcpy(pproptags->pproptag, tmp_proptags.pproptag, sizeof(proptag_t) * tmp_proptags.count);
 	pproptags->count = tmp_proptags.count;
 	static constexpr proptag_t tags1[] = {
 		PR_ACCESS, PR_ENTRYID, PR_OBJECT_TYPE, PR_MAPPING_SIGNATURE,
@@ -423,7 +422,7 @@ BOOL folder_object::get_properties(const PROPTAG_ARRAY *pproptags,
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
 	tmp_proptags.count = 0;
-	tmp_proptags.pproptag = cu_alloc<uint32_t>(pproptags->count);
+	tmp_proptags.pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	ppropvals->count = 0;
@@ -511,7 +510,7 @@ BOOL folder_object::remove_properties(const PROPTAG_ARRAY *pproptags)
 	TAGGED_PROPVAL propval_buff[4];
 	
 	tmp_proptags.count = 0;
-	tmp_proptags.pproptag = cu_alloc<uint32_t>(pproptags->count);
+	tmp_proptags.pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	auto pfolder = this;
@@ -519,7 +518,7 @@ BOOL folder_object::remove_properties(const PROPTAG_ARRAY *pproptags)
 		const auto tag = pproptags->pproptag[i];
 		if (pfolder->is_readonly_prop(tag))
 			continue;
-		tmp_proptags.pproptag[tmp_proptags.count++] = tag;
+		tmp_proptags.emplace_back(tag);
 	}
 	if (tmp_proptags.count == 0)
 		return TRUE;
@@ -795,6 +794,6 @@ BOOL folder_object::updaterules(uint32_t flags, RULE_LIST *plist) try
 		pfolder->folder_id, plist->count,
 		plist->prule, &b_exceed);
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1491: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2021 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
 // This file is part of Gromox.
 /*
  *	  Addr_kids, for parse the email addr
@@ -1287,14 +1287,6 @@ void enriched_to_html(const char *enriched_txt,
 	html[offset] = '\0';
 }
 
-static std::unique_ptr<char[]> htp_memdup(const void *src, size_t len)
-{
-	auto dst = std::make_unique<char[]>(len + 1);
-	memcpy(dst.get(), src, len);
-	dst[len] = '\0';
-	return dst;
-}
-
 /**
  * Rather trivial and uninspiring HTML-to-plaintext conversion.
  * @inbuf:  HTML input; must be ASCII-compatible.
@@ -1302,22 +1294,20 @@ static std::unique_ptr<char[]> htp_memdup(const void *src, size_t len)
  *
  * Returns 1 for success and negative numbers to indicate error.
  */
-static int html_to_plain_boring(const void *inbuf, size_t len,
-    std::string &outbuf) try
+static int html_to_plain_boring(std::string_view inbuf, std::string &outbuf) try
 {
 	enum class st { NONE, TAG, EXTRA, QUOTE, COMMENT } state = st::NONE;
 	bool linebegin = true;
 	char is_xml = 0, lc = 0;
 	int depth = 0, in_q = 0;
 
-	if (len == SIZE_MAX)
-		--len;
-	auto rbuf = htp_memdup(inbuf, len);
-	auto buf = htp_memdup(inbuf, len);
+	if (inbuf.size() == SIZE_MAX)
+		inbuf.remove_suffix(1);
+	std::string rp;
+	const char *const buf = inbuf.data();
+	const char *p = buf;
 	char c = buf[0];
-	char *p = buf.get();
-	char *rp = rbuf.get();
-	for (size_t i = 0; i < len; ++i) {
+	for (size_t i = 0; i < inbuf.size(); ++i) {
 		switch (c) {
 		case '\0':
 			break;
@@ -1329,8 +1319,7 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 			if (state == st::NONE) {
 				if (0 == strncasecmp(p, "<br>", 4) ||
 					0 == strncasecmp(p, "</p>", 4)) {
-					*(rp ++) = '\r';
-					*(rp ++) = '\n';
+					rp += "\r\n";
 					linebegin = true;
 					i += 3;
 					p += 3;
@@ -1364,23 +1353,23 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 		case '&':
 			if (state == st::NONE) {
 				if (0 == strncasecmp(p, "&quot;", 6)) {
-					*(rp ++) = '"';
+					rp += '"';
 					i += 5;
 					p += 5;
 				} else if (0 == strncasecmp(p, "&amp;", 5)) {
-					*(rp ++) = '&';
+					rp += '&';
 					i += 4;
 					p += 4;
 				} else if (0 == strncasecmp(p, "&lt;", 4)) {
-					*(rp ++) = '<';
+					rp += '<';
 					i += 3;
 					p += 3;
 				} else if (0 == strncasecmp(p, "&gt;", 4)) {
-					*(rp ++) = '>';
+					rp += '>';
 					i += 3;
 					p += 3;
 				} else if (0 == strncasecmp(p, "&nbsp;", 6)) {
-					*(rp ++) = ' ';
+					rp += ' ';
 					i += 5;
 					p += 5;
 				}
@@ -1390,7 +1379,7 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 		case '(':
 		case ')':
 			if (state == st::NONE) {
-				*(rp ++) = c;
+				rp += c;
 				linebegin = false;
 			}
 			break;
@@ -1415,13 +1404,13 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 				in_q = 0;
 				break;
 			case st::COMMENT:
-				if (p >= buf.get() + 2 && p[-1] == '-' && p[-2] == '-') {
+				if (p >= buf + 2 && p[-1] == '-' && p[-2] == '-') {
 					state = st::NONE;
 					in_q = 0;
 				}
 				break;
 			default:
-				*(rp ++) = c;
+				rp += c;
 				linebegin = false;
 				break;
 			}
@@ -1432,10 +1421,10 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 				/* Inside <!-- comment --> */
 				break;
 			} else if (state == st::NONE) {
-				*(rp ++) = c;
+				rp += c;
 				linebegin = false;
 			}
-			if (state != st::NONE && p != buf.get() &&
+			if (state != st::NONE && p != buf &&
 			    (state == st::TAG || p[-1] != '\\') && (!in_q || *p == in_q))
 				in_q = in_q ? 0 : *p;
 			break;
@@ -1446,12 +1435,12 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 				break;
 			}
 			if (state == st::NONE) {
-				*(rp ++) = c;
+				rp += c;
 				linebegin = false;
 			}
 			break;
 		case '-':
-			if (state == st::QUOTE && p >= buf.get() + 2 && p[-1] == '-' && p[-2] == '!')
+			if (state == st::QUOTE && p >= buf + 2 && p[-1] == '-' && p[-2] == '!')
 				state = st::COMMENT;
 			else
 				goto REG_CHAR;
@@ -1459,7 +1448,7 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 		case 'E':
 		case 'e':
 			/* !DOCTYPE exception */
-			if (state == st::QUOTE && p > buf.get() + 6 &&
+			if (state == st::QUOTE && p > buf + 6 &&
 			    HX_tolower(p[-6]) == 'd' && HX_tolower(p[-5]) == 'o' &&
 			    HX_tolower(p[-4]) == 'c' && HX_tolower(p[-3]) == 't' &&
 			    HX_tolower(p[-2]) == 'y' && HX_tolower(p[-1]) == 'p') {
@@ -1470,16 +1459,14 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
 		default:
  REG_CHAR:
 			if (state == st::NONE && (!HX_isspace(c) || !linebegin)) {
-				*rp++ = c;
+				rp += c;
 				linebegin = false;
 			}
 			break;
 		}
 		c = *(++ p);
 	}
-	if (rp < rbuf.get() + len)
-		*rp = '\0';
-	outbuf = rbuf.get();
+	outbuf = std::move(rp);
 	return 1;
 } catch (...) {
 	return -1;
@@ -1499,12 +1486,15 @@ static int html_to_plain_boring(const void *inbuf, size_t len,
  * which puts the ball back into the caller's court.
  * Returns a negative number on error.
  */
-int html_to_plain(const void *inbuf, size_t len, cpid_t cpid, std::string &outbuf)
+int html_to_plain(std::string_view inbuf, cpid_t cpid, std::string &outbuf)
 {
-	auto ret = feed_w3m(inbuf, len, cpid_to_cset(cpid), outbuf);
-	if (ret >= 0)
-		return CP_UTF8;
-	ret = html_to_plain_boring(inbuf, len, outbuf);
+	auto s = getenv("AVOID_W3M"); /* for testing */
+	if (s == nullptr || parse_bool(s) == 0) {
+		auto ret = feed_w3m(inbuf, cpid_to_cset(cpid), outbuf);
+		if (ret >= 0)
+			return CP_UTF8;
+	}
+	auto ret = html_to_plain_boring(inbuf, outbuf);
 	if (ret < 0)
 		return ret;
 	return cpid;
@@ -1513,24 +1503,22 @@ int html_to_plain(const void *inbuf, size_t len, cpid_t cpid, std::string &outbu
 /*
  * Always outputs UTF-8. The caller must ensure that this is conveyed properly
  * (e.g. via PR_INTERNET_CPID=65001 [CP_UTF8]).
+ *
+ * It is allowed for @rbuf to point to the same object as @out.
  */
-char *plain_to_html(const char *rbuf)
+ec_error_t plain_to_html(const char *rbuf, std::string &out) try
 {
-	const char head[] =
+	static constexpr char head[] =
 		"<html><head><meta name=\"Generator\" content=\"gromox-texttohtml"
 		"\">\r\n</head>\r\n<body>\r\n<pre>";
-	const char footer[] = "</pre>\r\n</body>\r\n</html>";
+	static constexpr char footer[] = "</pre>\r\n</body>\r\n</html>";
 
-	char *body = HX_strquote(rbuf, HXQUOTE_HTML, nullptr);
+	std::unique_ptr<char[], stdlib_delete> body(HX_strquote(rbuf, HXQUOTE_HTML, nullptr));
 	if (body == nullptr)
-		return nullptr;
-	auto out = gromox::me_alloc<char>(strlen(head) + strlen(body) +
-	           strlen(footer) + 1);
-	if (out != nullptr) {
-		strcpy(out, head);
-		strcat(out, body);
-		strcat(out, footer);
-	}
-	free(body);
-	return out;
+		return ecMAPIOOM;
+	out = std::string(head) + body.get() + footer;
+	return ecSuccess;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return ecMAPIOOM;
 }

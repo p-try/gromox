@@ -223,7 +223,7 @@ std::string cu_username_to_oneoff_s(const char *username, const char *dispname) 
 	out.resize(ep.m_offset);
 	return out;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2254: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -293,7 +293,7 @@ std::string cu_fid_to_entryid_s(const logon_object &logon, uint64_t folder_id) t
 		return {};
 	return out;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2246: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -341,7 +341,7 @@ std::string cu_fid_to_sk_s(const logon_object &logon, uint64_t folder_id) try
 		return {};
 	return out;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2248: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -404,7 +404,7 @@ std::string cu_mid_to_entryid_s(const logon_object &logon, uint64_t folder_id,
 	out.resize(ep.m_offset);
 	return out;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2252: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -448,7 +448,7 @@ std::string cu_mid_to_sk_s(const logon_object &logon, uint64_t message_id) try
 		return {};
 	return out;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2253: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -529,7 +529,7 @@ std::string cu_xid_to_bin_s(const XID &xid) try
 	out.resize(ep.m_offset);
 	return out;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2255: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -764,7 +764,7 @@ void common_util_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
 				memmove(pproptags_minuend->pproptag + i,
 					pproptags_minuend->pproptag + i + 1,
 					(pproptags_minuend->count - i) *
-					sizeof(uint32_t));
+					sizeof(proptag_t));
 			break;
 		}
 	}
@@ -775,7 +775,7 @@ PROPTAG_ARRAY* common_util_trim_proptags(const PROPTAG_ARRAY *pproptags)
 	auto ptmp_proptags = cu_alloc<PROPTAG_ARRAY>();
 	if (ptmp_proptags == nullptr)
 		return NULL;
-	ptmp_proptags->pproptag = cu_alloc<uint32_t>(pproptags->count);
+	ptmp_proptags->pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (ptmp_proptags->pproptag == nullptr)
 		return NULL;
 	ptmp_proptags->count = 0;
@@ -783,7 +783,7 @@ PROPTAG_ARRAY* common_util_trim_proptags(const PROPTAG_ARRAY *pproptags)
 		const auto tag = pproptags->pproptag[i];
 		if (PROP_TYPE(tag) == PT_OBJECT)
 			continue;
-		ptmp_proptags->pproptag[ptmp_proptags->count++] = tag;
+		ptmp_proptags->emplace_back(tag);
 	}
 	return ptmp_proptags;
 }
@@ -1170,7 +1170,7 @@ BOOL common_util_modifyrecipient_to_propvals(cpid_t cpid,
 			prow->precipient_row, pcolumns, ppropvals);
 }
 
-static void common_util_convert_proptag(BOOL to_unicode, uint32_t *pproptag)
+static void common_util_convert_proptag(BOOL to_unicode, proptag_t *pproptag)
 {
 	if (to_unicode) {
 		if (PROP_TYPE(*pproptag) == PT_STRING8)
@@ -1423,7 +1423,7 @@ void common_util_notify_receipt(const char *username, int type,
 	if (ret != ecSuccess)
 		mlog2(LV_ERR, "E-1189: ems_send_mail: %s", mapi_strerror(ret));
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2035: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 }
 
 static void common_util_set_dir(const char *dir)
@@ -1454,7 +1454,7 @@ static BOOL common_util_get_propname(propid_t propid, PROPERTY_NAME **pppropname
 	*pppropname = propnames.ppropname;
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2234: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -1604,7 +1604,7 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 	}
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2553: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 

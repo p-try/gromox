@@ -27,9 +27,11 @@
 #include <gromox/database_mysql.hpp>
 #include <gromox/defs.h>
 #include <gromox/ext_buffer.hpp>
+#include <gromox/mapi_types.hpp>
 #include <gromox/fileio.h>
 #include <gromox/json.hpp>
 #include <gromox/mapidefs.h>
+#include <gromox/usercvt.hpp>
 #include <gromox/paths.h>
 #include <gromox/textmaps.hpp>
 #include <gromox/util.hpp>
@@ -301,29 +303,71 @@ errno_t ace_list::emplace(std::string &&s, uint32_t r)
 
 static void substitute_addrs(TPROPVAL_ARRAY *ar)
 {
-	static constexpr std::pair<uint32_t, uint32_t> proplist[] = {
-		{PR_SENT_REPRESENTING_ADDRTYPE, PR_SENT_REPRESENTING_EMAIL_ADDRESS},
-		{PR_ORIGINAL_SENDER_ADDRTYPE, PR_ORIGINAL_SENDER_EMAIL_ADDRESS},
-		{PR_ORIGINAL_SENT_REPRESENTING_ADDRTYPE, PR_ORIGINAL_SENT_REPRESENTING_EMAIL_ADDRESS},
-		{PR_RECEIVED_BY_ADDRTYPE, PR_RECEIVED_BY_EMAIL_ADDRESS},
-		{PR_RCVD_REPRESENTING_ADDRTYPE, PR_RCVD_REPRESENTING_EMAIL_ADDRESS},
-		{PR_ORIGINAL_AUTHOR_ADDRTYPE, PR_ORIGINAL_AUTHOR_EMAIL_ADDRESS},
-		{PR_ORIGINALLY_INTENDED_RECIP_ADDRTYPE, PR_ORIGINALLY_INTENDED_RECIP_EMAIL_ADDRESS},
-		{PR_SENDER_ADDRTYPE, PR_SENDER_EMAIL_ADDRESS},
-		{PR_ADDRTYPE, PR_EMAIL_ADDRESS},
+	static constexpr struct {
+		proptag_t addrtype, emaddr, entryid, srchkey, smtpaddr;
+	} propsets[] = {
+		{PR_SENT_REPRESENTING_ADDRTYPE, PR_SENT_REPRESENTING_EMAIL_ADDRESS, PR_SENT_REPRESENTING_ENTRYID, PR_SENT_REPRESENTING_SEARCH_KEY, PR_SENT_REPRESENTING_SMTP_ADDRESS},
+		{PR_ORIGINAL_SENDER_ADDRTYPE, PR_ORIGINAL_SENDER_EMAIL_ADDRESS, PR_ORIGINAL_SENDER_ENTRYID, PR_ORIGINAL_SENDER_SEARCH_KEY},
+		{PR_ORIGINAL_SENT_REPRESENTING_ADDRTYPE, PR_ORIGINAL_SENT_REPRESENTING_EMAIL_ADDRESS, PR_ORIGINAL_SENT_REPRESENTING_ENTRYID, PR_ORIGINAL_SENT_REPRESENTING_SEARCH_KEY},
+		{PR_RECEIVED_BY_ADDRTYPE, PR_RECEIVED_BY_EMAIL_ADDRESS, PR_RECEIVED_BY_ENTRYID, PR_RECEIVED_BY_SEARCH_KEY},
+		{PR_RCVD_REPRESENTING_ADDRTYPE, PR_RCVD_REPRESENTING_EMAIL_ADDRESS, PR_RCVD_REPRESENTING_ENTRYID, PR_RCVD_REPRESENTING_SEARCH_KEY},
+		{PR_ORIGINAL_AUTHOR_ADDRTYPE, PR_ORIGINAL_AUTHOR_EMAIL_ADDRESS, PR_ORIGINAL_AUTHOR_ENTRYID, PR_ORIGINAL_AUTHOR_SEARCH_KEY},
+		{PR_ORIGINALLY_INTENDED_RECIP_ADDRTYPE, PR_ORIGINALLY_INTENDED_RECIP_EMAIL_ADDRESS, PR_ORIGINALLY_INTENDED_RECIP_ENTRYID, 0},
+		{PR_SENDER_ADDRTYPE, PR_SENDER_EMAIL_ADDRESS, PR_SENDER_ENTRYID, PR_SENDER_SEARCH_KEY, PR_SENDER_SMTP_ADDRESS},
+		{PR_ADDRTYPE, PR_EMAIL_ADDRESS, PR_ENTRYID, PR_SEARCH_KEY, PR_SMTP_ADDRESS},
 	};
-	for (const auto &pair : proplist) {
-		auto at = ar->get<const char>(pair.first);
-		if (at == nullptr || strcasecmp(at, "ZARAFA") != 0)
+	for (const auto &tags : propsets) {
+		const char *smtpaddr = nullptr;
+		/* If we already have PR.*SMTP_ADDRESS, just use that */
+		if (tags.smtpaddr != 0)
+			smtpaddr = ar->get<const char>(tags.smtpaddr);
+		if (smtpaddr == nullptr) {
+			auto at = ar->get<const char>(tags.addrtype);
+			if (at == nullptr || strcasecmp(at, "ZARAFA") != 0)
+				continue;
+			auto em = ar->get<const char>(tags.emaddr);
+			if (em == nullptr)
+				continue;
+			auto repl = g_zaddr_to_email.find(em);
+			if (repl == g_zaddr_to_email.end())
+				continue;
+			smtpaddr = repl->second.c_str();
+		}
+
+		ONEOFF_ENTRYID e{};
+		e.ctrl_flags    = MAPI_ONE_OFF_NO_RICH_INFO | MAPI_ONE_OFF_UNICODE;
+		e.pdisplay_name = smtpaddr;
+		e.paddress_type = "SMTP";
+		e.pmail_address = smtpaddr;
+		std::string out;
+		out.resize(1280);
+		EXT_PUSH ep;
+		if (!ep.init(out.data(), out.size(), EXT_FLAG_UTF16) ||
+		    ep.p_oneoff_eid(e) != pack_result::success)
 			continue;
-		auto em = ar->get<const char>(pair.second);
-		if (em == nullptr)
-			continue;
-		auto repl = g_zaddr_to_email.find(em);
-		if (repl == g_zaddr_to_email.end())
-			continue;
-		if (ar->set(TAGGED_PROPVAL{pair.first, deconst("SMTP")}) == ecServerOOM ||
-		    ar->set(TAGGED_PROPVAL{pair.second, deconst(repl->second.c_str())}) == ecServerOOM)
+		BINARY ebin;
+		ebin.cb = ep.m_offset;
+		ebin.pb = ep.m_udata;
+		std::string srchkey = "SMTP:"s + smtpaddr;
+		HX_strupper(srchkey.data());
+		BINARY sbin;
+		sbin.cb = srchkey.size() + 1;
+		sbin.pc = deconst(srchkey.c_str());
+
+		/*
+		 * No need to set PR_SMTP_ADDRESS:
+		 * - if it existed, it is the source truth (and is not changing)
+		 * - it did not exist before, don't add redundant
+		 *   data (PR_EMAIL_ADDRESS already contains everything)
+		 */
+		if (ar->set(TAGGED_PROPVAL{tags.addrtype, deconst("SMTP")}) == ecServerOOM ||
+		    ar->set(TAGGED_PROPVAL{tags.emaddr, deconst(smtpaddr)}) == ecServerOOM)
+			throw std::bad_alloc();
+		if (tags.entryid != 0 &&
+		    ar->set(TAGGED_PROPVAL{tags.entryid, &ebin}) == ecServerOOM)
+			throw std::bad_alloc();
+		if (tags.srchkey != 0 &&
+		    ar->set(TAGGED_PROPVAL{tags.srchkey, &sbin}) == ecServerOOM)
 			throw std::bad_alloc();
 	}
 }
@@ -1431,24 +1475,24 @@ static int usermap_read(const char *file, LR_map &ku, LR_map &na, LR_map &ze)
 		return EXIT_FAILURE;
 	}
 	Json::Value jval;
-	if (!json_from_str({slurp_data.get(), slurp_len}, jval) ||
+	if (!str_to_json({slurp_data.get(), slurp_len}, jval) ||
 	    !jval.isArray()) {
-		fprintf(stderr, "%s: parse error\n", file);
+		fprintf(stderr, "%s: JSON parse error.\n"
+			"Try using a utility like jq(1) to discover details.\n", file);
 		return EXIT_FAILURE;
 	}
 	for (unsigned int i = 0; i < jval.size(); ++i) {
 		auto &row = jval[i];
-		if (row["id"].isNull() || row["sv"].isNull())
-			continue;
-		auto srv_guid = row["sv"].asString();
+		const std::string &kuid = !row["id"].isNull() ? row["id"].asString() : "";
+		auto srv_guid = !row["sv"].isNull() ? row["sv"].asString() : "";
 		HX_strlower(srv_guid.data());
 		auto f_na = !row["na"].isNull() ? row["na"].asCString() : "";
 		auto f_em = !row["em"].isNull() ? row["em"].asCString() : "";
 		auto f_to = !row["to"].isNull() ? row["to"].asCString() : "";
-		if (g_acl_conv == aclconv::convert && *f_to != '\0' &&
-		    strchr(f_to, '@') != nullptr)
-			ku.emplace(row["id"].asString() + "@" + srv_guid +
-				".kopano.invalid", f_to);
+		if (g_acl_conv == aclconv::convert &&
+		    kuid.size() > 0 && srv_guid.size() > 0 &&
+		    *f_to != '\0' && strchr(f_to, '@') != nullptr)
+			ku.emplace(kuid + "@" + srv_guid + ".kopano.invalid", f_to);
 		if (*f_na != '\0' && !row["st"].isNull()) {
 			auto store_guid = row["st"].asString();
 			HX_strlower(store_guid.data());
@@ -1463,6 +1507,7 @@ static int usermap_read(const char *file, LR_map &ku, LR_map &na, LR_map &ze)
 	if (g_acl_conv == aclconv::convert)
 		fprintf(stderr, "usermap %s: %zu x kuid -> (new) emailaddr\n", file, ku.size());
 	fprintf(stderr, "usermap %s: %zu x name -> storeguid\n", file, na.size());
+	fprintf(stderr, "usermap %s: %zu x name -> emailaddr\n", file, ze.size());
 	return 0;
 }
 

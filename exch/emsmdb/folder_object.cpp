@@ -54,14 +54,13 @@ BOOL folder_object::get_all_proptags(PROPTAG_ARRAY *pproptags) const
 	if (!exmdb_client->get_folder_all_proptags(pfolder->plogon->get_dir(),
 	    pfolder->folder_id, &tmp_proptags))
 		return FALSE;		
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags.count + 15);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags.count + 15);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
 	/* Folders are not supposed to have namedprops */
 	auto eop = std::copy_if(tmp_proptags.begin(), tmp_proptags.end(),
-	           pproptags->pproptag, [](uint32_t x) { return x < 0x80000000; });
+	           pproptags->pproptag, [](proptag_t x) { return !is_nameprop_id(PROP_ID(x)); });
 	pproptags->count = eop - pproptags->pproptag;
-	memcpy(pproptags->pproptag, tmp_proptags.pproptag, sizeof(proptag_t) * tmp_proptags.count);
 	static constexpr proptag_t tags1[] = {
 		PR_ACCESS, PR_RIGHTS, PR_PARENT_ENTRYID, PR_PARENT_SOURCE_KEY,
 		PR_SOURCE_KEY, PR_CORRELATION_ID,
@@ -419,7 +418,7 @@ BOOL folder_object::get_properties(const PROPTAG_ARRAY *pproptags,
 	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
-	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<uint32_t>(pproptags->count)};
+	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<proptag_t>(pproptags->count)};
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	ppropvals->count = 0;
@@ -514,7 +513,7 @@ BOOL folder_object::set_properties(const TPROPVAL_ARRAY *ppropvals,
 	*pproblems += std::move(tmp_problems);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1743: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -527,7 +526,7 @@ BOOL folder_object::remove_properties(const PROPTAG_ARRAY *pproptags,
 	pproblems->pproblem = cu_alloc<PROPERTY_PROBLEM>(pproptags->count);
 	if (pproblems->pproblem == nullptr)
 		return FALSE;
-	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<uint32_t>(pproptags->count)};
+	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<proptag_t>(pproptags->count)};
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	auto pfolder = this;

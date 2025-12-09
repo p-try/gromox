@@ -42,7 +42,7 @@ static BOOL oxctable_verify_columns_and_sorts(
 	return TRUE;
 }
 
-static inline bool table_acceptable_type(uint16_t type)
+static inline bool table_acceptable_type(proptype_t type)
 {
 	switch (type) {
 	case PT_SHORT:
@@ -918,9 +918,9 @@ ec_error_t rop_updatedeferredactionmessages(const BINARY *pserver_entry_id,
 	    &table_id, &row_count))
 		return ecError;
 
-	uint32_t tmp_proptag = PidTagMid;
+	static constexpr proptag_t tmp_proptag = PidTagMid;
 	proptags.count = 1;
-	proptags.pproptag = &tmp_proptag;
+	proptags.pproptag = deconst(&tmp_proptag);
 	if (!exmdb_client->query_table(dir, nullptr, CP_ACP,
 	    table_id, &proptags, 0, row_count, &tmp_set))
 		return ecError;

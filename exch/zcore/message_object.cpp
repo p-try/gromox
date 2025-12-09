@@ -361,7 +361,7 @@ ec_error_t message_object::save() try
 			pmessage->cpid, pmessage->folder_id, pmessage->message_id);
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2905: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return ecServerOOM;
 }
 
@@ -391,7 +391,7 @@ BOOL message_object::reload()
 	return TRUE;
 }
 
-static constexpr uint32_t trimtags[] = {
+static constexpr proptag_t trimtags[] = {
 	PidTagMid, PR_DISPLAY_TO, PR_DISPLAY_CC,
 	PR_DISPLAY_BCC, PR_MESSAGE_SIZE, PR_HASATTACH,
 	PR_CHANGE_KEY, PidTagChangeNumber,
@@ -552,7 +552,7 @@ BOOL message_object::get_all_proptags(PROPTAG_ARRAY *pproptags)
 	    pmessage->instance_id, &tmp_proptags))
 		return FALSE;	
 	pproptags->count = 0;
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags.count + 15);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags.count + 15);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
 	for (unsigned int i = 0; i < tmp_proptags.count; ++i) {
@@ -712,7 +712,7 @@ BOOL message_object::get_properties(const PROPTAG_ARRAY *pproptags,
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
 	tmp_proptags.count = 0;
-	tmp_proptags.pproptag = cu_alloc<uint32_t>(pproptags->count);
+	tmp_proptags.pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	ppropvals->count = 0;
@@ -829,7 +829,7 @@ static BOOL message_object_set_properties_internal(message_object *pmessage,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1748: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -854,7 +854,7 @@ BOOL message_object::remove_properties(const PROPTAG_ARRAY *pproptags) try
 	if (problems.pproblem == nullptr)
 		return FALSE;
 	tmp_proptags.count = 0;
-	tmp_proptags.pproptag = cu_alloc<uint32_t>(pproptags->count);
+	tmp_proptags.pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	std::vector<uint16_t> poriginal_indices;
@@ -864,7 +864,7 @@ BOOL message_object::remove_properties(const PROPTAG_ARRAY *pproptags) try
 			problems.pproblem[problems.count++].index = i;
 			continue;
 		}
-		tmp_proptags.pproptag[tmp_proptags.count++] = tag;
+		tmp_proptags.emplace_back(tag);
 		poriginal_indices.push_back(i);
 	}
 	if (tmp_proptags.count == 0)
@@ -890,7 +890,7 @@ BOOL message_object::remove_properties(const PROPTAG_ARRAY *pproptags) try
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1749: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 

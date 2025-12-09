@@ -51,17 +51,14 @@ static int instance_get_rtf(MESSAGE_CONTENT *mc, BINARY *&bin)
 	auto ret = instance_get_raw(mc, bin, ID_TAG_RTFCOMPRESSED);
 	if (ret <= 0)
 		return ret;
-	BINARY rtf_comp = *bin;
-	ssize_t unc_size = rtfcp_uncompressed_size(&rtf_comp);
-	if (unc_size < 0)
+	std::string out;
+	if (rtfcp_uncompress(*bin, out) != ecSuccess)
 		return -1;
-	bin->pv = common_util_alloc(unc_size);
+	bin->pv = common_util_alloc(out.size());
 	if (bin->pv == nullptr)
 		return -1;
-	size_t unc_size2 = unc_size;
-	if (!rtfcp_uncompress(&rtf_comp, bin->pc, &unc_size2))
-		return -1;
-	bin->cb = unc_size2;
+	memcpy(bin->pv, out.data(), out.size());
+	bin->cb = out.size();
 	return 1;
 }
 
@@ -73,7 +70,8 @@ static int instance_conv_htmlfromhigher(MESSAGE_CONTENT *mc, BINARY *&bin)
 	std::string outbuf;
 	auto at = attachment_list_init();
 	auto at_clean = HX::make_scope_exit([&]() { attachment_list_free(at); });
-	if (!rtf_to_html(bin->pc, bin->cb, "utf-8", outbuf, at))
+	auto err = rtf_to_html(*bin, "utf-8", outbuf, at);
+	if (err != ecSuccess)
 		return -1;
 	bin->cb = outbuf.size() < UINT32_MAX ? outbuf.size() : UINT32_MAX;
 	bin->pv = common_util_alloc(bin->cb);
@@ -95,7 +93,7 @@ static int instance_conv_textfromhigher(MESSAGE_CONTENT *mc, BINARY *&bin)
 	auto cpraw = mc->proplist.get<const uint32_t>(PR_INTERNET_CPID);
 	cpid_t cpid = cpraw != nullptr ? static_cast<cpid_t>(*cpraw) : CP_OEMCP;
 	std::string plainbuf;
-	ret = html_to_plain(bin->pc, bin->cb, cpid, plainbuf);
+	ret = html_to_plain(*bin, cpid, plainbuf);
 	if (ret < 0)
 		return 0;
 	else if (ret == CP_OEMCP)
@@ -126,10 +124,11 @@ static int instance_conv_htmlfromlower(MESSAGE_CONTENT *mc,
 	}
 	if (ret <= 0)
 		return ret;
-	std::unique_ptr<char[], instbody_delete> htmlout(plain_to_html(bin->pc));
-	if (htmlout == nullptr)
+	std::string htmlout;
+	auto err = plain_to_html(bin->pc, htmlout);
+	if (err != ecSuccess)
 		return -1;
-	bin->pc = common_util_convert_copy(false, cpid, htmlout.get());
+	bin->pc = common_util_convert_copy(false, cpid, htmlout.c_str());
 	if (bin->pc == nullptr)
 		return -1;
 	/* instance_get_raw / instance_read_cid_content guaranteed trailing \0 */
@@ -143,18 +142,19 @@ static int instance_conv_rtfcpfromlower(MESSAGE_CONTENT *mc,
 	auto ret = instance_conv_htmlfromlower(mc, cpid, bin);
 	if (ret <= 0)
 		return ret;
-	std::unique_ptr<char[], instbody_delete> rtfout;
-	size_t rtflen = 0;
-	if (html_to_rtf(bin->pc, bin->cb, cpid, &unique_tie(rtfout), &rtflen) != ecSuccess)
+	std::string rtfout;
+	if (html_to_rtf(*bin, cpid, rtfout) != ecSuccess)
 		return -1;
-	std::unique_ptr<BINARY, instbody_delete> rtfcpbin(rtfcp_compress(rtfout.get(), rtflen));
-	if (rtfcpbin == nullptr)
+	auto err = rtfcp_encode(rtfout, rtfout);
+	if (err != ecSuccess) {
+		mlog(LV_ERR, "rtfcp_encode_inplace: %s", mapi_strerror(err));
 		return -1;
-	bin->cb = rtfcpbin->cb;
-	bin->pv = common_util_alloc(rtfcpbin->cb);
+	}
+	bin->cb = rtfout.size();
+	bin->pv = common_util_alloc(rtfout.size());
 	if (bin->pv == nullptr)
 		return -1;
-	memcpy(bin->pv, rtfcpbin->pv, rtfcpbin->cb);
+	memcpy(bin->pv, rtfout.data(), rtfout.size());
 	return 1;
 }
 

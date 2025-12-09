@@ -76,7 +76,7 @@ static constexpr HXoption g_options_table[] = {
 	HXOPT_TABLEEND,
 };
 
-static constexpr static_module g_dfl_svc_plugins[] = {
+static constexpr generic_module g_dfl_svc_plugins[] = {
 	{"libgxs_event_proxy.so", SVC_event_proxy},
 	{"libgxs_event_stub.so", SVC_event_stub},
 	{"libgxs_midb_agent.so", SVC_midb_agent},
@@ -324,7 +324,7 @@ static void listener_stop_accept()
 
 char *capability_list(char *dst, size_t z, imap_context *ctx)
 {
-	gx_strlcpy(dst, "IMAP4rev1 XLIST SPECIAL-USE UNSELECT UIDPLUS IDLE AUTH=LOGIN LITERAL+ LITERAL-", z);
+	gx_strlcpy(dst, "IMAP4rev1 XLIST SPECIAL-USE UNSELECT UIDPLUS IDLE LITERAL+ LITERAL-", z);
 	bool offer_tls = g_support_tls;
 	if (ctx != nullptr) {
 		if (ctx->connection.ssl != nullptr || ctx->is_authed())
@@ -332,6 +332,10 @@ char *capability_list(char *dst, size_t z, imap_context *ctx)
 	}
 	if (offer_tls)
 		HX_strlcat(dst, " STARTTLS", z);
+	if (g_force_tls && (ctx == nullptr || ctx->connection.ssl == nullptr))
+		HX_strlcat(dst, " LOGINDISABLED", z);
+	else
+		HX_strlcat(dst, " AUTH=LOGIN", z);
 	if (parse_bool(g_config_file->get_value("enable_rfc2971_commands")))
 		HX_strlcat(dst, " ID", z);
 	return dst;
@@ -488,8 +492,13 @@ int main(int argc, char **argv)
 	}
 	
 	auto imap_force_tls = parse_bool(g_config_file->get_value("imap_force_tls"));
-	if (imap_support_tls && imap_force_tls)
-		printf("[imap]: imap MUST be running with TLS\n");
+	if (imap_force_tls) {
+		if (!imap_support_tls) {
+			fprintf(stderr, "Cannot combine imap_force_tls=yes with imap_support_tls=no.\n");
+			return EXIT_FAILURE;
+		}
+		printf("[imap]: imap connections MUST be using TLS\n");
+	}
 	if (!imap_support_tls && listen_tls_port > 0)
 		listen_tls_port = 0;
 	if (listen_tls_port > 0)

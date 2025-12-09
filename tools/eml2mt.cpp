@@ -74,7 +74,7 @@ static constexpr HXoption g_options_table[] = {
 	HXOPT_TABLEEND,
 };
 
-static constexpr static_module g_dfl_svc_plugins[] =
+static constexpr generic_module g_dfl_svc_plugins[] =
 	{{"libgxs_mysql_adaptor.so", SVC_mysql_adaptor}};
 
 static constexpr cfg_directive eml2mt_cfg_defaults[] = {
@@ -97,10 +97,10 @@ static void terse_help()
 	fprintf(stderr, "Documentation: man gromox-eml2mt\n");
 }
 
-static message_ptr do_mail(const char *file, char *data, size_t dsize)
+static message_ptr do_mail(const char *file, const char *data, size_t dsize)
 {
 	MAIL imail;
-	if (!imail.load_from_str(data, dsize)) {
+	if (!imail.refonly_parse(data, dsize)) {
 		fprintf(stderr, "Unable to parse %s\n", file);
 		return nullptr;
 	}

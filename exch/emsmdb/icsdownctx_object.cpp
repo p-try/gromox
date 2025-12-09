@@ -15,7 +15,7 @@
 #include <libHX/scope.hpp>
 #include <gromox/eid_array.hpp>
 #include <gromox/ext_buffer.hpp>
-#include <gromox/mapi_types.hpp>
+#include <gromox/idset.hpp>
 #include <gromox/proc_common.h>
 #include <gromox/proptag_array.hpp>
 #include <gromox/restriction.hpp>
@@ -40,7 +40,7 @@ bool ics_flow_list::record_node(ics_flow_func func_id, uint64_t param) try
 	emplace_back(func_id, param);
 	return true;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1598: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -53,16 +53,10 @@ bool ics_flow_list::record_node(ics_flow_func func_id, const void *param)
 std::unique_ptr<icsdownctx_object> icsdownctx_object::create(logon_object *plogon,
     folder_object *pfolder, uint8_t sync_type, uint8_t send_options,
 	uint16_t sync_flags, const RESTRICTION *prestriction,
-	uint32_t extra_flags, const PROPTAG_ARRAY *pproptags)
+	uint32_t extra_flags, const PROPTAG_ARRAY *pproptags) try
 {
 	int state_type = sync_type == SYNC_TYPE_CONTENTS ? ICS_STATE_CONTENTS_DOWN : ICS_STATE_HIERARCHY_DOWN;
-	std::unique_ptr<icsdownctx_object> pctx;
-	try {
-		pctx.reset(new icsdownctx_object);
-	} catch (const std::bad_alloc &) {
-		mlog(LV_ERR, "E-1454: ENOMEM");
-		return NULL;
-	}
+	std::unique_ptr<icsdownctx_object> pctx(new icsdownctx_object);
 	pctx->pstate = ics_state::create(plogon, state_type);
 	if (pctx->pstate == nullptr)
 		return NULL;
@@ -86,6 +80,9 @@ std::unique_ptr<icsdownctx_object> icsdownctx_object::create(logon_object *plogo
 	if (pctx->pstream == nullptr)
 		return NULL;
 	return pctx;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
+	return nullptr;
 }
 
 static BOOL icsdownctx_object_make_content(icsdownctx_object *pctx)
@@ -231,7 +228,7 @@ static BOOL icsdownctx_object_make_hierarchy(icsdownctx_object *pctx)
 		if (!pctx->pstate->pgiven->append(fid))
 			return FALSE;	
 	for (auto &chg : fldchgs) {
-		static constexpr uint32_t tags[] = {
+		static constexpr proptag_t tags[] = {
 			PR_FOLDER_PATHNAME, PR_NORMAL_MESSAGE_SIZE,
 			PR_NORMAL_MESSAGE_SIZE_EXTENDED, PR_MESSAGE_SIZE_EXTENDED,
 			PR_ASSOC_MESSAGE_SIZE, PR_ASSOC_MESSAGE_SIZE_EXTENDED,
@@ -1055,7 +1052,7 @@ icsdownctx_object::~icsdownctx_object()
 		restriction_free(pctx->prestriction);
 }
 
-BOOL icsdownctx_object::begin_state_stream(uint32_t new_state_prop)
+bool icsdownctx_object::begin_state_stream(proptag_t new_state_prop)
 {
 	auto pctx = this;
 	if (pctx->b_started)
@@ -1075,7 +1072,7 @@ BOOL icsdownctx_object::begin_state_stream(uint32_t new_state_prop)
 	default:
 		return FALSE;
 	}
-	pctx->state_property = new_state_prop;
+	pctx->state_property = std::move(new_state_prop);
 	f_state_stream.clear();
 	return TRUE;
 }
@@ -1094,7 +1091,7 @@ BOOL icsdownctx_object::continue_state_stream(const BINARY *pstream_data) try
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1088: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -1110,7 +1107,7 @@ BOOL icsdownctx_object::end_state_stream()
 	auto pset = idset::create(idset::type::guid_packed);
 	if (pset == nullptr)
 		return FALSE;
-	auto saved_state_property = pctx->state_property;
+	auto saved_state_property = std::move(pctx->state_property);
 	pctx->state_property = 0;
 	tmp_bin.pv = f_state_stream.data();
 	tmp_bin.cb = f_state_stream.size();
@@ -1122,7 +1119,7 @@ BOOL icsdownctx_object::end_state_stream()
 		return FALSE;
 	if (!pset->convert())
 		return FALSE;
-	if (!pctx->pstate->append_idset(saved_state_property, std::move(pset)))
+	if (!pctx->pstate->append_idset(std::move(saved_state_property), std::move(pset)))
 		return FALSE;
 	return TRUE;
 }
@@ -1184,7 +1181,7 @@ BOOL icsupctx_object::continue_state_stream(const BINARY *pstream_data) try
 	f_state_stream += std::string_view(pstream_data->pc, pstream_data->cb);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1089: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -1207,7 +1204,7 @@ BOOL icsupctx_object::end_state_stream()
 		return FALSE;
 	tmp_bin.pv = f_state_stream.data();
 	tmp_bin.cb = f_state_stream.size();
-	auto saved_state_prop = pctx->state_property;
+	auto saved_state_prop = std::move(pctx->state_property);
 	pctx->state_property = 0;
 	if (!pset->deserialize(std::move(tmp_bin)))
 		return FALSE;
@@ -1215,7 +1212,7 @@ BOOL icsupctx_object::end_state_stream()
 		return FALSE;
 	if (!pset->convert())
 		return FALSE;
-	if (!pctx->pstate->append_idset(saved_state_prop, std::move(pset)))
+	if (!pctx->pstate->append_idset(std::move(saved_state_prop), std::move(pset)))
 		return FALSE;
 	return TRUE;
 }

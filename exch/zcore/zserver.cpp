@@ -2452,7 +2452,7 @@ ec_error_t zs_unadvise(GUID hsession, uint32_t hstore,
 	g_notify_table.erase(std::move(tmp_buf));
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1498: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -2580,7 +2580,7 @@ ec_error_t zs_queryrows(GUID hsession, uint32_t htable, uint32_t start,
 		case zcore_tbltype::recipient:
 		case zcore_tbltype::store:
 		case zcore_tbltype::abcontusr:
-			if (!ptable->filter_rows(count, prestriction, pproptags, prowset))
+			if (!ptable->filter_rows(count, prestriction, prowset))
 				return ecError;
 			break;
 		default:
@@ -2695,7 +2695,7 @@ ec_error_t zs_seekrow(GUID hsession, uint32_t htable, uint32_t bookmark,
 	return ecSuccess;
 }
 
-static bool table_acceptable_type(uint16_t type)
+static bool table_acceptable_type(proptype_t type)
 {
 	switch (type) {
 	case PT_SHORT:
@@ -2739,10 +2739,8 @@ ec_error_t zs_sorttable(GUID hsession,
 	uint32_t htable, const SORTORDER_SET *psortset)
 {
 	BOOL b_max;
-	uint16_t type;
 	zs_objtype mapi_type;
 	BOOL b_multi_inst;
-	uint32_t tmp_proptag;
 	
 	if (psortset->count > MAXIMUM_SORT_COUNT)
 		return ecTooComplex;
@@ -2759,7 +2757,7 @@ ec_error_t zs_sorttable(GUID hsession,
 	b_max = FALSE;
 	b_multi_inst = FALSE;
 	for (unsigned int i = 0; i < psortset->count; ++i) {
-		tmp_proptag = PROP_TAG(psortset->psort[i].type, psortset->psort[i].propid);
+		auto tmp_proptag = PROP_TAG(psortset->psort[i].type, psortset->psort[i].propid);
 		if (tmp_proptag == PR_DEPTH || tmp_proptag == PidTagInstID ||
 		    tmp_proptag == PidTagInstanceNum ||
 		    tmp_proptag == PR_CONTENT_COUNT ||
@@ -2778,7 +2776,7 @@ ec_error_t zs_sorttable(GUID hsession,
 		default:
 			return ecInvalidParam;
 		}
-		type = psortset->psort[i].type;
+		auto type = psortset->psort[i].type;
 		if (type & MV_FLAG) {
 			/* we do not support multivalue property
 				without multivalue instances */
@@ -3365,7 +3363,7 @@ ec_error_t zs_submitmessage(GUID hsession, uint32_t hmessage) try
 		pmessage->clear_unsent();
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2351: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -3858,7 +3856,7 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 			return ecError;
 		common_util_reduce_proptags(&proptags, pexclude_proptags);
 		tmp_proptags.count = 0;
-		tmp_proptags.pproptag = cu_alloc<uint32_t>(proptags.count);
+		tmp_proptags.pproptag = cu_alloc<proptag_t>(proptags.count);
 		if (tmp_proptags.pproptag == nullptr)
 			return ecServerOOM;
 		if (!b_force && !fdst->get_all_proptags(&proptags1))
@@ -3869,7 +3867,7 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 				continue;
 			if (!b_force && proptags1.has(tag))
 				continue;
-			tmp_proptags.pproptag[tmp_proptags.count++] = tag;
+			tmp_proptags.emplace_back(tag);
 		}
 		if (!folder->get_properties(&tmp_proptags, &propvals))
 			return ecError;

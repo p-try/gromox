@@ -738,17 +738,16 @@ static BOOL message_get_message_rcpts(sqlite3 *psqlite, uint64_t message_id,
 	uint32_t row_id = 0;
 	while (pstmt.step() == SQLITE_ROW) {
 		uint64_t rcpt_id = sqlite3_column_int64(pstmt, 0);
-		std::vector<uint32_t> tags;
+		std::vector<proptag_t> tags;
 		if (!cu_get_proptags(MAPI_MAILUSER, rcpt_id, psqlite, tags))
 			return false;
 		/* Nudge cu_get_properties allocation to make extra room. */
 		for (size_t i = 0; i < 5; ++i)
 			tags.push_back(PR_NULL);
-		PROPTAG_ARRAY proptags = {static_cast<uint16_t>(tags.size()), tags.data()};
 		pset->pparray[pset->count] = cu_alloc<TPROPVAL_ARRAY>();
 		if (pset->pparray[pset->count] == nullptr ||
 		    !cu_get_properties(MAPI_MAILUSER, rcpt_id, CP_ACP,
-		    psqlite, &proptags, pset->pparray[pset->count]))
+		    psqlite, tags, pset->pparray[pset->count]))
 			return FALSE;
 		/* PR_ROWID MUST be the first */
 		memmove(pset->pparray[pset->count]->ppropval + 1,
@@ -776,7 +775,7 @@ static BOOL message_get_message_rcpts(sqlite3 *psqlite, uint64_t message_id,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1165: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -804,16 +803,14 @@ BOOL exmdb_server::get_message_brief(const char *dir, cpid_t cpid,
 	*ppbrief = cu_alloc<MESSAGE_CONTENT>();
 	if (*ppbrief == nullptr)
 		return FALSE;
-	static constexpr proptag_t proptag_buff[] = {
+	static constexpr proptag_t proptags[] = {
 		PR_SUBJECT, PR_SENT_REPRESENTING_NAME,
 		PR_SENT_REPRESENTING_SMTP_ADDRESS, PR_CLIENT_SUBMIT_TIME,
 		PR_MESSAGE_SIZE, PR_INTERNET_CPID, PR_INTERNET_MESSAGE_ID,
 		PR_PARENT_KEY, PR_CONVERSATION_INDEX,
 	};
-	static constexpr PROPTAG_ARRAY proptags =
-		{std::size(proptag_buff), deconst(proptag_buff)};
 	if (!cu_get_properties(MAPI_MESSAGE, mid_val, cpid,
-	    pdb->psqlite, &proptags, &(*ppbrief)->proplist))
+	    pdb->psqlite, proptags, &(*ppbrief)->proplist))
 		return FALSE;
 	(*ppbrief)->children.prcpts = cu_alloc<TARRAY_SET>();
 	if ((*ppbrief)->children.prcpts == nullptr)
@@ -841,15 +838,14 @@ BOOL exmdb_server::get_message_brief(const char *dir, cpid_t cpid,
 	if (pstmt == nullptr)
 		return FALSE;
 
-	static constexpr proptag_t proptag2_buff[] = {PR_ATTACH_LONG_FILENAME};
-	static constexpr PROPTAG_ARRAY proptags2 = {std::size(proptag2_buff), deconst(proptag2_buff)};
+	static constexpr proptag_t proptags2[] = {PR_ATTACH_LONG_FILENAME};
 	while (pstmt.step() == SQLITE_ROW) {
 		uint64_t attachment_id = sqlite3_column_int64(pstmt, 0);
 		auto pattachment = cu_alloc<ATTACHMENT_CONTENT>();
 		if (pattachment == nullptr)
 			return FALSE;
 		if (!cu_get_properties(MAPI_ATTACH, attachment_id, cpid,
-		    pdb->psqlite, &proptags2, &pattachment->proplist))
+		    pdb->psqlite, proptags2, &pattachment->proplist))
 			return FALSE;
 		pattachment->pembedded = NULL;
 		auto &ats = *(*ppbrief)->children.pattachments;
@@ -940,7 +936,7 @@ BOOL exmdb_server::get_message_properties(const char *dir,
 	auto cl_0 = HX::make_scope_exit([]() { exmdb_server::set_public_username(nullptr); });
 	return cu_get_properties(MAPI_MESSAGE,
 	       rop_util_get_gc_value(message_id), cpid, pdb->psqlite,
-	       pproptags, ppropvals);
+	       *pproptags, ppropvals);
 }
 
 /**
@@ -993,7 +989,7 @@ BOOL exmdb_server::remove_message_properties(const char *dir, cpid_t cpid,
 	mid_val = rop_util_get_gc_value(message_id);
 	auto sql_transact = gx_sql_begin(pdb->psqlite, txn_mode::write);
 	if (!cu_remove_properties(MAPI_MESSAGE, mid_val,
-	    pdb->psqlite, pproptags))
+	    pdb->psqlite, *pproptags))
 		return FALSE;
 	uint64_t fid_val = 0;
 	if (!common_util_get_message_parent_folder(pdb->psqlite,
@@ -1289,9 +1285,7 @@ BOOL exmdb_server::set_message_timer(const char *dir,
 	snprintf(sql_string, std::size(sql_string), "UPDATE messages SET"
 		" timer_id=%u WHERE message_id=%llu",
 		XUI{timer_id}, LLU{rop_util_get_gc_value(message_id)});
-	if (pdb->exec(sql_string) != SQLITE_OK)
-		return FALSE;
-	return TRUE;
+	return pdb->exec(sql_string) == SQLITE_OK ? TRUE : false;
 }
 
 /* private only */
@@ -1341,20 +1335,17 @@ static BOOL message_read_message(sqlite3 *psqlite, cpid_t cpid,
 	*ppmsgctnt = cu_alloc<MESSAGE_CONTENT>();
 	if (*ppmsgctnt == nullptr)
 		return FALSE;
-	std::vector<uint32_t> mtags;
+	std::vector<proptag_t> mtags;
 	if (!cu_get_proptags(MAPI_MESSAGE, message_id, psqlite, mtags))
 		return FALSE;	
-	mtags.erase(std::remove_if(mtags.begin(), mtags.end(), [](uint32_t t) {
+	std::erase_if(mtags, [](proptag_t t) {
 		return t == PR_DISPLAY_TO || t == PR_DISPLAY_TO_A ||
 		       t == PR_DISPLAY_CC || t == PR_DISPLAY_CC_A ||
 		       t == PR_DISPLAY_BCC || t == PR_DISPLAY_BCC_A ||
 		       t == PR_HASATTACH;
-	}), mtags.end());
-	PROPTAG_ARRAY proptags;
-	proptags.count    = mtags.size();
-	proptags.pproptag = mtags.data();
+	});
 	if (!cu_get_properties(MAPI_MESSAGE, message_id, cpid,
-	    psqlite, &proptags, &(*ppmsgctnt)->proplist))
+	    psqlite, mtags, &(*ppmsgctnt)->proplist))
 		return FALSE;
 	(*ppmsgctnt)->children.prcpts = cu_alloc<TARRAY_SET>();
 	if ((*ppmsgctnt)->children.prcpts == nullptr)
@@ -1388,7 +1379,7 @@ static BOOL message_read_message(sqlite3 *psqlite, cpid_t cpid,
 	uint32_t attach_num = 0;
 	while (pstmt.step() == SQLITE_ROW) {
 		uint64_t attachment_id = sqlite3_column_int64(pstmt, 0);
-		std::vector<uint32_t> atags;
+		std::vector<proptag_t> atags;
 		if (!cu_get_proptags(MAPI_ATTACH, attachment_id,
 		    psqlite, atags))
 			return FALSE;
@@ -1396,10 +1387,8 @@ static BOOL message_read_message(sqlite3 *psqlite, cpid_t cpid,
 		if (pattachment == nullptr)
 			return FALSE;
 		atags.push_back(PR_ATTACH_NUM);
-		proptags.count    = atags.size();
-		proptags.pproptag = atags.data();
 		if (!cu_get_properties(MAPI_ATTACH, attachment_id, cpid,
-		    psqlite, &proptags, &pattachment->proplist))
+		    psqlite, atags, &pattachment->proplist))
 			return FALSE;
 		/* PR_ATTACH_NUM MUST be the first */
 		memmove(pattachment->proplist.ppropval + 1,
@@ -1426,7 +1415,7 @@ static BOOL message_read_message(sqlite3 *psqlite, cpid_t cpid,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1163: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -1537,30 +1526,30 @@ static ec_error_t message_rectify_message(const MESSAGE_CONTENT *src,
 		dprop.emplace_back(PR_BODY_CONTENT_ID, pvalue);
 	}
 	if (!sprop.has(PR_CREATOR_NAME)) {
-		auto pvalue = sprop.get<char>(PR_SENDER_NAME);
+		auto pvalue = sprop.getval(PR_SENDER_NAME);
 		if (pvalue == nullptr)
-			pvalue = sprop.get<char>(PR_SENT_REPRESENTING_NAME);
+			pvalue = sprop.getval(PR_SENT_REPRESENTING_NAME);
 		if (pvalue != nullptr)
 			dprop.emplace_back(PR_CREATOR_NAME, pvalue);
 	}
 	if (!sprop.has(PR_CREATOR_ENTRYID)) {
-		auto pvalue = sprop.get<char>(PR_SENDER_ENTRYID);
+		auto pvalue = sprop.getval(PR_SENDER_ENTRYID);
 		if (pvalue == nullptr)
-			pvalue = sprop.get<char>(PR_SENT_REPRESENTING_ENTRYID);
+			pvalue = sprop.getval(PR_SENT_REPRESENTING_ENTRYID);
 		if (pvalue != nullptr)
 			dprop.emplace_back(PR_CREATOR_ENTRYID, pvalue);
 	}
 	if (!sprop.has(PR_LAST_MODIFIER_NAME)) {
-		auto pvalue = sprop.get<char>(PR_SENDER_NAME);
+		auto pvalue = sprop.getval(PR_SENDER_NAME);
 		if (pvalue == nullptr)
-			pvalue = sprop.get<char>(PR_SENT_REPRESENTING_NAME);
+			pvalue = sprop.getval(PR_SENT_REPRESENTING_NAME);
 		if (pvalue != nullptr)
 			dprop.emplace_back(PR_LAST_MODIFIER_NAME, pvalue);
 	}
 	if (!sprop.has(PR_LAST_MODIFIER_ENTRYID)) {
-		auto pvalue = sprop.get<BINARY>(PR_SENDER_ENTRYID);
+		auto pvalue = sprop.getval(PR_SENDER_ENTRYID);
 		if (pvalue == nullptr)
-			pvalue = sprop.get<BINARY>(PR_SENT_REPRESENTING_ENTRYID);
+			pvalue = sprop.getval(PR_SENT_REPRESENTING_ENTRYID);
 		if (pvalue != nullptr)
 			dprop.emplace_back(PR_LAST_MODIFIER_ENTRYID, pvalue);
 	}
@@ -2011,7 +2000,7 @@ static BOOL message_load_folder_rules(const rulexec_in &rp,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1561: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2058,12 +2047,12 @@ static BOOL message_load_folder_ext_rules(const rulexec_in &rp,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1507: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
 static BOOL message_get_real_propid(sqlite3 *psqlite,
-    NAMEDPROPERTY_INFO *ppropname_info, uint32_t *pproptag, BOOL *pb_replaced)
+    NAMEDPROPERTY_INFO *ppropname_info, proptag_t *pproptag, BOOL *pb_replaced)
 {
 	int i;
 	PROPID_ARRAY propids;
@@ -2246,7 +2235,7 @@ static BOOL message_make_dem(const char *username,
 	seen.msg.emplace_back(PRIVATE_FID_DEFERRED_ACTION, mid_val);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2026: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2298,7 +2287,7 @@ static BOOL message_get_propname(propid_t propid,
 	*pppropname = propnames.ppropname;
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2227: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2429,13 +2418,13 @@ static BOOL message_auto_reply(const rulexec_in &rp, uint8_t action_type,
 		    mysql_adaptor_userid_to_name, false) != ecSuccess)
 			return false;
 	}
-	auto ret = ems_send_mail(&imail, rp.ev_to, rcpt_list);
+	auto ret = cu_send_mail(std::move(imail), g_exmdb_smtp_url.c_str(), rp.ev_to, rcpt_list);
 	if (ret != ecSuccess)
-		mlog(LV_ERR, "E-1188: ems_send_mail: %s", mapi_strerror(ret));
+		mlog(LV_ERR, "E-1188: cu_send_mail: %s", mapi_strerror(ret));
 	*pb_result = TRUE;
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2551: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2481,9 +2470,9 @@ static ec_error_t message_bounce_message(const char *from_address,
 	const char *pvalue2 = strchr(account, '@');
 	snprintf(tmp_buff, sizeof(tmp_buff), "postmaster@%s",
 	         pvalue2 == nullptr ? "system.mail" : pvalue2 + 1);
-	auto ret = ems_send_vmail(std::move(imail), tmp_buff, rcpt_list);
+	auto ret = cu_send_vmail(std::move(imail), g_exmdb_smtp_url.c_str(), tmp_buff, rcpt_list);
 	if (ret != ecSuccess)
-		mlog(LV_ERR, "E-1187: ems_send_vmail: %s", mapi_strerror(ret));
+		mlog(LV_ERR, "E-1187: cu_send_vmail: %s", mapi_strerror(ret));
 	return ecSuccess;
 }
 
@@ -2530,7 +2519,7 @@ static ec_error_t message_forward_message(const rulexec_in &rp,
 		if (read(fd.get(), pbuff.get(), node_stat.st_size) != node_stat.st_size)
 			return ecError;
 		imail.clear();
-		if (!imail.load_from_str(pbuff.get(), node_stat.st_size))
+		if (!imail.refonly_parse(pbuff.get(), node_stat.st_size))
 			return ecError;
 		auto pmime = imail.get_head();
 		if (pmime == nullptr)
@@ -2602,7 +2591,7 @@ static ec_error_t message_forward_message(const rulexec_in &rp,
 		/* Set new envelope FROM */
 		gx_strlcpy(tmp_buff, (action_flavor & FWD_PRESERVE_SENDER) ?
 		           rp.ev_from : rp.ev_to, std::size(tmp_buff));
-		ret = ems_send_mail(&imail1, tmp_buff, rcpt_list);
+		ret = cu_send_mail(std::move(imail1), g_exmdb_smtp_url.c_str(), tmp_buff, rcpt_list);
 	} else {
 		auto pmime = imail.get_head();
 		if (pmime == nullptr)
@@ -2612,13 +2601,13 @@ static ec_error_t message_forward_message(const rulexec_in &rp,
 		/* Set new envelope FROM */
 		gx_strlcpy(tmp_buff, (action_flavor & FWD_PRESERVE_SENDER) ?
 		           rp.ev_from : rp.ev_to, std::size(tmp_buff));
-		ret = ems_send_mail(&imail, tmp_buff, rcpt_list);
+		ret = cu_send_mail(std::move(imail), g_exmdb_smtp_url.c_str(), tmp_buff, rcpt_list);
 	}
 	if (ret != ecSuccess)
-		mlog(LV_ERR, "E-1186: ems_send_mail: %s", mapi_strerror(ret));
+		mlog(LV_ERR, "E-1186: cu_send_mail: %s", mapi_strerror(ret));
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2550: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -2702,7 +2691,7 @@ static BOOL message_make_dam(const rulexec_in &rp,
 	seen.msg.emplace_back(PRIVATE_FID_DEFERRED_ACTION, mid_val);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2027: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2746,7 +2735,7 @@ static BOOL message_make_dams(const rulexec_in &rp,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2028: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2821,7 +2810,7 @@ static ec_error_t op_move_same(const rulexec_in &rp,
 	}
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2033: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -2906,7 +2895,7 @@ static ec_error_t op_delegate(const rulexec_in &rp, seen_list &seen,
 			" again", rp.ev_to, LLU{rp.message_id}, LLU{rp.folder_id});
 		return ecSuccess;
 	}
-	static constexpr uint32_t tags[] = {
+	static constexpr proptag_t tags[] = {
 		PR_DISPLAY_TO, PR_DISPLAY_TO_A,
 		PR_DISPLAY_CC, PR_DISPLAY_CC_A,
 		PR_DISPLAY_BCC, PR_DISPLAY_BCC_A, PidTagMid, PR_MESSAGE_SIZE,
@@ -2993,7 +2982,7 @@ static ec_error_t op_delegate(const rulexec_in &rp, seen_list &seen,
 	}
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1130: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -3174,7 +3163,7 @@ static ec_error_t opx_move(const rulexec_in &rp,
 	}
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2031: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -3221,7 +3210,7 @@ static ec_error_t opx_delegate(const rulexec_in &rp, const rule_node &rule,
 			" again", rp.ev_to, LLU{rp.message_id}, LLU{rp.folder_id});
 		return ecSuccess;
 	}
-	static constexpr uint32_t tags[] = {
+	static constexpr proptag_t tags[] = {
 		PR_DISPLAY_TO, PR_DISPLAY_TO_A,
 		PR_DISPLAY_CC, PR_DISPLAY_CC_A,
 		PR_DISPLAY_BCC, PR_DISPLAY_BCC_A, PidTagMid, PR_MESSAGE_SIZE,
@@ -3303,7 +3292,7 @@ static ec_error_t opx_delegate(const rulexec_in &rp, const rule_node &rule,
 	}
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1128: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -3631,7 +3620,7 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 	std::optional<Json::Value> digest;
 	if (pdigest != nullptr) {
 		digest.emplace();
-		if (!json_from_str(pdigest, *digest))
+		if (!str_to_json(pdigest, *digest))
 			digest.reset();
 	}
 	if (digest.has_value() &&
@@ -3699,7 +3688,7 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 	           deliver_message_result::result_ok);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2032: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -3780,7 +3769,7 @@ BOOL exmdb_server::write_message(const char *dir, cpid_t cpid,
 	if (digest_stream.size() > 0) {
 		Json::Value digest;
 		std::string mid_string;
-		if (json_from_str(digest_stream, digest) &&
+		if (str_to_json(digest_stream, digest) &&
 		    digest["file"].asString().size() > 0) {
 			std::string ext_file = exmdb_server::get_dir() + "/ext/"s + digest["file"].asString();
 			auto ret = gx_mkbasedir(ext_file.c_str(), FMODE_PRIVATE);
@@ -3878,7 +3867,7 @@ BOOL exmdb_server::rule_new_message(const char *dir, const char *username,
 		std::unique_ptr<char[], stdlib_delete> slurp_data(HX_slurp_file(ext_path.c_str(), &slurp_size));
 		if (slurp_data != nullptr) {
 			digest.emplace();
-			if (!json_from_str({slurp_data.get(), slurp_size}, *digest))
+			if (!str_to_json({slurp_data.get(), slurp_size}, *digest))
 				digest.reset();
 		}
 	}
@@ -3904,6 +3893,6 @@ BOOL exmdb_server::rule_new_message(const char *dir, const char *username,
 	dg_notify(std::move(notifq));
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2034: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }

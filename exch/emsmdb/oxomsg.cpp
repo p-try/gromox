@@ -126,8 +126,8 @@ static ec_error_t oxomsg_rectify_message(message_object *pmessage,
 		return ecRpcFailed;
 	return pmessage->save();
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1166: ENOMEM");
-	return ecRpcFailed;
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return ecServerOOM;
 }
 
 /**
@@ -197,7 +197,7 @@ static int oxomsg_test_perm(const char *account, const char *maildir, bool send_
 	auto ret = read_file_by_line(dlg_path.c_str(), delegate_list);
 	if (ret != 0 && ret != ENOENT) {
 		mlog(LV_ERR, "E-2064: %s: %s", dlg_path.c_str(), strerror(ret));
-		return ret;
+		return -1;
 	}
 	for (const auto &deleg : delegate_list)
 		if (strcasecmp(deleg.c_str(), account) == 0 ||
@@ -205,8 +205,8 @@ static int oxomsg_test_perm(const char *account, const char *maildir, bool send_
 			return 1;
 	return 0;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1500: ENOMEM");
-	return false;
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return -1;
 }
 
 /**
@@ -436,7 +436,7 @@ ec_error_t rop_submitmessage(uint8_t submit_flags, LOGMAP *plogmap,
 		pmessage->clear_unsent();
 	return ret;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2353: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -606,8 +606,8 @@ ec_error_t rop_transportsend(TPROPVAL_ARRAY **pppropvals, LOGMAP *plogmap,
 		return ecAccessDenied;
 	}
 
-	static constexpr uint32_t rq_tags1[] = {PR_MESSAGE_FLAGS};
-	static constexpr uint32_t cls_tags1[] = {PR_MESSAGE_CLASS};
+	static constexpr proptag_t rq_tags1[] = {PR_MESSAGE_FLAGS};
+	static constexpr proptag_t cls_tags1[] = {PR_MESSAGE_CLASS};
 	static constexpr PROPTAG_ARRAY rq_tags = {1, deconst(rq_tags1)};
 	static constexpr PROPTAG_ARRAY cls_tags = {1, deconst(cls_tags1)};
 	TPROPVAL_ARRAY outvalues{};
@@ -634,7 +634,7 @@ ec_error_t rop_transportsend(TPROPVAL_ARRAY **pppropvals, LOGMAP *plogmap,
 	}
 	if (repr_grant < repr_grant::send_on_behalf) {
 		TPROPVAL_ARRAY cls_vals{};
-		if (pmessage->get_properties(0, &cls_tags, &cls_vals) != 0)
+		if (!pmessage->get_properties(0, &cls_tags, &cls_vals))
 			/* ignore, since we can test for cls_vals fill */;
 		auto ret = pass_scheduling("E-2080", actor, delegator.c_str(), *pmessage,
 		           cls_vals.get<const char>(PR_MESSAGE_CLASS));
@@ -669,7 +669,7 @@ ec_error_t rop_transportsend(TPROPVAL_ARRAY **pppropvals, LOGMAP *plogmap,
 	auto ev_from = repr_grant >= repr_grant::send_as ? delegator.c_str() : actor;
 	return cu_send_message(plogon, pmessage, ev_from);
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2352: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 

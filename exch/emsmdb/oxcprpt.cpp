@@ -113,7 +113,7 @@ static uint16_t size_in_utf16(const char *u8str)
 }
 
 /* Caller does not care for an exact count above 0x8000, so always break early. */
-static uint32_t propval_size_xfer(uint16_t type, void *val)
+static uint32_t propval_size_xfer(propid_t type, void *val)
 {
 	if (type == PT_UNICODE)
 		return size_in_utf16(static_cast<char *>(val)) + 2;
@@ -529,7 +529,7 @@ ec_error_t rop_querynamedproperties(uint8_t query_flags, const GUID *pguid,
 		return ecSuccess;
 	}
 	ppropidnames->count = 0;
-	ppropidnames->ppropid = cu_alloc<uint16_t>(propids.size());
+	ppropidnames->ppropid = cu_alloc<propid_t>(propids.size());
 	if (ppropidnames->ppropid == nullptr)
 		return ecServerOOM;
 	ppropidnames->ppropname = cu_alloc<PROPERTY_NAME>(propids.size());
@@ -554,7 +554,7 @@ ec_error_t rop_querynamedproperties(uint8_t query_flags, const GUID *pguid,
 	}
 	return ecSuccess;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2206: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -588,7 +588,7 @@ ec_error_t rop_copyproperties(uint8_t want_asynchronous, uint8_t copy_flags,
 	if (object_type == ems_objtype::folder && copy_flags & MAPI_MOVE)
 		return ecNotSupported;
 	proptags.count = 0;
-	proptags.pproptag = cu_alloc<uint32_t>(pproptags->count);
+	proptags.pproptag = cu_alloc<proptag_t>(pproptags->count);
 	if (proptags.pproptag == nullptr)
 		return ecServerOOM;
 	pproblems->count = 0;
@@ -724,7 +724,7 @@ ec_error_t rop_copyproperties(uint8_t want_asynchronous, uint8_t copy_flags,
 		return ecNotSupported;
 	}
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1747: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
 }
 
@@ -800,7 +800,7 @@ ec_error_t rop_copyto(uint8_t want_asynchronous, uint8_t want_subobjects,
 			return ecError;
 		common_util_reduce_proptags(&proptags, pexcluded_proptags);
 		tmp_proptags.count = 0;
-		tmp_proptags.pproptag = cu_alloc<uint32_t>(proptags.count);
+		tmp_proptags.pproptag = cu_alloc<proptag_t>(proptags.count);
 		if (tmp_proptags.pproptag == nullptr)
 			return ecServerOOM;
 		if (!b_force && !flddst->get_all_proptags(&proptags1))
@@ -881,7 +881,7 @@ ec_error_t rop_openstream(proptag_t proptag, uint8_t flags, uint32_t *pstream_si
 	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
-	BOOL b_write = flags == MAPI_CREATE || flags == MAPI_MODIFY ? TRUE : false;
+	const bool b_write = flags & MAPI_BEST_ACCESS; /* one bit suffices for wanting to write */
 	switch (object_type) {
 	case ems_objtype::folder:
 		/* MS-OXCPERM 3.1.4.1 */
@@ -898,8 +898,11 @@ ec_error_t rop_openstream(proptag_t proptag, uint8_t flags, uint32_t *pstream_si
 				    static_cast<folder_object *>(pobject)->folder_id,
 				    eff_user, &permission))
 					return ecError;
-				if (!(permission & frightsOwner))
-					return ecAccessDenied;
+				if (!(permission & frightsOwner)) {
+					if ((flags & MAPI_BEST_ACCESS) != MAPI_BEST_ACCESS)
+						return ecAccessDenied;
+					flags &= ~MAPI_BEST_ACCESS;
+				}
 			}
 		}
 		max_length = MAX_LENGTH_FOR_FOLDER;
@@ -922,8 +925,11 @@ ec_error_t rop_openstream(proptag_t proptag, uint8_t flags, uint32_t *pstream_si
 			auto tag_access = object_type == ems_objtype::message ?
 				static_cast<message_object *>(pobject)->get_tag_access() :
 				static_cast<attachment_object *>(pobject)->get_tag_access();
-			if (!(tag_access & MAPI_ACCESS_MODIFY))
-				return ecAccessDenied;
+			if (!(tag_access & MAPI_ACCESS_MODIFY)) {
+				if ((flags & MAPI_BEST_ACCESS) != MAPI_BEST_ACCESS)
+					return ecAccessDenied;
+				flags &= ~MAPI_BEST_ACCESS;
+			}
 		}
 		max_length = g_max_mail_len;
 		break;
@@ -934,7 +940,7 @@ ec_error_t rop_openstream(proptag_t proptag, uint8_t flags, uint32_t *pstream_si
 	               proptag, max_length);
 	if (pstream == nullptr)
 		return ecError;
-	if (!pstream->check())
+	if (!pstream->prop_present())
 		return ecNotFound;
 	auto rstream = pstream.get();
 	auto hnd = rop_processor_add_object_handle(plogmap,

@@ -160,6 +160,49 @@ int have_delete_perm(sqlite3 *db, const char *user, uint64_t fid, uint64_t mid)
 	return !!owner;
 }
 
+static std::string autoreply_fspath(const char *dir, proptag_t proptag)
+{
+	switch (proptag) {
+	case PR_EC_OUTOFOFFICE:
+	case PR_EC_OUTOFOFFICE_FROM:
+	case PR_EC_OUTOFOFFICE_UNTIL:
+	case PR_EC_ALLOW_EXTERNAL:
+	case PR_EC_EXTERNAL_AUDIENCE:
+		return dir + "/config/autoreply.cfg"s;
+	case PR_EC_OUTOFOFFICE_MSG:
+	case PR_EC_OUTOFOFFICE_SUBJECT:
+		return dir + "/config/internal-reply"s;
+	case PR_EC_EXTERNAL_REPLY:
+	case PR_EC_EXTERNAL_SUBJECT:
+		return dir + "/config/external-reply"s;
+	default:
+		return {};
+	}
+}
+
+ec_error_t autoreply_make_oofstate(const char *dir, void *&outptr)
+{
+	auto result = cu_alloc<uint8_t>();
+	if (result == nullptr)
+		return ecServerOOM;
+	outptr = result;
+	*result = 0;
+	auto cfg = config_file_init(autoreply_fspath(dir, PR_EC_OUTOFOFFICE).c_str(), oof_defaults);
+	if (cfg == nullptr)
+		return ecSuccess;
+	auto oofstate = cfg->get_ll("oof_state");
+	if (oofstate <= 1) {
+		*result = oofstate;
+		return ecSuccess;
+	}
+	auto from = cfg->get_value("START_TIME");
+	auto to   = cfg->get_value("END_TIME");
+	auto now  = time(nullptr);
+	if (from != nullptr && to != nullptr)
+		*result = strtoll(from, nullptr, 0) <= now && now < strtoll(to, nullptr, 0);
+	return ecSuccess;
+}
+
 }
 
 /**
@@ -568,7 +611,7 @@ BOOL exmdb_server::autoreply_tsquery(const char *dir, const char *peer,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2225: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -585,30 +628,14 @@ BOOL exmdb_server::autoreply_tsupdate(const char *dir, const char *peer) try
 	stm.bind_int64(2, time(nullptr));
 	return stm.step() == SQLITE_DONE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2226: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
-static std::string autoreply_fspath(const char *dir, proptag_t proptag)
-{
-	switch (proptag) {
-	case PR_EC_OUTOFOFFICE:
-	case PR_EC_OUTOFOFFICE_FROM:
-	case PR_EC_OUTOFOFFICE_UNTIL:
-	case PR_EC_ALLOW_EXTERNAL:
-	case PR_EC_EXTERNAL_AUDIENCE:
-		return dir + "/config/autoreply.cfg"s;
-	case PR_EC_OUTOFOFFICE_MSG:
-	case PR_EC_OUTOFOFFICE_SUBJECT:
-		return dir + "/config/internal-reply"s;
-	case PR_EC_EXTERNAL_REPLY:
-	case PR_EC_EXTERNAL_SUBJECT:
-		return dir + "/config/external-reply"s;
-	default:
-		return {};
-	}
-}
-
+/*
+ * Having the OOF config separate from exchange.sqlite3 means it is unaffected
+ * by `mkprivate -f`.
+ */
 static ec_error_t autoreply_getprop1(const char *dir,
     proptag_t proptag, void *&value)
 {
@@ -617,6 +644,8 @@ static ec_error_t autoreply_getprop1(const char *dir,
 	auto path = autoreply_fspath(dir, proptag);
 
 	switch (proptag) {
+	case PR_OOF_STATE:
+		return autoreply_make_oofstate(dir, value);
 	case PR_EC_OUTOFOFFICE: {
 		auto oofstate = cu_alloc<uint32_t>();
 		if (oofstate == nullptr)
@@ -724,7 +753,7 @@ BOOL exmdb_server::autoreply_getprop(const char *dir, cpid_t cpid,
 	}
 	return true;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2227: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -862,7 +891,7 @@ BOOL exmdb_server::autoreply_setprop(const char *dir, cpid_t cpid,
 			return false;
 	return true;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2229: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 

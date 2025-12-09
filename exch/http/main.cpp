@@ -54,19 +54,19 @@ static constexpr HXoption g_options_table[] = {
 	HXOPT_TABLEEND,
 };
 
-static constexpr static_module g_dfl_hpm_plugins[] = {
-	{"libgxh_ews.so", HPM_ews},
-	{"libgxh_mh_emsmdb.so", HPM_mh_emsmdb},
-	{"libgxh_mh_nsp.so", HPM_mh_nsp},
-	{"libgxh_oxdisco.so", HPM_oxdisco},
-	{"libgxh_oab.so", HPM_oab},
+static constexpr generic_module g_dfl_hpm_plugins[] = {
+	{"libgromox_ews.so", HPM_ews},
+	{"libgromox_mh_emsmdb.so", HPM_mh_emsmdb},
+	{"libgromox_mh_nsp.so", HPM_mh_nsp},
+	{"libgromox_oxdisco.so", HPM_oxdisco},
+	{"libgromox_oab.so", HPM_oab},
 };
-static constexpr static_module g_dfl_proc_plugins[] = {
-	{"libgxp_exchange_emsmdb.so", PROC_exchange_emsmdb},
-	{"libgxp_exchange_nsp.so", PROC_exchange_nsp},
-	{"libgxp_exchange_rfr.so", PROC_exchange_rfr},
+static constexpr generic_module g_dfl_proc_plugins[] = {
+	{"libgromox_emsmdb.so", PROC_exchange_emsmdb},
+	{"libgromox_nsp.so", PROC_exchange_nsp},
+	{"libgromox_rfr.so", PROC_exchange_rfr},
 };
-static constexpr static_module g_dfl_svc_plugins[] = {
+static constexpr generic_module g_dfl_svc_plugins[] = {
 	{"libgxs_mysql_adaptor.so", SVC_mysql_adaptor},
 	{"libgromox_auth.so/ldap", SVC_ldap_adaptor},
 	{"libgromox_auth.so/mgr", SVC_authmgr},
@@ -83,6 +83,7 @@ static constexpr cfg_directive gromox_cfg_defaults[] = {
 	{"http_basic_auth_cred_caching", "1min", CFG_TIME_NS},
 	{"http_fd_limit", "0", CFG_SIZE},
 	{"http_remote_host_hdr", ""},
+	{"istore_standalone", "0", CFG_BOOL},
 	CFG_TABLE_END,
 };
 
@@ -312,9 +313,22 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	const char *program_identifier = "http";
+	auto istore_standalone = gxconfig->get_ll("istore_standalone");
+	if (istore_standalone) {
+		/*
+		 * The module is loaded in both cases, because http still needs
+		 * the exmdb_client portion of libgxs_exmdb_provider.
+		 */
+		mlog(LV_INFO, "Information Store is set to external with EXRPC access");
+	} else {
+		program_identifier = "istore";
+		mlog(LV_INFO, "Information Store is set to run in this process image with LPC");
+	}
+
 	filedes_limit_bump(gxconfig->get_ll("http_fd_limit"));
 	service_init({g_config_file, g_dfl_svc_plugins,
-		context_num, "http"});
+		context_num, program_identifier});
 	auto cleanup_6 = HX::make_scope_exit(service_stop);
 	if (!service_register_service("ndr_stack_alloc",
 	    reinterpret_cast<void *>(pdu_processor_ndr_stack_alloc),

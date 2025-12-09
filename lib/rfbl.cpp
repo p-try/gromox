@@ -19,14 +19,11 @@
 #include <cwctype>
 #include <fcntl.h>
 #include <iconv.h>
-#include <istream>
 #include <memory>
 #include <mutex>
 #include <netdb.h>
 #include <pwd.h>
 #include <spawn.h>
-#include <sstream>
-#include <streambuf>
 #include <string>
 #include <string_view>
 #include <unistd.h>
@@ -548,10 +545,10 @@ static int utf8_writeout(FILE *fp, const void *vsrc, size_t src_size, const char
  *          inside the data), or %nullptr if unknown
  * @outbuf: result variable for caller
  *
+ * It is valid for @inbuf to point to the same object as @outbuf.
  * Returns 0 on success, non-zero on error with errno set.
  */
-int feed_w3m(const void *inbuf, size_t len, const char *cset,
-    std::string &outbuf) try
+int feed_w3m(std::string_view inbuf, const char *cset, std::string &outbuf) try
 {
 	std::string filename;
 	auto tmpdir = getenv("TMPDIR");
@@ -565,7 +562,7 @@ int feed_w3m(const void *inbuf, size_t len, const char *cset,
 	if (fp == nullptr)
 		return -1;
 	auto cl1 = HX::make_scope_exit([&]() { unlink(filename.c_str()); });
-	if (utf8_writeout(fp.get(), inbuf, len, cset) != 0)
+	if (utf8_writeout(fp.get(), inbuf.data(), inbuf.size(), cset) != 0)
 		return -1;
 	fp.reset();
 	int fout = -1;
@@ -587,7 +584,7 @@ int feed_w3m(const void *inbuf, size_t len, const char *cset,
 		return -1;
 	int status = 0;
 	auto cl3 = HX::make_scope_exit([&]() { waitpid(pid, &status, 0); });
-	outbuf = std::string();
+	outbuf.clear();
 	ssize_t ret;
 	char fbuf[4096];
 	while ((ret = read(fout, fbuf, std::size(fbuf))) > 0)
@@ -718,16 +715,26 @@ std::string bin2cstr(const void *vdata, size_t len)
  */
 namespace {
 struct bin2txt_init {
-	bin2txt_init() { m_cstr = *znul(getenv("BIN2TXT_CSTR")) != '\0'; }
-	bool m_cstr = false;
+	bin2txt_init() {
+		auto p = znul(getenv("BIN2TXT_MODE"));
+		if (*p == '\0' || strcasecmp(p, "txt") == 0)
+			m_cstr = 0;
+		else if (strcasecmp(p, "hex") == 0)
+			m_cstr = 1;
+		else if (strcasecmp(p, "co") == 0 || strcasecmp(p, "cstr") == 0)
+			m_cstr = 2;
+	}
+	unsigned int m_cstr = 0;
 };
 static bin2txt_init g_bin2txt_choice;
 }
 
 std::string bin2txt(const void *vdata, size_t len)
 {
-	if (g_bin2txt_choice.m_cstr)
-		return bin2cstr(vdata, len);
+	switch (g_bin2txt_choice.m_cstr) {
+	case 1: return bin2hex(vdata, len);
+	case 2: return bin2cstr(vdata, len);
+	}
 	auto data = static_cast<const unsigned char *>(vdata);
 	std::string ret;
 	char b[4]{};
@@ -994,7 +1001,7 @@ bool get_digest(const Json::Value &jval, const char *key, char *out, size_t outm
 bool get_digest(const char *json, const char *key, char *out, size_t outmax) try
 {
 	Json::Value jval;
-	if (!gromox::json_from_str(json, jval))
+	if (!gromox::str_to_json(json, jval))
 		return false;
 	return get_digest(jval, key, out, outmax);
 } catch (const std::bad_alloc &) {
@@ -1006,7 +1013,7 @@ template<typename T> static bool
 set_digest2(char *json, size_t iomax, const char *key, T &&val) try
 {
 	Json::Value jval;
-	if (!gromox::json_from_str(json, jval))
+	if (!gromox::str_to_json(json, jval))
                 return false;
 	jval[key] = val;
 	Json::StreamWriterBuilder swb;
@@ -1459,29 +1466,11 @@ errno_t gx_compress_tofile(std::string_view inbuf, const char *outfile,
 	return fd.close_wr();
 }
 
-namespace {
-
-struct iomembuf : public std::streambuf {
-	iomembuf(const char *p, size_t z) {
-		auto q = const_cast<char *>(p);
-		setg(q, q, q + z);
-	}
-};
-
-struct imemstream : public virtual iomembuf, public std::istream {
-	imemstream(const char *p, size_t z) :
-		iomembuf(p, z),
-		std::istream(static_cast<std::streambuf *>(this))
-	{}
-};
-
-}
-
-bool json_from_str(std::string_view sv, Json::Value &jv)
+bool str_to_json(std::string_view sv, Json::Value &jv)
 {
-	imemstream strm(sv.data(), sv.size());
-	return Json::parseFromStream(Json::CharReaderBuilder(),
-	       strm, &jv, nullptr);
+	using reader_t = decltype(Json::CharReaderBuilder().newCharReader());
+	std::unique_ptr<std::remove_pointer_t<reader_t>> rd(Json::CharReaderBuilder().newCharReader());
+	return rd->parse(sv.data(), sv.data() + sv.size(), &jv, nullptr);
 }
 
 std::string json_to_str(const Json::Value &jv)
@@ -1587,8 +1576,10 @@ size_t utf8_printable_prefix(const void *vinput, size_t max)
 std::string iconvtext(const char *src, size_t src_size,
     const char *from, const char *to)
 {
-	if (strcasecmp(from, to) == 0)
+	if (strcasecmp(from, to) == 0) {
+		errno = 0;
 		return {reinterpret_cast<const char *>(src), src_size};
+	}
 	auto cs = to + "//IGNORE"s;
 	auto cd = iconv_open(cs.c_str(), from);
 	if (cd == reinterpret_cast<iconv_t>(-1)) {

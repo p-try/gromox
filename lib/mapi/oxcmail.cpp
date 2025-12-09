@@ -1658,7 +1658,7 @@ static void oxcmail_enum_attachment(const MIME *pmime, void *pparam)
 		if (!pmime->read_content(pcontent.get(), &content_len))
 			return;
 		MAIL mail;
-		if (mail.load_from_str(pcontent.get(), content_len)) {
+		if (mail.refonly_parse(pcontent.get(), content_len)) {
 			pattachment->proplist.erase(PR_ATTACH_LONG_FILENAME);
 			pattachment->proplist.erase(PR_ATTACH_LONG_FILENAME_A);
 			pattachment->proplist.erase(PR_ATTACH_EXTENSION);
@@ -2467,7 +2467,7 @@ static BOOL xlog_bool(const char *func, unsigned int line)
 
 static std::nullptr_t xlog_null(const char *func, unsigned int line)
 {
-	mlog(LV_ERR, "%s:%u returned false; see surrounding log messages and those of gromox-http for unexpected shutdowns", func, line);
+	mlog(LV_ERR, "%s:%u returned false; see surrounding log messages and those of gromox-http for unexpected shutdowns or absence of the mailbox directory", func, line);
 	return nullptr;
 }
 
@@ -2719,7 +2719,7 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 			auto num = pmsg->proplist.get<const uint32_t>(PR_INTERNET_CPID);
 			auto cpid = num != nullptr ? static_cast<cpid_t>(*num) : CP_OEMCP;
 			std::string plainbuf;
-			auto ret = html_to_plain(phtml_bin->pc, phtml_bin->cb, cpid, plainbuf);
+			auto ret = html_to_plain(*phtml_bin, cpid, plainbuf);
 			if (ret < 0)
 				return imp_null;
 			else if (ret == CP_OEMCP)
@@ -2744,16 +2744,15 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 	if (!pmsg->proplist.has(PR_HTML)) {
 		auto s = pmsg->proplist.get<const char>(PR_BODY);
 		if (s != nullptr) {
+			std::string html_repr;
+			auto err = plain_to_html(s, html_repr);
+			if (err != ecSuccess)
+				return imp_null;
 			BINARY bv;
-			bv.pc = plain_to_html(s);
-			if (bv.pc == nullptr)
+			bv.pc = html_repr.data();
+			bv.cb = html_repr.size();
+			if (pmsg->proplist.set(PR_HTML, &bv) != ecSuccess)
 				return imp_null;
-			bv.cb = strlen(bv.pc);
-			if (pmsg->proplist.set(PR_HTML, &bv) != ecSuccess) {
-				free(bv.pc);
-				return imp_null;
-			}
-			free(bv.pc);
 			uint32_t tmp_int32 = CP_UTF8;
 			if (pmsg->proplist.set(PR_INTERNET_CPID, &tmp_int32) != ecSuccess)
 				return imp_null;
@@ -2922,6 +2921,31 @@ static BOOL oxcmail_export_addresses(const TARRAY_SET &rcpt_list,
 	return false;
 }
 
+static bool genentryid_to_smtpaddr(const BINARY &bin, std::string &dispname,
+    std::string &emaddr)
+{
+	EXT_PULL ep;
+	EMSAB_ENTRYID ems;
+	ep.init(bin.pb, bin.cb, malloc, EXT_FLAG_UTF16);
+	if (ep.g_abk_eid(&ems) == pack_result::ok &&
+	    cvt_essdn_to_username(ems.x500dn.c_str(), g_oxcmail_org_name,
+	    oxcmail_get_username, emaddr) == ecSuccess)
+		return true;
+
+	ONEOFF_ENTRYID oo;
+	ep.init(bin.pb, bin.cb, malloc, EXT_FLAG_UTF16);
+	if (ep.g_oneoff_eid(&oo) == pack_result::ok) {
+		dispname = std::move(oo.pdisplay_name);
+		if (cvt_genaddr_to_smtpaddr(oo.paddress_type.c_str(),
+		    oo.pmail_address.c_str(), g_oxcmail_org_name,
+		    oxcmail_get_username, emaddr) == ecSuccess)
+			return true;
+	}
+
+	mlog(LV_WARN, "W-1964: skipping unrecognizable entry in PR_REPLY_RECIPIENTS_TO");
+	return false;
+}
+
 static bool oxcmail_export_reply_to(const MESSAGE_CONTENT *pmsg,
     vmime::addressList &adrlist) try
 {
@@ -2945,20 +2969,15 @@ static bool oxcmail_export_reply_to(const MESSAGE_CONTENT *pmsg,
 	if (ext_pull.g_flatentry_a(&address_array) != pack_result::ok)
 		return FALSE;
 	for (size_t i = 0; i < address_array.count; ++i) {
-		EXT_PULL ep2;
-		ONEOFF_ENTRYID oo{};
-		ep2.init(address_array.pbin[i].pb, address_array.pbin[i].cb,
-			malloc, EXT_FLAG_UTF16);
-		if (ep2.g_oneoff_eid(&oo) != pack_result::ok ||
-		    strcasecmp(oo.paddress_type.c_str(), "SMTP") != 0) {
-			mlog(LV_WARN, "W-1964: skipping non-SMTP reply-to entry");
+		std::string dispname, emaddr;
+		if (!genentryid_to_smtpaddr(address_array.pbin[i], dispname, emaddr))
 			continue;
-		}
 		auto mb = vmime::make_shared<vmime::mailbox>("");
-		if (!oo.pdisplay_name.empty())
-			mb->setName(vmime::text(std::move(oo.pdisplay_name), vmime::charsets::UTF_8));
-		if (!oo.pmail_address.empty())
-			mb->setEmail(std::move(oo.pmail_address));
+		if (!emaddr.empty()) {
+			mb->setEmail(std::move(emaddr));
+			if (!dispname.empty())
+				mb->setName(vmime::text(std::move(dispname), vmime::charsets::UTF_8));
+		}
 		adrlist.appendAddress(mb);
 	}
 	return true;
@@ -3064,24 +3083,16 @@ static bool skel_find_rtf(mime_skeleton &skel, const message_content &msg,
 	auto rtf = msg.proplist.get<const BINARY>(PR_RTF_COMPRESSED);
 	if (rtf == nullptr)
 		return true;
-	ssize_t unc_size = rtfcp_uncompressed_size(rtf);
-	std::string buf;
-	if (unc_size < 0) {
+	auto err = rtfcp_uncompress(*rtf, skel.rtf);
+	if (err != ecSuccess) {
 		skel.mail_type = oxcmail_type::tnef;
 		return true;
 	}
-	buf.resize(unc_size);
-	size_t rtf_len = unc_size;
-	if (unc_size < 0 || !rtfcp_uncompress(rtf, buf.data(), &rtf_len)) {
-		skel.mail_type = oxcmail_type::tnef;
-		return true;
-	}
-	buf.resize(rtf_len);
 	skel.pattachments = attachment_list_init();
 	if (skel.pattachments == nullptr)
 		return false;
-	if (!rtf_to_html(buf.data(), buf.size(), charset,
-	    skel.rtf, skel.pattachments)) {
+	err = rtf_to_html(skel.rtf, charset, skel.rtf, skel.pattachments);
+	if (err != ecSuccess) {
 		skel.mail_type = oxcmail_type::tnef;
 		return true;
 	}

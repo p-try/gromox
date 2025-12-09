@@ -11,6 +11,7 @@
 #include <gromox/defs.h>
 #include <gromox/element_data.hpp>
 #include <gromox/ext_buffer.hpp>
+#include <gromox/idset.hpp>
 #include <gromox/list_file.hpp>
 #include <gromox/mapi_types.hpp>
 #include <gromox/mapidefs.h>
@@ -98,5 +99,6 @@ class GX_EXPORT exmdb_client_remote {
 };
 
 extern GX_EXPORT std::optional<exmdb_client_remote> exmdb_client;
+extern GX_EXPORT bool g_exmdb_disallow_lpc;
 
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2024 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <climits>
@@ -72,7 +72,7 @@ BOOL exmdb_server::get_folder_by_class(const char *dir, const char *str_class,
 	str_explicit->clear();
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2159: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -494,7 +494,7 @@ BOOL exmdb_server::create_folder_v1(const char *dir, cpid_t cpid,
 BOOL exmdb_server::get_folder_all_proptags(const char *dir, uint64_t folder_id,
     PROPTAG_ARRAY *pproptags) try
 {
-	std::vector<uint32_t> tags;
+	std::vector<proptag_t> tags;
 	
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
@@ -506,14 +506,14 @@ BOOL exmdb_server::get_folder_all_proptags(const char *dir, uint64_t folder_id,
 	pdb.reset();
 	if (std::find(tags.cbegin(), tags.cend(), PR_SOURCE_KEY) == tags.cend())
 		tags.push_back(PR_SOURCE_KEY);
-	pproptags->pproptag = cu_alloc<uint32_t>(tags.size());
+	pproptags->pproptag = cu_alloc<proptag_t>(tags.size());
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
 	pproptags->count = tags.size();
 	memcpy(pproptags->pproptag, tags.data(), sizeof(tags[0]) * pproptags->count);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1164: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -526,7 +526,7 @@ BOOL exmdb_server::get_folder_properties(const char *dir, cpid_t cpid,
 		return FALSE;
 	/* Only one SQL operation, no transaction needed. */
 	return cu_get_properties(MAPI_FOLDER, rop_util_get_gc_value(folder_id),
-	       cpid, pdb->psqlite, pproptags, ppropvals);
+	       cpid, pdb->psqlite, *pproptags, ppropvals);
 }
 
 /* no PROPERTY_PROBLEM for PidTagChangeNumber and PR_CHANGE_KEY */
@@ -579,7 +579,7 @@ BOOL exmdb_server::remove_folder_properties(const char *dir,
 	if (!sql_transact)
 		return false;
 	if (!cu_remove_properties(MAPI_FOLDER,
-	    fid_val, pdb->psqlite, pproptags))
+	    fid_val, pdb->psqlite, *pproptags))
 		return FALSE;
 
 	db_conn::NOTIFQ notifq;
@@ -1103,11 +1103,8 @@ BOOL exmdb_server::is_descendant_folder(const char *dir,
 	auto sql_transact = gx_sql_begin(pdb->psqlite, txn_mode::read);
 	if (!sql_transact)
 		return false;
-	if (!cu_is_descendant_folder(pdb->psqlite,
-	    rop_util_get_gc_value(child_fid), rop_util_get_gc_value(parent_fid),
-	    b_status))
-		return FALSE;
-	return TRUE;
+	return cu_is_descendant_folder(pdb->psqlite, rop_util_get_gc_value(child_fid),
+	       rop_util_get_gc_value(parent_fid), b_status) ? TRUE : false;
 }
 
 /**
@@ -1996,7 +1993,7 @@ BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
 	*pb_result = TRUE;
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1161: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -2026,9 +2023,7 @@ BOOL exmdb_server::empty_folder_permission(const char *dir, uint64_t folder_id)
 	/* Only one SQL operation, no transaction needed. */
 	snprintf(sql_string, 1024, "DELETE FROM permissions WHERE"
 	         " folder_id=%llu", LLU{rop_util_get_gc_value(folder_id)});
-	if (pdb->exec(sql_string) != SQLITE_OK)
-		return FALSE;
-	return TRUE;
+	return pdb->exec(sql_string) == SQLITE_OK ? TRUE : false;
 }
 
 static uint32_t permission_adjust(uint32_t v, bool adjust_fb = false)
@@ -2089,7 +2084,7 @@ static bool ufp_add(const TPROPVAL_ARRAY &propvals, db_conn_ptr &pdb,
 	sqlite3_reset(pstmt);
 	return true;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2059: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -2243,9 +2238,7 @@ BOOL exmdb_server::empty_folder_rule(const char *dir, uint64_t folder_id)
 	/* Only one SQL operation, no transaction needed. */
 	snprintf(sql_string, 1024, "DELETE FROM rules WHERE "
 	         "folder_id=%llu", LLU{rop_util_get_gc_value(folder_id)});
-	if (pdb->exec(sql_string) != SQLITE_OK)
-		return FALSE;
-	return TRUE;
+	return pdb->exec(sql_string) == SQLITE_OK ? TRUE : false;
 }
 
 /* after updating the database, update the table too! */
@@ -2480,7 +2473,7 @@ BOOL exmdb_server::update_folder_rule(const char *dir, uint64_t folder_id,
 	}
 	return sql_transact.commit() == SQLITE_OK ? TRUE : false;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1199: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 

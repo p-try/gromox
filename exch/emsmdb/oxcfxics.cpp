@@ -53,7 +53,7 @@ static EID_ARRAY *oxcfxics_load_folder_messages(logon_object *plogon,
 	    username, TABLE_FLAG_NONOTIFICATIONS, &restriction, nullptr,
 	    &table_id, &row_count))
 		return NULL;	
-	uint32_t tmp_proptag = PidTagMid;
+	proptag_t tmp_proptag = PidTagMid;
 	proptags.count = 1;
 	proptags.pproptag = &tmp_proptag;
 	if (!exmdb_client->query_table(plogon->get_dir(), nullptr, CP_ACP,
@@ -135,7 +135,7 @@ oxcfxics_load_folder_content(logon_object *plogon, uint64_t folder_id,
 	    folder_id, username, TABLE_FLAG_NONOTIFICATIONS, nullptr,
 	    &table_id, &row_count))
 		return NULL;
-	uint32_t tmp_proptag = PidTagFolderId;
+	proptag_t tmp_proptag = PidTagFolderId;
 	tmp_proptags.count = 1;
 	tmp_proptags.pproptag = &tmp_proptag;
 	if (!exmdb_client->query_table(plogon->get_dir(), nullptr, CP_ACP,
@@ -686,7 +686,7 @@ ec_error_t rop_syncconfigure(uint8_t sync_type, uint8_t send_options,
 	    const_cast<RESTRICTION *>(pres)))
 			return ecError;
 
-	std::vector<uint32_t> new_tags;
+	std::vector<proptag_t> new_tags;
 	PROPTAG_ARRAY new_pta;
 	auto bodyof = pproptags->indexof(PR_BODY);
 	if (!(sync_flags & SYNC_ONLY_SPECIFIED_PROPS) &&
@@ -704,7 +704,7 @@ ec_error_t rop_syncconfigure(uint8_t sync_type, uint8_t send_options,
 		new_pta.pproptag = new_tags.data();
 		pproptags = &new_pta;
 	} catch (const std::bad_alloc &) {
-		mlog(LV_ERR, "E-1610: ENOMEM");
+		mlog(LV_ERR, "%s: ENOMEM", __func__);
 		return ecServerOOM;
 	}
 	auto pctx = icsdownctx_object::create(plogon, pfolder, sync_type,
@@ -1570,7 +1570,7 @@ ec_error_t rop_syncgettransferstate(LOGMAP *plogmap, uint8_t logon_id,
 	return ecSuccess;
 }
 
-ec_error_t rop_syncuploadstatestreambegin(uint32_t proptag_state,
+ec_error_t rop_syncuploadstatestreambegin(proptag_t proptag_state,
     uint32_t buffer_size, LOGMAP *plogmap, uint8_t logon_id, uint32_t hin)
 {
 	ems_objtype object_type;

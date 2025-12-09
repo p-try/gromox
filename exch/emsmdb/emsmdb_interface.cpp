@@ -91,7 +91,6 @@ struct NOTIFY_ITEM {
 }
 
 static constexpr time_duration HANDLE_VALID_INTERVAL = std::chrono::seconds(2000);
-static constexpr size_t TAG_SIZE = 256;
 static time_point g_start_time;
 static pthread_t g_scan_id;
 static std::mutex g_lock; /* protects g_handle_hash & g_user_hash */
@@ -170,8 +169,8 @@ static uint32_t emsmdb_interface_get_timestamp()
 	return std::chrono::duration_cast<std::chrono::seconds>(d).count() + 1230336000;
 }
 
-BOOL emsmdb_interface_check_acxh(ACXH *pacxh,
-	char *username, uint16_t *pcxr, BOOL b_touch)
+bool emsmdb_interface_inspect_acxh(const ACXH *pacxh, std::string &username,
+    uint16_t *pcxr, bool b_touch) try
 {
 	if (pacxh->handle_type != HANDLE_EXCHANGE_ASYNCEMSMDB)
 		return FALSE;
@@ -182,12 +181,15 @@ BOOL emsmdb_interface_check_acxh(ACXH *pacxh,
 	auto phandle = &iter->second;
 	if (b_touch)
 		phandle->last_time = tp_now();
-	strcpy(username, phandle->username);
+	username = phandle->username;
 	*pcxr = phandle->cxr;
 	return TRUE;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return false;
 }
 
-bool emsmdb_interface_notifications_pending(ACXH &acxh)
+bool emsmdb_interface_notifications_pending(const ACXH &acxh)
 {
 	auto pacxh = &acxh;
 	if (pacxh->handle_type != HANDLE_EXCHANGE_ASYNCEMSMDB)
@@ -632,10 +634,9 @@ static bool enable_rop_chaining(uint16_t v[4])
 ec_error_t emsmdb_interface_rpc_ext2(CXH &cxh, uint32_t *pflags,
 	const uint8_t *pin, uint32_t cb_in, uint8_t *pout, uint32_t *pcb_out,
 	const uint8_t *pauxin, uint32_t cb_auxin, uint8_t *pauxout,
-	uint32_t *pcb_auxout, uint32_t *ptrans_time)
+	uint32_t *pcb_auxout, uint32_t *ptrans_time) try
 {
 	auto pcxh = &cxh;
-	uint16_t cxr;
 	char username[UADDR_SIZE];
 	HANDLE_DATA *phandle;
 	auto input_flags = *pflags;
@@ -690,13 +691,14 @@ ec_error_t emsmdb_interface_rpc_ext2(CXH &cxh, uint32_t *pflags,
 		input_flags &= ~GROMOX_READSTREAM_NOCHAIN;
 	else
 		input_flags |= GROMOX_READSTREAM_NOCHAIN;
+
 	auto result = rop_processor_proc(input_flags, pin, cb_in, pout, pcb_out);
-	gx_strlcpy(username, phandle->username, std::size(username));
-	cxr = phandle->cxr;
+	std::string usrname = phandle->username;
+	uint16_t cxr = phandle->cxr;
 	BOOL b_wakeup = double_list_get_nodes_num(&phandle->notify_list) == 0 ? false : TRUE;
 	emsmdb_interface_put_handle_data(phandle);
 	if (b_wakeup)
-		asyncemsmdb_interface_wakeup(username, cxr);
+		asyncemsmdb_interface_wakeup(std::move(username), cxr);
 	g_handle_key = nullptr;
 	if (result != ecSuccess) {
 		*pcb_out = 0;
@@ -704,6 +706,9 @@ ec_error_t emsmdb_interface_rpc_ext2(CXH &cxh, uint32_t *pflags,
 	}
 	*ptrans_time = std::chrono::duration_cast<std::chrono::milliseconds>(tp_now() - first_time).count();
 	return ecSuccess;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return ecServerOOM;
 }
 	
 ec_error_t emsmdb_interface_async_connect_ex(CXH cxh, ACXH *pacxh)
@@ -827,16 +832,29 @@ BOOL emsmdb_interface_set_rop_num(int num)
 	return TRUE;
 }
 
+/**
+ * Generate keys for the notify map. Since the map can have different kinds of
+ * elements, the tag formats need to be unique.
+ */
+static std::string make_table_notify_tag(const char *dir, uint32_t id)
+{
+	return std::to_string(id) + ":" + dir;
+}
+
+static std::string make_sub_notify_tag(const char *dir, uint32_t id)
+{
+	return std::to_string(id) + "|" + dir;
+}
+
 void emsmdb_interface_add_table_notify(const char *dir,
     uint32_t table_id, uint32_t handle, uint8_t logon_id, GUID *pguid) try
 {
-	char tag_buff[TAG_SIZE];
 	NOTIFY_ITEM tmp_notify;
 	
 	tmp_notify.handle = handle;
 	tmp_notify.logon_id = logon_id;
 	tmp_notify.guid = *pguid;
-	snprintf(tag_buff, std::size(tag_buff), "%u:%s", table_id, dir);
+	auto tag = make_table_notify_tag(dir, table_id);
 	std::lock_guard nt_hold(g_notify_lock);
 	if (ems_max_active_notifh > 0 &&
 	    g_notify_hash.size() >= ems_max_active_notifh) {
@@ -844,20 +862,19 @@ void emsmdb_interface_add_table_notify(const char *dir,
 			ems_max_active_notifh);
 		return;
 	}
-	g_notify_hash.emplace(tag_buff, std::move(tmp_notify));
+	g_notify_hash.emplace(std::move(tag), std::move(tmp_notify));
 	ems_high_active_notifh = std::max(ems_high_active_notifh, g_notify_hash.size());
 } catch (const std::bad_alloc &) {
 	mlog(LV_WARN, "W-1541: ENOMEM");
 }
 
-static BOOL emsmdb_interface_get_table_notify(const char *dir,
-	uint32_t table_id, uint32_t *phandle, uint8_t *plogon_id, GUID *pguid)
+static BOOL emsmdb_interface_get_table_notify(const char *dir, uint32_t table_id,
+    uint32_t *phandle, uint8_t *plogon_id, GUID *pguid) try
 {
-	char tag_buff[TAG_SIZE];
-	snprintf(tag_buff, std::size(tag_buff), "%u:%s", table_id, dir);
+	auto tag = make_table_notify_tag(dir, table_id);
 	std::lock_guard nt_hold(g_notify_lock);
 	const auto &nh = g_notify_hash;
-	auto iter = nh.find(tag_buff);
+	auto iter = nh.find(std::move(tag));
 	if (iter == nh.cend())
 		return FALSE;
 	auto pnotify = &iter->second;
@@ -865,30 +882,29 @@ static BOOL emsmdb_interface_get_table_notify(const char *dir,
 	*plogon_id = pnotify->logon_id;
 	*pguid = pnotify->guid;
 	return TRUE;
+} catch (const std::bad_alloc &) {
+	mlog(LV_WARN, "%s: ENOMEM", __func__);
+	return false;
 }
 
-void emsmdb_interface_remove_table_notify(
-	const char *dir, uint32_t table_id)
+void emsmdb_interface_remove_table_notify(const char *dir, uint32_t table_id) try
 {
-	char tag_buff[TAG_SIZE];
-	
-	snprintf(tag_buff, std::size(tag_buff), "%u:%s", table_id, dir);
+	auto tag = make_table_notify_tag(dir, table_id);
 	std::lock_guard nt_hold(g_notify_lock);
-	g_notify_hash.erase(tag_buff);
+	g_notify_hash.erase(std::move(tag));
+} catch (const std::bad_alloc &) {
+	mlog(LV_WARN, "%s: ENOMEM", __func__);
 }
 
 void emsmdb_interface_add_subscription_notify(const char *dir,
     uint32_t sub_id, uint32_t handle, uint8_t logon_id, GUID *pguid) try
 {
-	char tag_buff[TAG_SIZE];
 	NOTIFY_ITEM tmp_notify;
-	
 	
 	tmp_notify.handle = handle;
 	tmp_notify.logon_id = logon_id;
 	tmp_notify.guid = *pguid;
-	
-	snprintf(tag_buff, std::size(tag_buff), "%u|%s", sub_id, dir);
+	auto tag = make_sub_notify_tag(dir, sub_id);
 	std::lock_guard nt_hold(g_notify_lock);
 	if (ems_max_active_notifh > 0 &&
 	    g_notify_hash.size() >= ems_max_active_notifh) {
@@ -896,21 +912,19 @@ void emsmdb_interface_add_subscription_notify(const char *dir,
 			ems_max_active_notifh);
 		return;
 	}
-	g_notify_hash.emplace(tag_buff, std::move(tmp_notify));
+	g_notify_hash.emplace(std::move(tag), std::move(tmp_notify));
 	ems_high_active_notifh = std::max(ems_high_active_notifh, g_notify_hash.size());
 } catch (const std::bad_alloc &) {
 	mlog(LV_WARN, "W-1542: ENOMEM");
 }
 
-static BOOL emsmdb_interface_get_subscription_notify(
-	const char *dir, uint32_t sub_id, uint32_t *phandle,
-	uint8_t *plogon_id, GUID *pguid)
+static BOOL emsmdb_interface_get_subscription_notify(const char *dir,
+    uint32_t sub_id, uint32_t *phandle, uint8_t *plogon_id, GUID *pguid) try
 {
-	char tag_buff[TAG_SIZE];
-	snprintf(tag_buff, std::size(tag_buff), "%u|%s", sub_id, dir);
+	auto tag = make_sub_notify_tag(dir, sub_id);
 	std::lock_guard nt_hold(g_notify_lock);
 	const auto &nh = g_notify_hash;
-	auto iter = nh.find(tag_buff);
+	auto iter = nh.find(std::move(tag));
 	if (iter == nh.cend())
 		return FALSE;
 	auto pnotify = &iter->second;
@@ -918,16 +932,18 @@ static BOOL emsmdb_interface_get_subscription_notify(
 	*plogon_id = pnotify->logon_id;
 	*pguid = pnotify->guid;
 	return TRUE;
+} catch (const std::bad_alloc &) {
+	mlog(LV_WARN, "%s: ENOMEM", __func__);
+	return false;
 }
 
-void emsmdb_interface_remove_subscription_notify(
-	const char *dir, uint32_t sub_id)
+void emsmdb_interface_remove_subscription_notify(const char *dir, uint32_t sub_id) try
 {
-	char tag_buff[TAG_SIZE];
-	
-	snprintf(tag_buff, std::size(tag_buff), "%u|%s", sub_id, dir);
+	auto tag = make_sub_notify_tag(dir, sub_id);
 	std::lock_guard nt_hold(g_notify_lock);
-	g_notify_hash.erase(tag_buff);
+	g_notify_hash.erase(std::move(tag));
+} catch (const std::bad_alloc &) {
+	mlog(LV_WARN, "%s: ENOMEM", __func__);
 }
 
 static BOOL emsmdb_interface_merge_content_row_deleted(
@@ -1030,13 +1046,13 @@ static BOOL emsmdb_interface_merge_folder_modified(
 }
 
 void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
-	uint32_t notify_id, const DB_NOTIFY *pdb_notify)
+    uint32_t notify_id, const DB_NOTIFY *pdb_notify) try
 {
 	CXH cxh;
 	uint16_t cxr;
 	uint8_t logon_id;
 	BOOL b_processing;
-	char username[UADDR_SIZE];
+	std::string username;
 	uint32_t obj_handle;
 	HANDLE_DATA *phandle;
 	DOUBLE_LIST_NODE *pnode;
@@ -1068,11 +1084,11 @@ void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
 		b_processing = phandle->b_processing;
 		if (!b_processing) {
 			cxr = phandle->cxr;
-			gx_strlcpy(username, phandle->username, std::size(username));
+			username = phandle->username;
 		}
 		emsmdb_interface_put_handle_notify_list(phandle);
 		if (!b_processing)
-			asyncemsmdb_interface_wakeup(username, cxr);
+			asyncemsmdb_interface_wakeup(std::move(username), cxr);
 		return;
 	case db_notify_type::message_modified:
 		if (!emsmdb_interface_merge_message_modified(
@@ -1100,7 +1116,7 @@ void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
 	}
 	ems_high_pending_sesnotif = std::max(ems_high_pending_sesnotif, notifnum);
 	cxr = phandle->cxr;
-	gx_strlcpy(username, phandle->username, std::size(username));
+	username = phandle->username;
 	pnode = me_alloc<DOUBLE_LIST_NODE>();
 	if (NULL == pnode) {
 		emsmdb_interface_put_handle_notify_list(phandle);
@@ -1128,7 +1144,9 @@ void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
 		free(pnode);
 	}
 	if (!b_processing)
-		asyncemsmdb_interface_wakeup(username, cxr);
+		asyncemsmdb_interface_wakeup(std::move(username), cxr);
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 }
 
 static void *emsi_scanwork(void *pparam)
@@ -1144,7 +1162,7 @@ static void *emsi_scanwork(void *pparam)
 			if (cur_time - phandle->last_time > HANDLE_VALID_INTERVAL) try {
 				temp_list.push_back(guid);
 			} catch (const std::bad_alloc &) {
-				mlog(LV_ERR, "E-1624: ENOMEM");
+				mlog(LV_ERR, "%s: ENOMEM", __func__);
 				continue;
 			}
 		}

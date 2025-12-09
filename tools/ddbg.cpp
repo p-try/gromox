@@ -1,21 +1,58 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2024 grommunio GmbH
+// SPDX-FileCopyrightText: 2024–2025 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <libHX/io.h>
+#include <libHX/option.h>
 #include <libHX/scope.hpp>
+#include <gromox/element_data.hpp>
+#include <gromox/lzxpress.hpp>
+#include <gromox/mail_func.hpp>
 #include <gromox/mapidefs.h>
 #include <gromox/mapi_types.hpp>
+#include <gromox/paths.h>
 #include <gromox/rop_util.hpp>
+#include <gromox/textmaps.hpp>
+#include <gromox/tie.hpp>
 #include <gromox/util.hpp>
 
 using namespace gromox;
+using LLD = long long;
 using LLU = unsigned long long;
 
-static void try_entryid(const std::string_view s, unsigned int ind);
+enum {
+	CM_NONE, CM_DEC_ACTION, CM_DEC_ANYTHING, CM_DEC_ENTRYID, CM_DEC_GUID,
+	CM_DEC_NTTIME, CM_DEC_RESTRICT, CM_DEC_UNIXTIME,
+	CM_LZXDEC, CM_LZXENC, CM_HTMLTORTF,
+	CM_HTMLTOTEXT, CM_RTFCP, CM_RTFTOHTML, CM_TEXTTOHTML, CM_UNRTFCP,
+};
+static unsigned int g_dowhat, g_hex2bin;
+static constexpr struct HXoption g_options_table[] = {
+	{"decode", 'd', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_ANYTHING, "Try all decoders"},
+	{"decode-action", 'A', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_ACTION, "Decode rule action blob"},
+	{"decode-entryid", 'e', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_ENTRYID, "Decode entryid"},
+	{"decode-guid", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_GUID, "Decode GUID"},
+	{"decode-nttime", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_NTTIME, "Decode NT timestamps to unixtime/calendar"},
+	{"decode-restrict", 'r', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_RESTRICT, "Decode restriction blob (e.g. rule condition)"},
+	{"decode-unixtime", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_UNIXTIME, "Decode Unix timestamp to nttime/calendar"},
+	{"htmltortf", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_HTMLTORTF, "Convert HTML to RTF"},
+	{"htmltotext", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_HTMLTOTEXT, "Convert HTML to plaintext"},
+	{"lzxdec", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_LZXDEC, "LZX decompression"},
+	{"lzxenc", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_LZXENC, "LZX compression"},
+	{"pack", 'p', HXTYPE_NONE, &g_hex2bin, {}, {}, 0, "Employ hex2bin before main action"},
+	{"rtfcp", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_RTFCP, "Convert RTF to uncompressed RTFCP"},
+	{"unrtfcp", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_UNRTFCP, "Decompress RTFCP (all forms) to RTF"},
+	{"rtftohtml", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_RTFTOHTML, "Convert RTF to HTML"},
+	{"texttohtml", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_TEXTTOHTML, "Convert plaintext to HTML"},
+	HXOPT_AUTOHELP,
+	HXOPT_TABLEEND,
+};
+
+static void try_entryid(const std::string_view s, unsigned int ind = 0);
 
 static unsigned int lead(unsigned int level)
 {
@@ -33,7 +70,7 @@ static void print_guid(const FLATUID le)
 		printf(" <<%s>>", name.c_str());
 }
 
-static void try_guid(const std::string_view s, unsigned int ind)
+static void try_guid(const std::string_view s, unsigned int ind = 0)
 {
 	if (s.size() == sizeof(FLATUID))
 		print_guid(*reinterpret_cast<const FLATUID *>(s.data()));
@@ -368,19 +405,217 @@ static void try_entryid(const std::string_view s, unsigned int ind)
 		try_object_eid(s, ind);
 }
 
-static void parse(const char *hex)
+static int print_action(std::string_view data)
 {
-	printf("===== %s:\n", hex);
-	auto bin = hex2bin(hex);
-	unsigned int i = 0;
-	try_guid(bin, i);
-	try_entryid(bin, i);
-	printf("\n");
+	RULE_ACTIONS ra{};
+	EXT_PULL ep;
+	ep.init(data.data(), data.size(), zalloc, 0);
+	if (ep.g_rule_actions(&ra) != pack_result::ok)
+		return -1;
+	printf("%s\n", ra.repr().c_str());
+	return 0;
+}
+
+static int print_restrict(std::string_view data)
+{
+	RESTRICTION rs{};
+	EXT_PULL ep;
+	ep.init(data.data(), data.size(), zalloc, 0);
+	if (ep.g_restriction(&rs) != pack_result::ok)
+		return -1;
+	printf("%s\n", rs.repr().c_str());
+	return 0;
+}
+
+static void print_nttime(const char *str)
+{
+	auto nt = strtoll(str, nullptr, 0);
+	auto ut = rop_util_nttime_to_unix(nt);
+	printf("%lld ... is unixtime %lld\n", LLD{nt}, LLD{ut});
+	char buf[64];
+	auto tm = localtime(&ut);
+	strftime(buf, std::size(buf), "%FT%T", tm);
+	printf("%lld ... is calendar %s\n", LLD{nt}, buf);
+}
+
+static void print_unixtime(const char *str)
+{
+	time_t ut = strtoll(str, nullptr, 0);
+	auto nt = rop_util_unix_to_nttime(ut);
+	printf("%lld ... is nttime %lld\n", LLD{ut}, LLU{nt});
+	char buf[64];
+	auto tm = localtime(&ut);
+	strftime(buf, std::size(buf), "%FT%T", tm);
+	printf("%lld ... is calendar %s\n", LLD{ut}, buf);
+}
+
+static int do_lzx(std::string_view data, bool enc)
+{
+	/*
+	 * The API of that lzxpress implementation does not expose streamed
+	 * decompression; it's just one-shot. Just allocate a huge chunk and
+	 * hope.
+	 */
+	size_t osize = data.size() * 10;
+	auto outbuf = std::make_unique<char[]>(osize);
+	auto ret = enc ? lzxpress_compress(data.data(), data.size(), outbuf.get(), osize) :
+	           lzxpress_decompress(data.data(), data.size(), outbuf.get(), osize);
+	if (ret < 0) {
+		fprintf(stderr, "Something went wrong\n");
+		return -1;
+	} else if (HXio_fullwrite(STDOUT_FILENO, outbuf.get(), ret) < 0) {
+		perror("write");
+		return -1;
+	}
+	return 0;
+}
+
+static int do_process_2(std::string_view &&data, const char *str)
+{
+	switch (g_dowhat) {
+	case CM_DEC_ANYTHING: {
+		try_entryid(data);
+		try_guid(data);
+		return 0;
+	}
+	case CM_DEC_ACTION:
+		return print_action(data);
+	case CM_DEC_ENTRYID: {
+		try_entryid(data, 0);
+		return 0;
+	}
+	case CM_DEC_GUID: {
+		try_guid(data, 0);
+		return 0;
+	}
+	case CM_DEC_NTTIME:
+		print_nttime(str);
+		return 0;
+	case CM_DEC_RESTRICT:
+		return print_restrict(data);
+	case CM_DEC_UNIXTIME:
+		print_unixtime(str);
+		return 0;
+	case CM_HTMLTORTF: {
+		std::string out;
+		auto err = html_to_rtf(data, CP_UTF8, out);
+		if (err != ecSuccess) {
+			fprintf(stderr, "html_to_rtf: %s", mapi_strerror(err));
+			return -1;
+		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
+	case CM_HTMLTOTEXT: {
+		std::string out;
+		if (html_to_plain(data, CP_OEMCP, out) < 0) {
+			fprintf(stderr, "html_to_plain failed\n");
+			return -1;
+		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return 01;
+		}
+		return 0;
+	}
+	case CM_LZXDEC:
+		return do_lzx(data, 0);
+	case CM_LZXENC:
+		return do_lzx(data, 1);
+	case CM_RTFCP: {
+		std::string out;
+		auto err = rtfcp_encode(data, out);
+		if (err != ecSuccess) {
+			fprintf(stderr, "rtfcp_compress: %s\n", mapi_strerror(err));
+			return -1;
+		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
+	case CM_RTFTOHTML: {
+		auto at = attachment_list_init();
+		std::string out;
+		auto err = rtf_to_html(data, "utf-8", out, at);
+		if (err != ecSuccess) {
+			fprintf(stderr, "rtf_to_html: %s\n", mapi_strerror(err));
+			return -1;
+		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
+	case CM_TEXTTOHTML: {
+		std::string out;
+		auto err = plain_to_html(str, out);
+		if (err != ecSuccess) {
+			fprintf(stderr, "plain_to_html: %s\n", mapi_strerror(err));
+			return -1;
+		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
+	case CM_UNRTFCP: {
+		auto unc_size = rtfcp_uncompressed_size(data);
+		if (unc_size == -1) {
+			fprintf(stderr, "Bad header magic, or data stream is shorter than the header says it should be.\n");
+			return -1;
+		} else if (unc_size == 0) {
+			return 0;
+		}
+		std::string out;
+		auto err = rtfcp_uncompress(data, out);
+		if (err != ecSuccess) {
+			fprintf(stderr, "rtfcp_uncompress: %s\n", mapi_strerror(err));
+			return -1;
+		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
+	default:
+		return -1;
+	}
+}
+
+static int do_process_1(std::string_view &&data, const char *str)
+{
+	return do_process_2(g_hex2bin ? hex2bin(data, HEX2BIN_SKIP) : std::move(data), str);
 }
 
 int main(int argc, char **argv)
 {
-	while (*++argv != nullptr)
-		parse(*argv);
-	return EXIT_SUCCESS;
+	HXopt6_auto_result argp;
+	if (HX_getopt6(g_options_table, argc, argv, &argp,
+	    HXOPT_USAGEONERR | HXOPT_ITER_ARGS) != HXOPT_ERR_SUCCESS)
+		return EXIT_FAILURE;
+
+	if (g_dowhat == CM_NONE) {
+		fprintf(stderr, "No command selected\n");
+		return EXIT_FAILURE;
+	}
+	if (iconv_validate() != 0)
+		return EXIT_FAILURE;
+	textmaps_init(PKGDATADIR);
+	if (argp.nargs == 0) {
+		size_t slurp_len = 0;
+		std::unique_ptr<char[], stdlib_delete> slurp_data(HX_slurp_fd(STDIN_FILENO, &slurp_len));
+		if (slurp_data == nullptr)
+			return EXIT_FAILURE;
+		return do_process_1(std::string_view(slurp_data.get(), slurp_len), slurp_data.get());
+	}
+
+	int combined_ret = EXIT_SUCCESS;
+	for (int i = 0; i < argp.nargs; ++i) {
+		int ret = do_process_1(argp.uarg[i], argp.uarg[i]);
+		if (ret != 0)
+			combined_ret = EXIT_FAILURE;
+	}
+	return combined_ret;
 }

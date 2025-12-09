@@ -1531,13 +1531,13 @@ static ec_error_t nsp_get_proptags(const ab_tree::ab_node &node,
 	 * Trim tags that have no propval (requirement as per MS-OXNSPI v14
 	 * §3.1.4.1.6 point 5).
 	 */
-	t.erase(std::remove_if(t.begin(), t.end(), [&](proptag_t proptag) {
+	std::erase_if(t, [&](proptag_t proptag) {
 		char temp_buff[1024];
 		PROPERTY_VALUE prop_val{};
 		return nsp_interface_fetch_property(node, false, CP_UTF8,
 		       proptag, &prop_val, temp_buff,
 		       std::size(temp_buff)) != ecSuccess;
-	}), t.end());
+	});
 	return ecSuccess;
 #undef U
 } catch (const std::bad_alloc &) {
@@ -2000,7 +2000,7 @@ ec_error_t nsp_interface_query_columns(NSPI_HANDLE handle, uint32_t reserved,
 	auto pcolumns = ndr_stack_anew<LPROPTAG_ARRAY>(NDR_STACK_OUT);
 	if (pcolumns == nullptr)
 		return ecServerOOM;
-	static constexpr uint32_t utags[] = {
+	static constexpr proptag_t utags[] = {
 		PR_DISPLAY_NAME, PR_NICKNAME,/* PR_TITLE, */
 		PR_BUSINESS_TELEPHONE_NUMBER, PR_PRIMARY_TELEPHONE_NUMBER,
 		PR_MOBILE_TELEPHONE_NUMBER, PR_HOME_ADDRESS_STREET, PR_COMMENT,

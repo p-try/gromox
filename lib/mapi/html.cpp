@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
+// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// This file is part of Gromox.
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -17,6 +19,7 @@
 #include <libHX/defs.h>
 #include <libHX/endian.h>
 #include <libHX/libxml_helper.h>
+#include <libHX/scope.hpp>
 #include <libHX/string.h>
 #include <libxml/HTMLparser.h>
 #include <gromox/defs.h>
@@ -358,9 +361,21 @@ static ec_error_t html_write_string(RTF_WRITER *pwriter, const char *string)
 	char tmp_buff[24];
 	const char *ptr = string, *pend = string + strlen(string);
 
+	bool seen_non_ws = false;
 	while ('\0' != *ptr) {
+		if (*ptr == '\r') {
+			++ptr;
+			continue;
+		}
+		if (*ptr == '\n') {
+			if (seen_non_ws)
+				QRF(pwriter->ext_push.p_bytes("\\line ", 6));
+			++ptr;
+			continue;
+		}
 		static_assert(UCHAR_MAX <= std::size(utf8_byte_num));
-		auto len = utf8_byte_num[static_cast<unsigned char>(*ptr)];
+		char cur = *ptr;
+		auto len = utf8_byte_num[static_cast<unsigned char>(cur)];
 		if (len == 0) {
 			++ptr;
 			continue;
@@ -377,6 +392,8 @@ static ec_error_t html_write_string(RTF_WRITER *pwriter, const char *string)
 			else
 				QRF(pwriter->ext_push.p_uint8(*ptr));
 			ptr += len;
+			if (!HX_isspace(cur))
+				seen_non_ws = true;
 			continue;
 		}
 		auto [w1, w2] = html_utf8_to_utf16(pwriter->cd, ptr, len);
@@ -391,6 +408,7 @@ static ec_error_t html_write_string(RTF_WRITER *pwriter, const char *string)
 
 		tmp_len = strlen(tmp_buff);
 		QRF(pwriter->ext_push.p_bytes(tmp_buff, tmp_len));
+		seen_non_ws = true;
 	}
 	return ecSuccess;
 }
@@ -469,8 +487,8 @@ static ec_error_t html_write_style_font_size(RTF_WRITER *pwriter,
 	char tmp_buff[256];
 	
 	if (!unit_point)
-		/* 1px = 0.75292857248934pt */
-		font_size = (int)(((double)font_size)*0.75292857248934*2);
+		/* 1px = 0.75pt (at 96 DPI, anyway) */
+		font_size = static_cast<double>(font_size) * 0.75 * 2;
 	else
 		font_size *= 2;
 	length = snprintf(tmp_buff, std::size(tmp_buff), "\\fs%d ", font_size);
@@ -506,6 +524,27 @@ static ec_error_t html_write_style_text_indent(RTF_WRITER *pwriter, int text_ind
 	length = snprintf(tmp_buff, std::size(tmp_buff), "\\fi%d ", text_indent*15);
 	QRF(pwriter->ext_push.p_bytes(tmp_buff, length));
 	return ecSuccess;
+}
+
+static int html_css_font_keyword_to_pt(const char *value)
+{
+	static constexpr struct kw {
+		const char name[9];
+		int8_t pt;
+	} keywords[] = {
+		{"large", 14},
+		{"larger", 14},
+		{"medium", 12},
+		{"small", 10},
+		{"smaller", 10},
+		{"x-large", 18},
+		{"x-small", 8},
+		{"xx-large", 24},
+		{"xx-small", 6},
+	};
+	auto i = std::lower_bound(std::cbegin(keywords), std::cend(keywords), value,
+	         [](const kw &e, const char *v) { return strcasecmp(e.name, v) < 0; });
+	return i != std::cend(keywords) ? i->pt : 0;
 }
 
 static void html_trim_style_value(char *value)
@@ -630,8 +669,22 @@ static ec_error_t html_write_style(RTF_WRITER *pwriter, const xmlNode *pelement)
 	}
 	if (html_match_style(pattribute,
 		"font-size", value, sizeof(value))) {
-		auto unit_point = class_match_suffix(value, "pt") == 0;
-		ERF(html_write_style_font_size(pwriter, strtol(value, nullptr, 0), unit_point));
+		html_trim_style_value(value);
+		bool unit_point = false;
+		int font_size = 0;
+		if (class_match_suffix(value, "pt") == 0) {
+			unit_point = true;
+			font_size = strtol(value, nullptr, 0);
+		} else if (class_match_suffix(value, "px") == 0) {
+			unit_point = false;
+			font_size = strtol(value, nullptr, 0);
+		} else {
+			font_size = html_css_font_keyword_to_pt(value);
+			if (font_size > 0)
+				unit_point = true;
+		}
+		if (font_size > 0)
+			ERF(html_write_style_font_size(pwriter, font_size, unit_point));
 	}
 	if (html_match_style(pattribute,
 		"line-height", value, sizeof(value))) {
@@ -1061,25 +1114,24 @@ static void html_enum_tables(RTF_WRITER *pwriter, xmlNode *pnode)
 		html_enum_tables(pwriter, pnode);
 }
 
-ec_error_t html_to_rtf(const void *pbuff_in, size_t length, cpid_t cpid,
-    char **pbuff_out, size_t *plength) try
+/**
+ * @inbuf: input data
+ * @cpid:  the actual character set of the HTML data (override; can't trust <meta>)
+ * @out:   output variable
+ *
+ * It is allowed for @inbuf to point to the same object as @out.
+ */
+ec_error_t html_to_rtf(std::string_view inbuf, cpid_t cpid, std::string &out) try
 {
 	RTF_WRITER writer;
 
-	std::unique_ptr<char[]> buff_inz(new(std::nothrow) char[length+1]);
-	if (buff_inz == nullptr)
-		return ecMAPIOOM;
-	memcpy(buff_inz.get(), pbuff_in, length);
-	buff_inz[length] = '\0';
-
-	*pbuff_out = nullptr;
 	cpid_cstr_compatible(cpid);
 	auto cset = cpid_to_cset(cpid);
 	if (cset == nullptr)
 		cset = "windows-1252";
 	cset = replace_iconv_charset(cset);
-	auto buffer = iconvtext(static_cast<const char *>(pbuff_in),
-	              length, cset, "UTF-8");
+	/* First, switch HTML to UTF-8 */
+	auto buffer = iconvtext(inbuf.data(), inbuf.size(), cset, "UTF-8");
 	if (errno == ENOMEM)
 		return ecMAPIOOM;
 	else if (errno == EINVAL)
@@ -1093,6 +1145,7 @@ ec_error_t html_to_rtf(const void *pbuff_in, size_t length, cpid_t cpid,
 	            HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_NONET);
 	if (hdoc == nullptr)
 		return ecError;
+	auto cl_0 = HX::make_scope_exit([&]() { xmlFreeDoc(hdoc); });
 	auto root = xmlDocGetRootElement(hdoc);
 	if (root != nullptr) {
 		html_enum_tables(&writer, root);
@@ -1100,12 +1153,9 @@ ec_error_t html_to_rtf(const void *pbuff_in, size_t length, cpid_t cpid,
 		ERF(html_enum_write(&writer, root));
 		ERF(html_write_tail(&writer));
 	}
-	*plength = writer.ext_push.m_offset;
-	*pbuff_out = me_alloc<char>(*plength);
-	if (*pbuff_out != nullptr)
-		memcpy(*pbuff_out, writer.ext_push.m_udata, *plength);
-	xmlFreeDoc(hdoc);
-	return *pbuff_out != nullptr ? ecSuccess : ecMAPIOOM;
+	out.assign(writer.ext_push.m_cdata, writer.ext_push.m_offset);
+	return ecSuccess;
 } catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecMAPIOOM;
 }

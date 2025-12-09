@@ -86,6 +86,7 @@ static thread_local prepared_statements *g_opt_key;
 
 namespace exmdb {
 
+std::string g_exmdb_smtp_url;
 char g_exmdb_org_name[256];
 thread_local unsigned int g_inside_flush_instance;
 thread_local sqlite3 *g_sqlite_for_oxcmail;
@@ -93,13 +94,11 @@ unsigned int g_max_rule_num, g_max_extrule_num;
 unsigned int g_cid_compression = 0; /* disabled(0), specific_level(n) */
 
 decltype(common_util_get_handle) common_util_get_handle;
-decltype(ems_send_mail) ems_send_mail;
-decltype(ems_send_vmail) ems_send_vmail;
 
 static bool cu_eval_subobj_restriction(sqlite3 *, cpid_t, uint64_t msgid, gromox::proptag_t, const RESTRICTION *);
-static bool gp_prepare_anystr(sqlite3 *, mapi_object_type, uint64_t, uint32_t, xstmt &, sqlite3_stmt *&);
-static bool gp_prepare_mvstr(sqlite3 *, mapi_object_type, uint64_t, uint32_t, xstmt &, sqlite3_stmt *&);
-static bool gp_prepare_default(sqlite3 *, mapi_object_type, uint64_t, uint32_t, xstmt &, sqlite3_stmt *&);
+static bool gp_prepare_anystr(sqlite3 *, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
+static bool gp_prepare_mvstr(sqlite3 *, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
+static bool gp_prepare_default(sqlite3 *, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
 static void *gp_fetch(sqlite3 *, sqlite3_stmt *, uint16_t, cpid_t, GP_RESULT &);
 
 ec_error_t cu_set_propval(TPROPVAL_ARRAY *parray, proptag_t tag, const void *data)
@@ -139,19 +138,18 @@ void common_util_remove_propvals(TPROPVAL_ARRAY *parray, proptag_t proptag)
 void common_util_pass_service(const char *name, void *func)
 {
 #define E(v, ptr) do { if (strcmp(name, (v)) == 0) { (ptr) = reinterpret_cast<decltype(ptr)>(func); return; } } while (false)
-	E("ems_send_mail", ems_send_mail);
-	E("ems_send_vmail", ems_send_vmail);
 	E("get_handle", common_util_get_handle);
 #undef E
 }
 
 void common_util_init(const char *org_name, uint32_t max_msg,
-	unsigned int max_rule_num, unsigned int max_ext_rule_num)
+    unsigned int max_rule_num, unsigned int max_ext_rule_num, std::string &&smtp_url)
 {
 	gx_strlcpy(g_exmdb_org_name, org_name, std::size(g_exmdb_org_name));
 	g_max_msg = max_msg;
 	g_max_rule_num = max_rule_num;
 	g_max_extrule_num = max_ext_rule_num;
+	g_exmdb_smtp_url = std::move(smtp_url);
 }
 
 void common_util_build_tls()
@@ -291,9 +289,7 @@ BOOL common_util_allocate_eid(sqlite3 *psqlite, uint64_t *peid)
 	snprintf(sql_string, std::size(sql_string), "UPDATE configurations SET"
 		" config_value=%llu WHERE config_id=%u",
 		LLU{cur_eid}, CONFIG_ID_CURRENT_EID);
-	if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK)
-		return FALSE;
-	return TRUE;
+	return gx_sql_exec(psqlite, sql_string) == SQLITE_OK ? TRUE : false;
 }
 
 /**
@@ -331,9 +327,7 @@ BOOL common_util_allocate_eid_from_folder(sqlite3 *psqlite,
 	snprintf(sql_string, std::size(sql_string), "UPDATE folders SET cur_eid=%llu,"
 		" max_eid=%llu WHERE folder_id=%llu", LLU{cur_eid},
 		LLU{max_eid}, LLU{folder_id});
-	if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK)
-		return FALSE;
-	return TRUE;
+	return gx_sql_exec(psqlite, sql_string) == SQLITE_OK ? TRUE : false;
 }
 
 /**
@@ -409,31 +403,6 @@ BOOL common_util_check_allocated_eid(sqlite3 *psqlite,
 	return TRUE;
 }
 
-BOOL common_util_allocate_cid(sqlite3 *psqlite, uint64_t *pcid)
-{
-	char sql_string[128];
-	
-	snprintf(sql_string, std::size(sql_string), "SELECT config_value FROM "
-		"configurations WHERE config_id=%u", CONFIG_ID_LAST_CID);
-	auto pstmt = gx_sql_prep(psqlite, sql_string);
-	if (pstmt == nullptr)
-		return FALSE;
-	uint64_t last_cid = pstmt.step() == SQLITE_ROW ?
-	                    sqlite3_column_int64(pstmt, 0) : 0;
-	pstmt.finalize();
-	last_cid ++;
-	snprintf(sql_string, std::size(sql_string), "REPLACE INTO configurations"
-					" VALUES (%u, ?)", CONFIG_ID_LAST_CID);
-	pstmt = gx_sql_prep(psqlite, sql_string);
-	if (pstmt == nullptr)
-		return FALSE;
-	sqlite3_bind_int64(pstmt, 1, last_cid);
-	if (pstmt.step() != SQLITE_DONE)
-		return FALSE;
-	*pcid = last_cid;
-	return TRUE;
-}
-
 }
 
 bool prepared_statements::begin(sqlite3 *psqlite)
@@ -477,7 +446,7 @@ std::unique_ptr<prepared_statements> db_conn::begin_optim() try
 	g_opt_key = op.get();
 	return op;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2358: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return nullptr;
 }
 
@@ -516,8 +485,8 @@ template<typename F> static F coalesce_propid(F first, F last)
 	return first;
 }
 
-BOOL cu_get_proptags(mapi_object_type table_type, uint64_t id, sqlite3 *psqlite,
-    std::vector<uint32_t> &tags) try
+bool cu_get_proptags(mapi_object_type table_type, uint64_t id, sqlite3 *psqlite,
+    std::vector<proptag_t> &tags) try
 {
 	/*
 	 * All computed/synthesized tags should appear in these tag lists (XXX:
@@ -526,7 +495,7 @@ BOOL cu_get_proptags(mapi_object_type table_type, uint64_t id, sqlite3 *psqlite,
 	 * exmdb_server::read_message, so it's not just for the default columns
 	 * of content tables.
 	 */
-	static constexpr uint32_t folder_tags[] = {
+	static constexpr proptag_t folder_tags[] = {
 		PR_ASSOC_CONTENT_COUNT, PR_CONTENT_COUNT,
 		PR_MESSAGE_SIZE_EXTENDED, PR_ASSOC_MESSAGE_SIZE_EXTENDED,
 		PR_NORMAL_MESSAGE_SIZE_EXTENDED, PR_FOLDER_CHILD_COUNT,
@@ -534,12 +503,12 @@ BOOL cu_get_proptags(mapi_object_type table_type, uint64_t id, sqlite3 *psqlite,
 		PR_FOLDER_PATHNAME, PR_LOCAL_COMMIT_TIME, PidTagFolderId,
 		PidTagChangeNumber, PR_FOLDER_FLAGS, PR_CI_SEARCH_ENABLED,
 	};
-	static constexpr uint32_t msg_tags[] = {
+	static constexpr proptag_t msg_tags[] = {
 		PidTagMid, PR_MESSAGE_SIZE, PR_ASSOCIATED, PidTagChangeNumber,
 		PR_READ, PR_HASATTACH, PR_MESSAGE_FLAGS, PR_DISPLAY_TO,
 		PR_DISPLAY_CC, PR_DISPLAY_BCC, PR_MESSAGE_CLASS,
 	};
-	static constexpr uint32_t rcpt_tags[] = {
+	static constexpr proptag_t rcpt_tags[] = {
 		PR_RECIPIENT_TYPE, PR_DISPLAY_NAME, PR_ADDRTYPE, PR_EMAIL_ADDRESS,
 	};
 	BOOL b_subject;
@@ -609,7 +578,7 @@ BOOL cu_get_proptags(mapi_object_type table_type, uint64_t id, sqlite3 *psqlite,
 	tags.erase(coalesce_propid(tags.begin(), tags.end()), tags.end());
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2135: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -697,8 +666,7 @@ BOOL common_util_get_mapping_guid(sqlite3 *psqlite,
 	return TRUE;
 }
 
-static uint32_t common_util_calculate_childcount(
-	uint32_t folder_id, sqlite3 *psqlite)
+static uint32_t common_util_calculate_childcount(uint64_t folder_id, sqlite3 *psqlite)
 {
 	uint32_t count;
 	char sql_string[80];
@@ -717,18 +685,17 @@ static uint32_t common_util_calculate_childcount(
 	return count;
 }
 
-static BOOL common_util_check_subfolders(
-	sqlite3 *psqlite, uint32_t folder_id)
+static bool common_util_check_subfolders(sqlite3 *psqlite, uint64_t folder_id)
 {
 	char sql_string[80];
 	
 	snprintf(sql_string, std::size(sql_string), "SELECT folder_id FROM"
 	         " folders WHERE parent_id=%llu AND is_deleted=0", LLU{folder_id});
 	auto pstmt = gx_sql_prep(psqlite, sql_string);
-	return pstmt != nullptr && pstmt.step() == SQLITE_ROW ? TRUE : false;
+	return pstmt != nullptr && pstmt.step() == SQLITE_ROW;
 }
 
-static ec_error_t cu_calc_folder_path(uint32_t folder_id,
+static ec_error_t cu_calc_folder_path(uint64_t folder_id,
     sqlite3 *psqlite, std::string &path)
 {
 	static constexpr char delim[] = "\xEF\xBF\xBE";
@@ -803,15 +770,13 @@ BOOL common_util_check_msgcnt_overflow(sqlite3 *psqlite)
 	return c >= g_max_msg ? TRUE : false;
 }
 
-BOOL cu_check_msgsize_overflow(sqlite3 *psqlite, uint32_t qtag)
+bool cu_check_msgsize_overflow(sqlite3 *psqlite, proptag_t qtag)
 {
-	const proptag_t proptag_buff[] = {qtag, PR_MESSAGE_SIZE_EXTENDED};
-	const PROPTAG_ARRAY proptags =
-		{std::size(proptag_buff), deconst(proptag_buff)};
+	const proptag_t tags[] = {qtag, PR_MESSAGE_SIZE_EXTENDED};
 	TPROPVAL_ARRAY propvals;
 	
 	if (!cu_get_properties(MAPI_STORE, 0, CP_ACP, psqlite,
-	    &proptags, &propvals))
+	    tags, &propvals))
 		return FALSE;
 	auto ptotal = propvals.get<uint64_t>(PR_MESSAGE_SIZE_EXTENDED);
 	auto qv_kb = propvals.get<uint32_t>(qtag);
@@ -1475,7 +1440,7 @@ static BOOL common_util_get_message_display_recipients(sqlite3 *psqlite,
 	           common_util_convert_copy(false, cpid, dr.c_str());
 	return *ppvalue != nullptr ? TRUE : false;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1159: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -1490,7 +1455,7 @@ std::string cu_cid_path(const char *dir, const char *id, unsigned int type) try
 		path += ".v1z";
 	return path;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1608: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return {};
 }
 
@@ -1596,7 +1561,7 @@ static void *cu_get_object_text(sqlite3 *psqlite,
 		return nullptr;
 	return bv;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2010: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return nullptr;
 }
 
@@ -1647,11 +1612,10 @@ static void *cu_get_object_text_v0(const char *dir, const char *cid,
 BOOL cu_get_property(mapi_object_type table_type, uint64_t id,
     cpid_t cpid, sqlite3 *psqlite, proptag_t proptag, void **ppvalue)
 {
-	const PROPTAG_ARRAY proptags = {1, deconst(&proptag)};
+	const proptag_t tags[] = {proptag};
 	TPROPVAL_ARRAY propvals;
-	
 	if (!cu_get_properties(table_type,
-	    id, cpid, psqlite, &proptags, &propvals))
+	    id, cpid, psqlite, tags, &propvals))
 		return FALSE;
 	*ppvalue = propvals.count == 0 ? nullptr : propvals.ppropval[0].pvalue;
 	return TRUE;
@@ -1720,7 +1684,7 @@ static BINARY *cu_get_replmap(sqlite3 *db)
 	return bin;
 }
 
-static GP_RESULT gp_storeprop(uint32_t tag, TAGGED_PROPVAL &pv, sqlite3 *db)
+static GP_RESULT gp_storeprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db)
 {
 	uint32_t *v = nullptr;
 	switch (tag) {
@@ -1735,6 +1699,7 @@ static GP_RESULT gp_storeprop(uint32_t tag, TAGGED_PROPVAL &pv, sqlite3 *db)
 		if (pv.pvalue == nullptr)
 			return GP_ERR;
 		break;
+	case PR_OOF_STATE:
 	case PidTagSerializedReplidGuidMap:
 		break;
 	default:
@@ -1752,11 +1717,16 @@ static GP_RESULT gp_storeprop(uint32_t tag, TAGGED_PROPVAL &pv, sqlite3 *db)
 		if (pv.pvalue == nullptr)
 			return GP_ERR;
 		break;
+	case PR_OOF_STATE:
+		auto err = autoreply_make_oofstate(exmdb_server::get_dir(), pv.pvalue);
+		if (err != ecSuccess)
+			return GP_ERR;
+		break;
 	}
 	return GP_ADV;
 }
 
-static GP_RESULT gp_folderprop(uint32_t tag, TAGGED_PROPVAL &pv,
+static GP_RESULT gp_folderprop(proptag_t tag, TAGGED_PROPVAL &pv,
     sqlite3 *db, uint64_t id)
 {
 	uint32_t *v = nullptr;
@@ -1863,7 +1833,7 @@ static GP_RESULT gp_folderprop(uint32_t tag, TAGGED_PROPVAL &pv,
 	return GP_ADV;
 }
 
-static GP_RESULT gp_msgprop(uint32_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
+static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
     uint64_t id, cpid_t cpid)
 {
 	switch (tag) {
@@ -2010,7 +1980,7 @@ static GP_RESULT gp_msgprop(uint32_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
 	return GP_UNHANDLED;
 }
 
-static GP_RESULT gp_atxprop(uint32_t tag, TAGGED_PROPVAL &pv,
+static GP_RESULT gp_atxprop(proptag_t tag, TAGGED_PROPVAL &pv,
     sqlite3 *db, uint64_t id)
 {
 	switch (tag) {
@@ -2035,7 +2005,7 @@ static GP_RESULT gp_atxprop(uint32_t tag, TAGGED_PROPVAL &pv,
 	return GP_UNHANDLED;
 }
 
-static GP_RESULT gp_spectableprop(mapi_object_type table_type, uint32_t tag,
+static GP_RESULT gp_spectableprop(mapi_object_type table_type, proptag_t tag,
     TAGGED_PROPVAL &pv, sqlite3 *db, uint64_t id, cpid_t cpid)
 {
 	pv.proptag = tag;
@@ -2229,16 +2199,16 @@ static GP_RESULT cu_get_properties1(mapi_object_type table_type, uint64_t id,
 	return GP_SKIP; /* emplace_back already did the GP_ADV part */
 }
 
-BOOL cu_get_properties(mapi_object_type table_type, uint64_t objid, cpid_t cpid,
-    sqlite3 *psqlite, const PROPTAG_ARRAY *pproptags, TPROPVAL_ARRAY *ppropvals)
+bool cu_get_properties(mapi_object_type table_type, uint64_t objid, cpid_t cpid,
+    sqlite3 *psqlite, proptag_cspan pproptags, TPROPVAL_ARRAY *ppropvals)
 {
 	ppropvals->count = 0;
-	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
+	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags.size());
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
-	for (size_t i = 0; i < pproptags->count; ++i) {
+	for (size_t i = 0; i < pproptags.size(); ++i) {
 		auto ret = cu_get_properties1(table_type, objid, cpid, psqlite,
-		           pproptags->pproptag[i], ppropvals);
+		           pproptags[i], ppropvals);
 		if (ret == GP_ADV)
 			++ppropvals->count;
 		else if (ret == GP_ERR)
@@ -2248,7 +2218,7 @@ BOOL cu_get_properties(mapi_object_type table_type, uint64_t objid, cpid_t cpid,
 }
 
 static bool gp_prepare_anystr(sqlite3 *psqlite, mapi_object_type table_type,
-    uint64_t id, uint32_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
+    uint64_t id, proptag_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
 {
 	switch (table_type) {
 	case MAPI_STORE:
@@ -2320,7 +2290,7 @@ static bool gp_prepare_anystr(sqlite3 *psqlite, mapi_object_type table_type,
 }
 
 static bool gp_prepare_mvstr(sqlite3 *psqlite, mapi_object_type table_type,
-    uint64_t id, uint32_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
+    uint64_t id, proptag_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
 {
 	switch (table_type) {
 	case MAPI_STORE:
@@ -2389,7 +2359,7 @@ static bool gp_prepare_mvstr(sqlite3 *psqlite, mapi_object_type table_type,
 }
 
 static bool gp_prepare_default(sqlite3 *psqlite, mapi_object_type table_type,
-    uint64_t id, uint32_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
+    uint64_t id, proptag_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
 {
 	switch (table_type) {
 	case MAPI_STORE:
@@ -2899,7 +2869,7 @@ static BOOL common_util_set_message_subject(cpid_t cpid, uint64_t message_id,
 	auto subj = static_cast<const char *>(props.ppropval[subj_id].pvalue);
 	if (!cu_rebuild_subjects(subj, pfx, norm))
 		return false;
-	auto lm = [&](uint32_t tag, const char *value) {
+	auto lm = [&](proptag_t tag, const char *value) {
 	if (PROP_TYPE(tag) == PT_UNICODE) {
 		pstmt.bind_int64(1, tag);
 		pstmt.bind_text(2, value);
@@ -3020,7 +2990,7 @@ static errno_t cu_cid_writeout(const char *maildir, std::string_view data,
 		path.c_str(), strerror(err));
 	return err;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2065: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ENOMEM;
 }
 
@@ -3098,7 +3068,7 @@ static BOOL cu_set_object_cid_value(sqlite3 *psqlite, mapi_object_type table_typ
 }
 
 BOOL cu_set_property(mapi_object_type table_type, uint64_t id, cpid_t cpid,
-    sqlite3 *psqlite, uint32_t tag, const void *data, BOOL *pb_result)
+    sqlite3 *psqlite, proptag_t tag, const void *data, BOOL *pb_result)
 {
 	PROBLEM_ARRAY tmp_problems;
 	const TAGGED_PROPVAL tp = {tag, deconst(data)};
@@ -3606,16 +3576,8 @@ BOOL cu_set_properties(mapi_object_type table_type, uint64_t id, cpid_t cpid,
 	return TRUE;
 }
 
-BOOL cu_remove_property(mapi_object_type table_type,
-	uint64_t id, sqlite3 *psqlite, proptag_t proptag)
-{
-	const PROPTAG_ARRAY tmp_proptags = {1, deconst(&proptag)};
-	return cu_remove_properties(
-		table_type, id, psqlite, &tmp_proptags);
-}
-
-BOOL cu_remove_properties(mapi_object_type table_type, uint64_t id,
-	sqlite3 *psqlite, const PROPTAG_ARRAY *pproptags)
+bool cu_remove_properties(mapi_object_type table_type, uint64_t id,
+    sqlite3 *psqlite, proptag_cspan pproptags)
 {
 	char sql_string[128];
 	
@@ -3650,8 +3612,7 @@ BOOL cu_remove_properties(mapi_object_type table_type, uint64_t id,
 	auto pstmt = gx_sql_prep(psqlite, sql_string);
 	if (pstmt == nullptr)
 		return FALSE;
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
-		const auto tag = pproptags->pproptag[i];
+	for (const auto tag : pproptags) {
 		switch (table_type) {
 		case MAPI_STORE:
 			switch (tag) {
@@ -3713,7 +3674,7 @@ BOOL cu_remove_properties(mapi_object_type table_type, uint64_t id,
 	return TRUE;
 }
 
-static inline const char *rule_tag_to_col(uint32_t tag)
+static inline const char *rule_tag_to_col(proptag_t tag)
 {
 	switch (tag) {
 	case PR_RULE_SEQUENCE: return "sequence";
@@ -4713,6 +4674,7 @@ static errno_t copy_eml_ext(const char *old_midstr, std::string &new_midstr) try
 	}
 	return 0;
 } catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ENOMEM;
 }
 
@@ -5041,7 +5003,7 @@ BOOL common_util_get_named_propids(sqlite3 *psqlite, BOOL b_create,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1503: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 

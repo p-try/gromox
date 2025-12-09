@@ -52,7 +52,7 @@ static BOOL logon_object_cache_propname(logon_object *plogon,
 	plogon->propname_hash.emplace(s, propid);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1633: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
 
@@ -157,12 +157,12 @@ BOOL logon_object::get_named_propnames(const PROPID_ARRAY &propids,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2236: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
 BOOL logon_object::get_named_propid(BOOL b_create,
-    const PROPERTY_NAME *ppropname, uint16_t *ppropid)
+    const PROPERTY_NAME *ppropname, propid_t *ppropid)
 {
 	if (ppropname->guid == PS_MAPI) {
 		*ppropid = ppropname->kind == MNID_ID ? ppropname->lid : 0;
@@ -244,7 +244,7 @@ BOOL logon_object::get_named_propids(BOOL b_create,
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-2177: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -255,19 +255,18 @@ BOOL logon_object::get_all_proptags(PROPTAG_ARRAY *pproptags) const
 	
 	if (!exmdb_client->get_store_all_proptags(plogon->dir, &tmp_proptags))
 		return FALSE;	
-	pproptags->pproptag = cu_alloc<uint32_t>(tmp_proptags.count + 25);
+	pproptags->pproptag = cu_alloc<proptag_t>(tmp_proptags.count + 25);
 	if (pproptags->pproptag == nullptr)
 		return FALSE;
-	memcpy(pproptags->pproptag, tmp_proptags.pproptag,
-				sizeof(uint32_t)*tmp_proptags.count);
+	memcpy(pproptags->pproptag, tmp_proptags.pproptag, sizeof(proptag_t) * tmp_proptags.count);
 	pproptags->count = tmp_proptags.count;
 
-	static constexpr uint32_t pvt_tags[] = {
+	static constexpr proptag_t pvt_tags[] = {
 		PR_MAILBOX_OWNER_NAME, PR_MAILBOX_OWNER_ENTRYID,
 		PR_MAX_SUBMIT_MESSAGE_SIZE, PR_EXTENDED_RULE_SIZE_LIMIT,
 		PR_EMS_AB_DISPLAY_NAME_PRINTABLE,
 	};
-	static constexpr uint32_t tags[] = {
+	static constexpr proptag_t tags[] = {
 		PR_DELETED_ASSOC_MESSAGE_SIZE,
 		PR_DELETED_ASSOC_MESSAGE_SIZE_EXTENDED,
 		PR_DELETED_ASSOC_MSG_COUNT, PR_DELETED_MESSAGE_SIZE,
@@ -575,7 +574,7 @@ BOOL logon_object::get_properties(const PROPTAG_ARRAY *pproptags,
 	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
-	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<uint32_t>(pproptags->count)};
+	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<proptag_t>(pproptags->count)};
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	ppropvals->count = 0;
@@ -644,7 +643,7 @@ BOOL logon_object::set_properties(const TPROPVAL_ARRAY *ppropvals,
 	*pproblems += std::move(tmp_problems);
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1744: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 	return false;
 }
 
@@ -655,7 +654,7 @@ BOOL logon_object::remove_properties(const PROPTAG_ARRAY *pproptags,
 	pproblems->pproblem = cu_alloc<PROPERTY_PROBLEM>(pproptags->count);
 	if (pproblems->pproblem == nullptr)
 		return FALSE;
-	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<uint32_t>(pproptags->count)};
+	PROPTAG_ARRAY tmp_proptags = {0, cu_alloc<proptag_t>(pproptags->count)};
 	if (tmp_proptags.pproptag == nullptr)
 		return FALSE;
 	auto plogon = this;
