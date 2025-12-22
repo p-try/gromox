@@ -80,6 +80,7 @@ static constexpr proptag_t g_ufld_proptags[] =
 	{0x800C001F, 0x800D001F, 0x800E001F, 0x800F001F};
 static constexpr proptag_t g_fbl_proptag = 0x8010001F;
 static constexpr proptag_t g_vcarduid_proptag = 0x8011001F;
+static constexpr proptag_t g_hasphoto_proptag = 0x8015000b;
 
 static BOOL oxvcard_check_compatible(const vcard *pvcard)
 {
@@ -104,7 +105,7 @@ static BOOL oxvcard_check_compatible(const vcard *pvcard)
 static BOOL oxvcard_get_propids(PROPID_ARRAY *ppropids,
 	GET_PROPIDS get_propids)
 {
-	const PROPERTY_NAME bf[21] = {
+	const PROPERTY_NAME bf[22] = {
 	/* 0x0 */
 		{MNID_ID, PSETID_Address, PidLidWorkAddressPostOfficeBox},
 		{MNID_ID, PSETID_Address, PidLidWorkAddressStreet},
@@ -129,6 +130,7 @@ static BOOL oxvcard_get_propids(PROPID_ARRAY *ppropids,
 		{MNID_ID, PSETID_Address, PidLidEmail1AddressType},
 		{MNID_ID, PSETID_Address, PidLidEmail2AddressType},
 		{MNID_ID, PSETID_Address, PidLidEmail3AddressType},
+		{MNID_ID, PSETID_Address, PidLidHasPicture},
 	};
 	const PROPNAME_ARRAY propnames  {std::size(bf), deconst(bf)};
 	return get_propids(&propnames, ppropids);
@@ -217,12 +219,6 @@ static std::string join(const char *gn, const char *mn, const char *sn)
 	return r;
 }
 
-static BOOL xlog_bool(const char *func, unsigned int line)
-{
-	mlog(LV_ERR, "%s:%u returned false", func, line);
-	return false;
-}
-
 static std::nullptr_t xlog_null(const char *func, unsigned int line)
 {
 	mlog(LV_ERR, "%s:%u returned false", func, line);
@@ -302,8 +298,10 @@ message_content *oxvcard_import(const vcard *pvcard, GET_PROPIDS get_propids) tr
 			for (const auto &prnode : pvline->m_params) {
 				auto pvparam = &prnode;
 				if (strcasecmp(pvparam->name(), "ENCODING") == 0) {
-					if (pvparam->m_paramvals.size() == 0 ||
-					    strcasecmp(pvparam->m_paramvals[0].c_str(), "b") != 0)
+					if (pvparam->m_paramvals.size() == 0)
+						throw unrecog(line, prnode);
+					if (strcasecmp(pvparam->m_paramvals[0].c_str(), "b") != 0 &&
+					    strcasecmp(pvparam->m_paramvals[0].c_str(), "base64") != 0)
 						throw unrecog(line, prnode);
 					b_encoding = TRUE;
 				} else if (strcasecmp(pvparam->name(), "TYPE") == 0) {
@@ -752,12 +750,10 @@ message_content *oxvcard_import(const vcard *pvcard, GET_PROPIDS get_propids) tr
 }
 #undef imp_null
 
-#define exp_false xlog_bool(__func__, __LINE__)
 BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
     vcard &vcard, GET_PROPIDS get_propids) try
 {
 	const char *pvalue;
-	size_t out_len;
 	struct tm tmp_tm;
 	PROPID_ARRAY propids{};
 	auto remap_tag = [&](proptag_t t) -> proptag_t {
@@ -765,7 +761,6 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 		return PROP_TAG(PROP_TYPE(t), propids[PROP_ID(t)-0x8000]);
 	};
 	const char *photo_type;
-	char tmp_buff[VCARD_MAX_BUFFER_LEN];
 	std::string vcarduid;
 	static constexpr const char *tel_types[] =
 		{"HOME", "HOME", "VOICE", "WORK", "WORK",
@@ -828,27 +823,27 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 		email_line.append_value(pvalue);
 	}
 	
-	auto flag = pmsg->proplist.get<const uint8_t>(PR_ATTACHMENT_CONTACTPHOTO);
+	auto flag = pmsg->proplist.get<const uint8_t>(remap_tag(g_hasphoto_proptag));
 	if (flag != nullptr && *flag != 0 && pmsg->children.pattachments != nullptr) {
 		for (auto &at : *pmsg->children.pattachments) {
+			flag = at.proplist.get<uint8_t>(PR_ATTACHMENT_CONTACTPHOTO);
+			if (flag == nullptr || *flag == 0)
+				continue;
 			pvalue = at.proplist.get<char>(PR_ATTACH_EXTENSION);
 			if (pvalue == nullptr)
 				continue;
-			if (!is_photo(pvalue))
-				continue;
+			if (*pvalue == '.')
+				++pvalue;
+			if (strcasecmp(pvalue, "jpg") == 0)
+				pvalue = "JPEG";
 			photo_type = pvalue;
-			auto bv = at.proplist.get<BINARY>(PR_ATTACH_DATA_BIN);
+			auto bv = at.proplist.get<const BINARY>(PR_ATTACH_DATA_BIN);
 			if (bv == nullptr)
 				continue;
 			auto &photo_line = vcard.append_line("PHOTO");
 			photo_line.append_param("TYPE", photo_type);
-			photo_line.append_param("ENCODING", "B");
-			if (encode64(bv->pb, bv->cb, tmp_buff, VCARD_MAX_BUFFER_LEN - 1, &out_len) != 0)
-				return exp_false;
-			if (out_len >= VCARD_MAX_BUFFER_LEN)
-				return exp_false;
-			tmp_buff[out_len] = '\0';
-			photo_line.append_value(tmp_buff);
+			photo_line.append_param("ENCODING", "BASE64");
+			photo_line.append_value(base64_encode(*bv));
 			break;
 		}
 	}
@@ -978,13 +973,7 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 	if (ba != nullptr && ba->count != 0) {
 		auto &key_line = vcard.append_line("KEY");
 		key_line.append_param("ENCODING", "B");
-		if (encode64(ba->pbin->pb, ba->pbin->cb, tmp_buff,
-		    std::size(tmp_buff) - 1, &out_len) != 0)
-			return exp_false;
-		if (out_len >= std::size(tmp_buff))
-			return exp_false;
-		tmp_buff[out_len] = '\0';
-		key_line.append_value(tmp_buff);
+		key_line.append_value(base64_encode(ba->pbin[0]));
 	}
 	
 	pvalue = pmsg->proplist.get<char>(PR_TITLE);
@@ -999,10 +988,11 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 	if (lnum != nullptr) {
 		auto unix_time = rop_util_nttime_to_unix(*lnum);
 		if (gmtime_r(&unix_time, &tmp_tm) != nullptr) {
-			strftime(tmp_buff, 1024, "%Y-%m-%d", &tmp_tm);
+			char tb[16];
+			strftime(tb, std::size(tb), "%Y-%m-%d", &tmp_tm);
 			auto &day_line = vcard.append_line("BDAY");
 			day_line.append_param("VALUE", "DATE");
-			day_line.append_value(tmp_buff);
+			day_line.append_value(tb);
 		}
 	}
 	
@@ -1010,10 +1000,11 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 	if (lnum != nullptr) {
 		auto unix_time = rop_util_nttime_to_unix(*lnum);
 		if (gmtime_r(&unix_time, &tmp_tm) != nullptr) {
-			strftime(tmp_buff, 1024, "%Y-%m-%dT%H:%M:%SZ", &tmp_tm);
+			char tb[24];
+			strftime(tb, std::size(tb), "%Y-%m-%dT%H:%M:%SZ", &tmp_tm);
 			auto &day_line = vcard.append_line("REV");
 			day_line.append_param("VALUE", "DATE-TIME");
-			day_line.append_value(tmp_buff);
+			day_line.append_value(tb);
 		}
 	}
 	
@@ -1021,15 +1012,15 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 	if (lnum != nullptr) {
 		auto unix_time = rop_util_nttime_to_unix(*lnum);
 		if (gmtime_r(&unix_time, &tmp_tm) != nullptr) {
-			strftime(tmp_buff, 1024, "%Y-%m-%d", &tmp_tm);
+			char tb[16];
+			strftime(tb, std::size(tb), "%Y-%m-%d", &tmp_tm);
 			auto &day_line = vcard.append_line("X-MS-ANNIVERSARY");
 			day_line.append_param("VALUE", "DATE");
-			day_line.append_value(tmp_buff);
+			day_line.append_value(tb);
 		}
 	}
 	return TRUE;
 } catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1605: ENOMEM");
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
 }
-#undef exp_false
