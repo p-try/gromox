@@ -43,7 +43,7 @@
 
 using namespace gromox;
 
-gromox::atomic_bool g_notify_stop;
+gromox::atomic_bool g_httpmain_stop;
 std::shared_ptr<CONFIG_FILE> g_config_file;
 static const char *opt_config_file;
 static gromox::atomic_bool g_hup_signalled, g_usr_signalled;
@@ -418,7 +418,10 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	/* accept the connection */
+	/*
+	 * The listening socket comes last. The htls_thrwork function
+	 * needs an initialized contexts_pool object.
+	 */
 	if (listener_trigger_accept() != 0) {
 		mlog(LV_ERR, "system: failed listening socket setup");
 		return EXIT_FAILURE;
@@ -427,7 +430,7 @@ int main(int argc, char **argv)
 	
 	retcode = EXIT_SUCCESS;
 	mlog(LV_INFO, "system: HTTP daemon is now running");
-	while (!g_notify_stop) {
+	while (!g_httpmain_stop) {
 		sleep(3);
 		if (g_hup_signalled.exchange(false)) {
 			http_reload_config();
@@ -443,11 +446,13 @@ int main(int argc, char **argv)
 			pdu_processor_trigger(PLUGIN_REPORT);
 		}
 	}
+	service_trigger_all(PLUGIN_QUENCH_ASYNC);
+	pdu_processor_trigger(PLUGIN_QUENCH_ASYNC);
+	pdu_processor_trigger(PLUGIN_QUENCH_ASYNC);
 	return retcode;
 }
 
 static void term_handler(int signo)
 {
-	http_parser_shutdown_async();
-	g_notify_stop = true;
+	g_httpmain_stop = true;
 }

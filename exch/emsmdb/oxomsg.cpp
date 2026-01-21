@@ -192,13 +192,9 @@ static bool oxomsg_extract_delegator(message_object *pmessage,
  */
 static int oxomsg_test_perm(const char *account, const char *maildir, bool send_as) try
 {
-	auto dlg_path = maildir + std::string(send_as ? "/config/sendas.txt" : "/config/delegates.txt");
 	std::vector<std::string> delegate_list;
-	auto ret = read_file_by_line(dlg_path.c_str(), delegate_list);
-	if (ret != 0 && ret != ENOENT) {
-		mlog(LV_ERR, "E-2064: %s: %s", dlg_path.c_str(), strerror(ret));
+	if (!exmdb_client->read_delegates(maildir, send_as, &delegate_list))
 		return -1;
-	}
 	for (const auto &deleg : delegate_list)
 		if (strcasecmp(deleg.c_str(), account) == 0 ||
 		    mysql_adaptor_check_mlist_include(deleg.c_str(), account))
@@ -220,6 +216,8 @@ static repr_grant oxomsg_get_perm(const char *account, const char *repr)
 	sql_meta_result mres;
 	if (mysql_adaptor_meta(repr, WANTPRIV_METAONLY, mres) != 0)
 		return repr_grant::error;
+	if (strcasecmp(account, mres.username.c_str()) == 0)
+		return repr_grant::send_as;
 	auto repdir = mres.maildir.c_str();
 	auto ret = oxomsg_test_perm(account, repdir, true);
 	if (ret < 0)

@@ -43,6 +43,7 @@
 #include <gromox/midb.hpp>
 #include <gromox/mjson.hpp>
 #include <gromox/mysql_adaptor.hpp>
+#include <gromox/notify_types.hpp>
 #include <gromox/oxcmail.hpp>
 #include <gromox/process.hpp>
 #include <gromox/rop_util.hpp>
@@ -169,10 +170,9 @@ unsigned int g_midb_cache_interval, g_midb_reload_interval;
 
 static constexpr time_duration DB_LOCK_TIMEOUT = std::chrono::seconds(60);
 static size_t g_table_size;
-static gromox::atomic_bool g_notify_stop; /* stop signal for scanning thread */
+static gromox::atomic_bool g_midb_stop; /* stop signal for scanning thread */
 static pthread_t g_scan_tid;
 static char g_org_name[256];
-static char g_default_charset[32];
 static std::mutex g_hash_lock;
 static std::unordered_map<std::string, IDB_ITEM> g_hash_table;
 
@@ -1549,7 +1549,7 @@ static BOOL me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id) try
 	if (stm_upd_msg == nullptr)
 		return FALSE;
 	for (const auto &[message_id, entry] : syncmessagelist) {
-		if (g_notify_stop)
+		if (g_midb_stop)
 			break;
 		stm_select_msg.reset();
 		stm_select_msg.bind_int64(1, message_id);
@@ -1568,7 +1568,7 @@ static BOOL me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id) try
 			mlog(LV_NOTICE, "sync_contents %s fld %llu progress: %zu/%zu",
 			        dir, LLU{folder_id}, procmsgs, totalmsgs);
 	}
-	if (g_notify_stop)
+	if (g_midb_stop)
 		return true;
 	if (procmsgs > 512)
 		/* display final value */
@@ -1764,7 +1764,7 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 	if (stm_insert == nullptr)
 		return false;
 	for (const auto &[folder_id, entry] : syncfolderlist) {
-		if (g_notify_stop)
+		if (g_midb_stop)
 			break;
 		switch (me_get_top_folder_id(syncfolderlist, folder_id)) {
 		case PRIVATE_FID_OUTBOX:
@@ -1822,7 +1822,7 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 			gx_sql_exec(pidb->psqlite, qstr.c_str());
 		}
 	}
-	if (g_notify_stop)
+	if (g_midb_stop)
 		return true;
 	stm_select.finalize();
 	stm_insert.finalize();
@@ -2015,7 +2015,7 @@ static void *midbme_scanwork(void *param)
 	int count;
 
 	count = 0;
-	while (!g_notify_stop) {
+	while (!g_midb_stop) {
 		std::vector<std::pair<std::string, uint32_t>> unsub_list;
 		sleep(1);
 		if (count < 10) {
@@ -2172,16 +2172,7 @@ static int me_minst(int argc, char **argv, int sockd) try
 	unsigned int user_id = 0;
 	if (!mysql_adaptor_get_user_ids(pidb->username.c_str(), &user_id, nullptr, nullptr))
 		return MIDB_E_SSGETID;
-	sql_meta_result mres;
-	auto mret = mysql_adaptor_meta(pidb->username.c_str(),
-	            WANTPRIV_METAONLY, mres);
-	auto charset = mret == 0 ? lang_to_charset(mres.lang.c_str()) : nullptr;
-	if (*znul(charset) == '\0')
-		charset = g_default_charset;
-	auto tmzone = mret == 0 ? mres.timezone.c_str() : nullptr;
-	if (*znul(tmzone) == '\0')
-		tmzone = GROMOX_FALLBACK_TIMEZONE;
-	auto pmsgctnt = oxcmail_import(charset, tmzone, &imail,
+	auto pmsgctnt = oxcmail_import(&imail,
 	                cu_alloc_bytes, cu_get_propids_create);
 	imail.clear();
 	pbuff.clear();
@@ -2248,12 +2239,9 @@ static int me_minst(int argc, char **argv, int sockd) try
 	if (newval == nullptr ||
 	    pmsgctnt->proplist.set(PR_PREDECESSOR_CHANGE_LIST, newval) != ecSuccess)
 		return MIDB_E_NO_MEMORY;
-	auto cpid = cset_to_cpid(charset);
-	if (cpid == CP_ACP)
-		cpid = static_cast<cpid_t>(1252);
 	ec_error_t e_result = ecRpcFailed;
 	uint64_t outmid = 0, outcn = 0;
-	if (!exmdb_client->write_message(argv[1], cpid,
+	if (!exmdb_client->write_message(argv[1], CP_ACP,
 	    rop_util_make_eid_ex(1, folder_id), pmsgctnt, djson.c_str(),
 	    &outmid, &outcn, &e_result) || e_result != ecSuccess)
 		return MIDB_E_MDB_WRITEMESSAGE;
@@ -2277,7 +2265,7 @@ static int me_mdele(int argc, char **argv, int sockd)
 	EID_ARRAY message_ids;
 
 	message_ids.count = 0;
-	message_ids.pids = cu_alloc<uint64_t>(argc - 3);
+	message_ids.pids = cu_alloc<eid_t>(argc - 3);
 	if (message_ids.pids == nullptr)
 		return MIDB_E_NO_MEMORY;
 	auto pidb = me_get_idb(argv[1]);
@@ -2707,7 +2695,7 @@ static int me_pfddt(int argc, char **argv, int sockd)
 	size_t recents = pstmt.step() == SQLITE_ROW ? pstmt.col_uint64(0) : 0;
 	pstmt.finalize();
 	pidb.reset();
-	auto temp_len = sprintf(temp_buff, "TRUE %zu %zu %zu %llu %llu\r\n",
+	auto temp_len = snprintf(temp_buff, std::size(temp_buff), "TRUE %zu %zu %zu %llu %llu\r\n",
 	                total, recents, unreads, LLU{folder_id},
 	                LLU{uidnext + 1});
 	return cmd_write(sockd, temp_buff, temp_len);
@@ -3991,7 +3979,7 @@ static void notif_handler(const char *dir,
 
 	switch (pdb_notify->type) {
 	case db_notify_type::folder_created: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_CREATED *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_CREATED>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		parent_id = n->parent_id;
 		if (g_cmd_debug >= 2)
@@ -4001,7 +3989,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::message_created: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_CREATED *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_CREATED>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		message_id = n->message_id;
 		if (g_cmd_debug >= 2)
@@ -4011,7 +3999,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::folder_deleted: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_DELETED *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_DELETED>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		if (g_cmd_debug >= 2)
 			mlog(LV_DEBUG, "midb-async: %s fld-del f%llu",
@@ -4020,7 +4008,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::message_deleted: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_DELETED *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_DELETED>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		message_id = n->message_id;
 		if (g_cmd_debug >= 2)
@@ -4041,7 +4029,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::folder_modified: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_MODIFIED *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MODIFIED>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		if (g_cmd_debug >= 2)
 			mlog(LV_DEBUG, "midb-async: %s fld-mod f%llu",
@@ -4050,7 +4038,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::message_modified: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_MODIFIED *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MODIFIED>(&pdb_notify->pdata);
 		message_id = n->message_id;
 		folder_id = n->folder_id;
 		if (g_cmd_debug >= 2)
@@ -4059,7 +4047,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::folder_moved: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_MVCP *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MVCP>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		parent_id = n->parent_id;
 		if (g_cmd_debug >= 2)
@@ -4069,7 +4057,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::message_moved: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_MVCP *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP>(&pdb_notify->pdata);
 		folder_id = n->old_folder_id;
 		message_id = n->old_message_id;
 		if (g_cmd_debug >= 2)
@@ -4090,7 +4078,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::folder_copied: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_MVCP *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MVCP>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		parent_id = n->parent_id;
 		if (g_cmd_debug >= 2)
@@ -4101,7 +4089,7 @@ static void notif_handler(const char *dir,
 		break;
 	}
 	case db_notify_type::message_copied: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_MVCP *>(pdb_notify->pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP>(&pdb_notify->pdata);
 		folder_id = n->folder_id;
 		message_id = n->message_id;
 		if (g_cmd_debug >= 2)
@@ -4137,10 +4125,9 @@ static void notif_handler(const char *dir,
 	mlog(LV_ERR, "E-2346: ENOMEM");
 }
 
-void me_init(const char *default_charset, const char *org_name,
+void me_init(const char *org_name,
     size_t table_size)
 {
-	gx_strlcpy(g_default_charset, default_charset, std::size(g_default_charset));
 	gx_strlcpy(g_org_name, org_name, std::size(g_org_name));
 	g_table_size = table_size;
 }
@@ -4188,7 +4175,7 @@ int me_run()
 		mlog(LV_ERR, "mail_engine: failed to init oxcmail library");
 		return -1;
 	}
-	g_notify_stop = false;
+	g_midb_stop = false;
 	auto ret = pthread_create4(&g_scan_tid, nullptr, midbme_scanwork, nullptr);
 	if (ret != 0) {
 		mlog(LV_ERR, "mail_engine: failed to create scan thread: %s", strerror(ret));
@@ -4203,7 +4190,7 @@ int me_run()
 
 void me_stop()
 {
-	g_notify_stop = true;
+	g_midb_stop = true;
 	if (!pthread_equal(g_scan_tid, {})) {
 		pthread_kill(g_scan_tid, SIGALRM);
 		pthread_join(g_scan_tid, NULL);

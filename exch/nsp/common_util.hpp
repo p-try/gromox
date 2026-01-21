@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <gromox/common_types.hpp>
 #include <gromox/proc_common.h>
 #include "nsp_types.hpp"
@@ -46,8 +48,9 @@ enum {
 
 extern GUID common_util_get_server_guid();
 void common_util_day_to_filetime(const char *str, FILETIME *pftime);
-extern int cu_utf8_to_mb(cpid_t, const char *src, char *dst, size_t len);
-extern int cu_mb_to_utf8(cpid_t, const char *src, char *dst, size_t len);
+extern char *cu_strdup(std::string_view, unsigned int = NDR_STACK_OUT);
+extern char *cu_utf8_to_mb_dup(cpid_t, std::string_view, unsigned int = NDR_STACK_OUT);
+extern char *cu_mb_to_utf8_dup(cpid_t, std::string_view, unsigned int = NDR_STACK_OUT);
 void common_util_set_ephemeralentryid(uint32_t display_type,
 	uint32_t minid, EPHEMERAL_ENTRYID *pephid);
 extern bool common_util_set_permanententryid(uint32_t display_type, const GUID *in, const char *dn, EMSAB_ENTRYID_manual *out);
@@ -57,10 +60,11 @@ extern NSP_ROWSET *common_util_proprowset_init();
 NSP_PROPROW* common_util_proprowset_enlarge(NSP_ROWSET *pset);
 NSP_PROPROW* common_util_propertyrow_init(NSP_PROPROW *prow);
 PROPERTY_VALUE* common_util_propertyrow_enlarge(NSP_PROPROW *prow);
-extern LPROPTAG_ARRAY *common_util_proptagarray_init();
-uint32_t* common_util_proptagarray_enlarge(LPROPTAG_ARRAY *pproptags);
+extern std::string cu_cvt_str(std::string_view sv, cpid_t cpid, bool to_utf8);
 BOOL common_util_load_file(const char *path, BINARY *pbin);
 extern int common_util_run();
 
 extern BOOL (*get_named_propids)(const char *dir, BOOL create, const PROPNAME_ARRAY *, PROPID_ARRAY *);
 extern BOOL (*get_store_properties)(const char *dir, cpid_t, const PROPTAG_ARRAY *, TPROPVAL_ARRAY *);
+extern BOOL (*read_delegates)(const char *dir, uint32_t mode, std::vector<std::string> *);
+extern BOOL (*write_delegates)(const char *dir, uint32_t mode, const std::vector<std::string> &);

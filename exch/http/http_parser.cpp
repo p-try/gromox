@@ -341,6 +341,7 @@ int http_parser::run()
 
 void http_parser_stop()
 {
+	g_parser->g_async_stop = true;
 	g_parser.reset();
 }
 
@@ -777,7 +778,7 @@ tproc_status http_parser::rdhead_mt(http_context *pcontext, char *line,
 	} else if (0 == strcasecmp(field_name, "Cookie")) {
 		auto &j = pcontext->request.f_cookie;
 		if (!j.empty())
-			j += ", ";
+			j += "; ";
 		j.append(ptoken, tmp_len);
 	} else if (g_http_remote_host_hdr.size() > 0 &&
 	    strcasecmp(field_name, g_http_remote_host_hdr.c_str()) == 0) {
@@ -2224,14 +2225,10 @@ tproc_status http_parser_process(schedule_context *vcontext)
 	return g_parser->http_end(pcontext);
 }
 
-void http_parser_shutdown_async()
-{
-	g_parser->g_async_stop = true;
-}
-
 void http_parser_vconnection_async_reply(const char *host,
 	int port, const char *connection_cookie, DCERPC_CALL *pcall)
 {
+	/* called from aemsi_thrwork */
 	g_parser->vconnection_async_reply(host, port, connection_cookie, pcall);
 }
 
@@ -2497,7 +2494,7 @@ BOOL http_context::recycle_inchannel(const char *predecessor_cookie)
 	hch->client_keepalive = ich->client_keepalive;
 	hch->available_window = ich->available_window;
 	hch->bytes_received = ich->bytes_received;
-	strcpy(hch->assoc_group_id, ich->assoc_group_id);
+	gx_strlcpy(hch->assoc_group_id, ich->assoc_group_id, std::size(hch->assoc_group_id));
 	pvconnection->pcontext_insucc = pcontext;
 	return TRUE;
 }

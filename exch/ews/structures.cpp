@@ -1840,7 +1840,8 @@ tFreeBusyView::tFreeBusyView(const char *username, const char *dir,
     time_t start_time, time_t end_time)
 {
 	std::vector<freebusy_event> fb_data;
-	if (!get_freebusy(username, dir, start_time, end_time, fb_data))
+	auto err = get_freebusy(username, dir, start_time, end_time, fb_data);
+	if (err != ecSuccess)
 		throw EWSError::FreeBusyGenerationFailed(E3144);
 
 	FreeBusyViewType = std::all_of(fb_data.begin(), fb_data.end(),
@@ -3183,6 +3184,7 @@ decltype(tFieldURI::tagMap) tFieldURI::tagMap = {
 	{"folder:DisplayName", PR_DISPLAY_NAME},
 	{"folder:FolderClass", PR_CONTAINER_CLASS},
 	{"folder:FolderId", PidTagFolderId},
+	{"folder:ManagedFolderInformation", PR_FOLDER_TYPE},
 	{"folder:ParentFolderId", PR_PARENT_ENTRYID},
 	{"folder:TotalCount", PR_CONTENT_COUNT},
 	{"folder:UnreadCount", PR_CONTENT_UNREAD},
@@ -3615,9 +3617,9 @@ void tItem::update(const sShape& shape)
 		const cpid_t* cpid = shape.get<cpid_t>(PR_INTERNET_CPID, sShape::FL_ANY);
 		const char* cset;
 		if (cpid && *cpid != CP_UTF8 && (cset = cpid_to_cset(*cpid)))
-			Body.emplace(iconvtext(content->pc, content->cb, cset, "UTF-8"), Enum::HTML);
+			Body.emplace(iconvtext(*content, cset, "UTF-8"), Enum::HTML);
 		else
-			Body.emplace(std::string_view(content->pc, content->cb), Enum::HTML);
+			Body.emplace(*content, Enum::HTML);
 	} else if (bodyText) {
 		Body.emplace(reinterpret_cast<const char*>(bodyText->pvalue), Enum::Text);
 	} else if (shape.requested(PR_BODY) || shape.requested(PR_HTML)) {

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021-2024 grommunio GmbH
+// SPDX-FileCopyrightText: 2021-2025 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
-#include <iconv.h>
+#include <string>
+#include <string_view>
 #include <unistd.h>
 #include <libHX/endian.h>
 #include <sys/stat.h>
@@ -26,6 +27,8 @@ static constexpr unsigned int SR_GROW_NSP_PROPROW = 40, SR_GROW_NSP_ROWSET = 100
 static GUID g_server_guid;
 decltype(get_named_propids) get_named_propids;
 decltype(get_store_properties) get_store_properties;
+decltype(read_delegates) read_delegates;
+decltype(write_delegates) write_delegates;
 
 GUID common_util_get_server_guid()
 {
@@ -39,59 +42,6 @@ void common_util_day_to_filetime(const char *day, FILETIME *pftime)
 	pftime->high_datetime = file_time >> 32;
 }
 
-int cu_utf8_to_mb(cpid_t codepage, const char *src, char *dst, size_t len)
-{
-	size_t in_len;
-	size_t out_len;
-	iconv_t conv_id;
-	
-	auto charset = cpid_to_cset(codepage);
-	if (charset == nullptr)
-		return -1;
-	conv_id = iconv_open(charset, "UTF-8");
-	if (conv_id == (iconv_t)-1)
-		return -1;
-	auto pin = deconst(src);
-	auto pout = dst;
-	in_len = strlen(src) + 1;
-	memset(dst, 0, len);
-	out_len = len;
-	if (iconv(conv_id, &pin, &in_len, &pout, &len) == static_cast<size_t>(-1)) {
-		iconv_close(conv_id);
-		return -1;
-	} else {
-		iconv_close(conv_id);
-		return out_len - len;
-	}
-}
-
-int cu_mb_to_utf8(cpid_t codepage, const char *src, char *dst, size_t len)
-{
-	size_t in_len;
-	size_t out_len;
-	iconv_t conv_id;
-	
-	cpid_cstr_compatible(codepage);
-	auto charset = cpid_to_cset(codepage);
-	if (charset == nullptr)
-		return -1;
-	conv_id = iconv_open("UTF-8", charset);
-	if (conv_id == (iconv_t)-1)
-		return -1;
-	auto pin = deconst(src);
-	auto pout = dst;
-	in_len = strlen(src) + 1;
-	memset(dst, 0, len);
-	out_len = len;
-	if (iconv(conv_id, &pin, &in_len, &pout, &len) == static_cast<size_t>(-1)) {
-		iconv_close(conv_id);
-		return -1;
-	} else {
-		iconv_close(conv_id);
-		return out_len - len;
-	}
-}
-
 void common_util_set_ephemeralentryid(uint32_t display_type,
 	uint32_t minid, EPHEMERAL_ENTRYID *pephid)
 {
@@ -100,10 +50,44 @@ void common_util_set_ephemeralentryid(uint32_t display_type,
 	pephid->mid = minid;
 }
 
+char *cu_strdup(std::string_view sv, unsigned int dir)
+{
+	auto out = ndr_stack_anew<char>(dir, sv.size() + 1);
+	if (out != nullptr) {
+		memcpy(out, sv.data(), sv.size());
+		out[sv.size()] = '\0';
+	}
+	return out;
+}
+
+std::string cu_cvt_str(std::string_view sv, cpid_t cpid, bool to_utf8) try
+{
+	auto cset = cpid_to_cset(cpid);
+	if (cset == nullptr) {
+		errno = EINVAL;
+		return {};
+	}
+	return iconvtext(sv, to_utf8 ? cset : "UTF-8", to_utf8 ? "UTF-8" : cset);
+} catch (const std::bad_alloc &) {
+	errno = ENOMEM;
+	return {};
+}
+
+char *cu_mb_to_utf8_dup(cpid_t cpid, std::string_view sv, unsigned int ndr)
+{
+	auto cvt = cu_cvt_str(std::move(sv), cpid, true);
+	return errno == 0 ? cu_strdup(cvt, ndr) : nullptr;
+}
+
+char *cu_utf8_to_mb_dup(cpid_t cpid, std::string_view sv, unsigned int ndr)
+{
+	auto cvt = cu_cvt_str(std::move(sv), cpid, false);
+	return errno == 0 ? cu_strdup(cvt, ndr) : nullptr;
+}
+
 bool common_util_set_permanententryid(unsigned int display_type,
     const GUID *pobj_guid, const char *pdn, EMSAB_ENTRYID_manual *ppermeid)
 {
-	int len;
 	char buff[128];
 	
 	ppermeid->flags = ENTRYID_TYPE_PERMANENT;
@@ -116,18 +100,14 @@ bool common_util_set_permanententryid(unsigned int display_type,
 			memcpy(buff, "/guid=", 6);
 			pobj_guid->to_str(&buff[6], 32);
 			buff[38] = '\0';
-			len = 38;
-			ppermeid->px500dn = ndr_stack_anew<char>(NDR_STACK_OUT, len + 1);
+			ppermeid->px500dn = cu_strdup({buff, 38}, NDR_STACK_OUT);
 			if (ppermeid->px500dn == nullptr)
 				return FALSE;
-			memcpy(ppermeid->px500dn, buff, len + 1);
 		}
 	}  else {
-		len = strlen(pdn);
-		ppermeid->px500dn = ndr_stack_anew<char>(NDR_STACK_OUT, len + 1);
+		ppermeid->px500dn = cu_strdup(pdn, NDR_STACK_OUT);
 		if (ppermeid->px500dn == nullptr)
 			return FALSE;
-		memcpy(ppermeid->px500dn, pdn, len + 1);
 	}
 	return TRUE;
 }
@@ -230,36 +210,6 @@ PROPERTY_VALUE* common_util_propertyrow_enlarge(NSP_PROPROW *prow)
 	}
 	prow->cvalues ++;
 	return &prow->pprops[prow->cvalues - 1]; 
-}
-
-LPROPTAG_ARRAY* common_util_proptagarray_init()
-{
-	auto pproptags = ndr_stack_anew<LPROPTAG_ARRAY>(NDR_STACK_OUT);
-	if (pproptags == nullptr)
-		return NULL;
-	memset(pproptags, 0, sizeof(LPROPTAG_ARRAY));
-	auto count = strange_roundup(pproptags->cvalues, SR_GROW_PROPTAG_ARRAY);
-	pproptags->pproptag = ndr_stack_anew<uint32_t>(NDR_STACK_OUT, count);
-	if (pproptags->pproptag == nullptr)
-		return NULL;
-	return pproptags;
-}
-
-uint32_t* common_util_proptagarray_enlarge(LPROPTAG_ARRAY *pproptags)
-{
-	uint32_t *pproptag;
-	auto count = strange_roundup(pproptags->cvalues, SR_GROW_PROPTAG_ARRAY);
-	if (pproptags->cvalues + 1 >= count) {
-		count += SR_GROW_PROPTAG_ARRAY;
-		pproptag = ndr_stack_anew<uint32_t>(NDR_STACK_OUT, count);
-		if (pproptag == nullptr)
-			return NULL;
-		memcpy(pproptag, pproptags->pproptag,
-			sizeof(uint32_t)*pproptags->cvalues);
-		pproptags->pproptag = pproptag;
-	}
-	pproptags->cvalues ++;
-	return &pproptags->pproptag[pproptags->cvalues - 1]; 
 }
 
 BOOL common_util_load_file(const char *path, BINARY *pbin)

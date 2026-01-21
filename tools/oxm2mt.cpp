@@ -171,15 +171,13 @@ static int ptesv_to_prop(const struct pte &pte, const char *cset,
 	case PT_STRING8: {
 		if (pte.v_ui4 != blob->cb + 1)
 			return -EIO;
-		auto s = iconvtext(blob->pc, blob->cb, cset, "UTF-8//IGNORE");
-		if (errno != 0)
-			return -errno;
+		auto s = iconvtext(*blob, cset, "UTF-8");
 		return ece2nerrno(proplist.set(pte.proptag, s.data()));
 	}
 	case PT_UNICODE: {
 		if (pte.v_ui4 != blob->cb + 2)
 			return -EIO;
-		auto s = iconvtext(blob->pc, blob->cb, "UTF-16", "UTF-8//IGNORE");
+		auto s = iconvtext(*blob, "UTF-16", "UTF-8");
 		if (errno != 0)
 			return -errno;
 		return ece2nerrno(proplist.set(pte.proptag, s.data()));
@@ -282,10 +280,7 @@ static int ptemvs_to_prop(const struct pte &pte, const char *cset,
 		else if (static_cast<unsigned int>(ret) != strm_size)
 			throw YError("PO-1017");
 
-		if (PROP_TYPE(pte.proptag) == PT_MV_STRING8)
-			rdbuf = iconvtext(rdbuf.c_str(), strm_size, cset, "UTF-8//IGNORE");
-		else
-			rdbuf = iconvtext(rdbuf.c_str(), strm_size, "UTF-16", "UTF-8//IGNORE");
+		rdbuf = iconvtext(rdbuf, PROP_TYPE(pte.proptag) == PT_MV_STRING8 ? cset : "UTF-16", "UTF-8");
 		if (errno != 0)
 			return -errno;
 		strs[i] = std::move(rdbuf);
@@ -513,7 +508,7 @@ static int npg_read(libolecf_item_t *root)
 			wbuf.resize(len);
 			if (sp.g_bytes(wbuf.data(), len) != pack_result::ok)
 				return -EIO;
-			pn_req.name = iconvtext(wbuf.data(), len, "UTF-16", "UTF-8//IGNORE");
+			pn_req.name = iconvtext(wbuf, "UTF-16", "UTF-8");
 			if (errno != 0)
 				return -errno;
 		}
@@ -582,7 +577,7 @@ static errno_t do_file(const char *filename) try
 			return ret;
 	}
 
-	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0004", 8) < 0)
+	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0005", 8) < 0)
 		throw YError("PG-1014: %s", strerror(errno));
 	uint8_t flag = false;
 	if (HXio_fullwrite(STDOUT_FILENO, &flag, sizeof(flag)) < 0) /* splice flag */
@@ -608,7 +603,7 @@ static errno_t do_file(const char *filename) try
 		return EXIT_FAILURE;
 	}
 	if (ep.p_uint32(static_cast<uint32_t>(MAPI_MESSAGE)) != pack_result::ok ||
-	    ep.p_uint32(1) != pack_result::ok ||
+	    ep.p_uint64(1) != pack_result::ok ||
 	    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
 	    ep.p_uint64(parent.folder_id) != pack_result::ok ||
 	    ep.p_msgctnt(*ctnt) != pack_result::ok ||

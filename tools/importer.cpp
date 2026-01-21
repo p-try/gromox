@@ -37,7 +37,7 @@ namespace {
 
 struct ob_desc {
 	enum mapi_object_type mapitype = MAPI_STORE;
-	uint32_t nid = 0;
+	uint64_t nid = 0;
 	parent_desc parent;
 };
 
@@ -100,11 +100,11 @@ static void validate_magic(const char *magic)
 	if (memcmp(magic, "GXMT", 4) != 0 || !HX_isdigit(magic[4]) ||
 	    !HX_isdigit(magic[5]) || !HX_isdigit(magic[6]) ||
 	    !HX_isdigit(magic[7]))
-		throw YError("PG-1127: Unrecognized input format. GXMT0004 file signature is missing.");
-	if (memcmp(&magic[4], "0004", 4) == 0)
+		throw YError("PG-1127: Unrecognized input format. GXMT0005 file signature is missing.");
+	if (memcmp(&magic[4], "0005", 4) == 0)
 		return;
 	throw YError("PG-1127: Input is from an unsupported version. "
-		"Observed signature \"%.8s\", but only \"GXMT0004\" is understood.", magic);
+		"Observed signature \"%.8s\", but only \"GXMT0005\" is understood.", magic);
 }
 
 static int exm_read_base_maps()
@@ -185,6 +185,8 @@ static void exm_adjust_staticprops(TPROPVAL_ARRAY &props)
 
 static void exm_adjust_namedprops(TPROPVAL_ARRAY &props)
 {
+	if (g_username == nullptr)
+		return;
 	for (size_t i = 0; i < props.count; ++i) {
 		auto old_tag = props.ppropval[i].proptag;
 		if (!is_nameprop_id(PROP_ID(old_tag)))
@@ -198,7 +200,7 @@ static void exm_adjust_namedprops(TPROPVAL_ARRAY &props)
 		if (name_iter == g_src_name_map.end())
 			name_iter = g_src_name_map.find(CHANGE_PROP_TYPE(old_tag, PT_UNSPECIFIED));
 		if (name_iter == g_src_name_map.end()) {
-			fprintf(stderr, "mt2exm: broken input stream does not specify namedpropinfo for tag %xh.\n", old_tag);
+			fprintf(stderr, "gromox-import: broken input stream does not specify namedpropinfo for tag %xh.\n", old_tag);
 			continue;
 		}
 		auto new_id = gi_resolve_namedprop(name_iter->second);
@@ -307,13 +309,17 @@ static int exm_folder(const ob_desc &obd, TPROPVAL_ARRAY &props,
     const std::vector<PERMISSION_DATA> &perms)
 {
 	if (g_show_tree) {
-		printf("exm: Folder %lxh (parent=%llxh)\n",
-			static_cast<unsigned long>(obd.nid),
-			static_cast<unsigned long long>(obd.parent.folder_id));
+		fprintf(stderr, "exm: Folder %llxh (parent=%llxh)\n",
+			LLU{obd.nid}, LLU{obd.parent.folder_id});
 		if (g_show_props)
 			gi_print(0, props, ee_get_propname);
 	}
+	if (g_username == nullptr) {
+		g_folder_map.try_emplace(obd.nid, tgt_folder{false, obd.nid});
+		return 0;
+	}
 	exm_folder_adjust(props);
+	props.erase(PidTagFolderId);
 
 	auto current_it  = g_folder_map.find(obd.nid);
 	auto parent_it   = g_folder_map.find(obd.parent.folder_id);
@@ -329,15 +335,12 @@ static int exm_folder(const ob_desc &obd, TPROPVAL_ARRAY &props,
 		auto ret = exm_create_folder(current_it->second.fid_to,
 			   &props, g_oexcl, &new_fid);
 		if (ret < 0) {
-			fprintf(stderr, "exm: folder for input object %lxh could not be created\n",
-			        static_cast<unsigned long>(obd.nid));
+			fprintf(stderr, "exm: folder for input object %llxh could not be created\n", LLU{obd.nid});
 			return ret;
 		}
 		if (new_fid != 0) {
 			if (g_show_tree)
-				fprintf(stderr, "Updated mapping {%lxh -> %llxh}\n",
-				        static_cast<unsigned long>(obd.nid),
-				        static_cast<unsigned long long>(new_fid));
+				fprintf(stderr, "Updated mapping {%llxh -> %llxh}\n", LLU{obd.nid}, LLU{new_fid});
 			current_it->second.create = false;
 			current_it->second.fid_to = new_fid;
 		}
@@ -360,22 +363,19 @@ static int exm_folder(const ob_desc &obd, TPROPVAL_ARRAY &props,
 		auto ret = exm_create_folder(parent_it->second.fid_to,
 			   &props, !g_splice && g_oexcl, &new_fid);
 		if (ret < 0) {
-			fprintf(stderr, "exm: folder for input object %lxh could not be created\n",
-			        static_cast<unsigned long>(obd.nid));
+			fprintf(stderr, "exm: folder for input object %llxh could not be created\n", LLU{obd.nid});
 			return ret;
 		}
 		if (new_fid != 0) {
 			/* Make subobjects (seen later) to take exm_folder case #3/exm_messages case #n. */
 			if (g_show_tree)
-				fprintf(stderr, "exm: Learned new folder {%lxh -> %llxh}\n",
-				        static_cast<unsigned long>(obd.nid),
-				        static_cast<unsigned long long>(new_fid));
+				fprintf(stderr, "exm: Learned new folder {%llxh -> %llxh}\n",
+					LLU{obd.nid}, LLU{new_fid});
 			g_folder_map.try_emplace(obd.nid, tgt_folder{false, new_fid});
 		}
 		return exm_permissions(new_fid, perms);
 	}
-	fprintf(stderr, "exm: No known placement method for NID %lxh, skipping.\n",
-	        static_cast<unsigned long>(obd.nid));
+	fprintf(stderr, "exm: No known placement method for NID %llxh, skipping.\n", LLU{obd.nid});
 	return 0;
 }
 
@@ -526,12 +526,11 @@ static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt,
     const std::string &im_repr)
 {
 	if (g_show_tree) {
-		printf("exm: Message %lxh (parent=%llxh)",
-			static_cast<unsigned long>(obd.nid),
-			static_cast<unsigned long long>(obd.parent.folder_id));
+		fprintf(stderr, "exm: Message %llxh (parent=%llxh)",
+			LLU{obd.nid}, LLU{obd.parent.folder_id});
 		if (im_repr.size() > 0)
-			printf(" [RFC5322: %zu bytes]", im_repr.size());
-		printf("\n");
+			fprintf(stderr, " [RFC5322: %zu bytes]", im_repr.size());
+		fprintf(stderr, "\n");
 	}
 	if (g_show_tree && g_show_props)
 		gi_print(0, ctnt, ee_get_propname);
@@ -542,11 +541,14 @@ static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt,
 		return 0;
 	}
 	exm_adjust_propids(ctnt);
+	ctnt.proplist.erase(PidTagMid);
 	if (g_show_tree && g_show_props) {
 		tree(0);
 		tlog("adjusted properties:\n");
 		gi_print(0, ctnt, ee_get_propname);
 	}
+	if (g_username == nullptr)
+		return 0;
 
 	Json::Value digest;
 	if (im_repr.size() > 0) {
@@ -565,7 +567,7 @@ static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt,
 	if (!g_do_delivery) {
 		for (auto i = 0U; i < g_repeat_iter; ++i) {
 			if (i > 0 && i % 1024 == 0)
-				fprintf(stderr, "mt2exm repeat %u/%u\n", i, g_repeat_iter);
+				fprintf(stderr, "importer repeat cycle %u/%u\n", i, g_repeat_iter);
 			auto ret = exm_create_msg(folder_it->second.fid_to,
 			           &ctnt, im_repr, digest);
 			if (ret != EXIT_SUCCESS)
@@ -586,7 +588,7 @@ static int exm_message(const ob_desc &obd, MESSAGE_CONTENT &ctnt,
 		mode |= DELIVERY_MRAUTOPROC;
 	for (auto i = 0U; i < g_repeat_iter; ++i) {
 		if (i > 0 && i % 1024 == 0)
-			fprintf(stderr, "mt2exm repeat %u/%u\n", i, g_repeat_iter);
+			fprintf(stderr, "importer repeat cycle %u/%u\n", i, g_repeat_iter);
 		auto ret = exm_deliver_msg(g_username, &ctnt, im_repr,
 		           digest, mode);
 		if (ret != EXIT_SUCCESS)
@@ -602,7 +604,7 @@ static int exm_packet(const void *buf, size_t bufsize)
 	ob_desc obd;
 	uint32_t type = 0, parent_type = 0;
 	if (ep.g_uint32(&type) != pack_result::ok ||
-	    ep.g_uint32(&obd.nid) != pack_result::ok)
+	    ep.g_uint64(&obd.nid) != pack_result::ok)
 		throw YError("PG-1121");
 	if (ep.g_uint32(&parent_type) != pack_result::success ||
 	    ep.g_uint64(&obd.parent.folder_id) != pack_result::ok)
@@ -671,13 +673,6 @@ static void gi_dump_thru_map(const propididmap_t &map)
 		fprintf(stderr, "\t%04xh <-> %04xh\n", from, to);
 }
 
-static void terse_help()
-{
-	fprintf(stderr, "Usage: gromox-mt2exm -u target@mbox.de <stream.dump\n");
-	fprintf(stderr, "Option overview: gromox-mt2exm -?\n");
-	fprintf(stderr, "Documentation: man gromox-mt2exm\n");
-}
-
 int main(int argc, char **argv) try
 {
 	HXopt6_auto_result argp;
@@ -688,17 +683,15 @@ int main(int argc, char **argv) try
 	for (int i = 0; i < argp.nopts; ++i)
 		if (argp.desc[i]->sh == 'u')
 			g_username = argp.oarg[i];
-	if (g_username == nullptr) {
-		terse_help();
-		return EXIT_FAILURE;
-	}
+	if (g_username == nullptr)
+		fprintf(stderr, "No username (-u) was given. The importer will operate in read-only mode.\n");
 	mlog_init(nullptr, nullptr, g_mlog_level, nullptr);
 	if (g_continuous_mode)
 		fprintf(stderr, "Continuous mode has been selcted: On errors, the import will NOT abort\n");
 	if (g_twostep)
 		g_do_delivery = true;
 	if (g_do_delivery && g_anchor_folder != 0)
-		fprintf(stderr, "mt2exm: -B option has no effect when -D is used\n");
+		fprintf(stderr, "gromox-import: -B option has no effect when -D is used\n");
 	if (iconv_validate() != 0)
 		return EXIT_FAILURE;
 	service_init({nullptr, g_dfl_svc_plugins, 1});
@@ -708,7 +701,7 @@ int main(int argc, char **argv) try
 		return EXIT_FAILURE;
 	}
 	textmaps_init(PKGDATADIR);
-	if (gi_setup_from_user(g_username) != EXIT_SUCCESS)
+	if (g_username != nullptr && gi_setup_from_user(g_username) != EXIT_SUCCESS)
 		return EXIT_FAILURE;
 	if (gi_startup_client() != EXIT_SUCCESS)
 		return EXIT_FAILURE;
@@ -716,7 +709,7 @@ int main(int argc, char **argv) try
 	if (g_anchor_folder_str == nullptr) {
 		g_anchor_folder = PRIVATE_FID_DRAFT;
 	} else {
-		g_anchor_folder = rop_util_get_gc_value(gi_lookup_eid_by_name(g_storedir, g_anchor_folder_str));
+		g_anchor_folder = rop_util_get_gc_value(gi_lookup_eid_any_way(g_storedir, g_anchor_folder_str));
 		if (g_anchor_folder == 0) {
 			fprintf(stderr, "Folder not recognized/found: \"%s\"\n", g_anchor_folder_str);
 			return EXIT_FAILURE;
@@ -748,6 +741,6 @@ int main(int argc, char **argv) try
 	gi_dump_thru_map(g_thru_name_map);
 	return iret;
 } catch (const std::exception &e) {
-	fprintf(stderr, "mt2exm: Exception: %s\n", e.what());
+	fprintf(stderr, "gromox-import: Exception: %s\n", e.what());
 	return EXIT_FAILURE;
 }

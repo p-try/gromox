@@ -750,7 +750,7 @@ static ec_error_t op_copy_other(rxparam &par, const rule_node &rule,
 	/* Copy done, delete original message object */
 	EID_ARRAY del_mids{};
 	del_mids.count = 1;
-	del_mids.pids = reinterpret_cast<uint64_t *>(&par.cur.mid);
+	del_mids.pids  = &par.cur.mid;
 	BOOL partial = false;
 	if (!exmdb_client->delete_messages(par.cur.dirc(), CP_UTF8, nullptr,
 	    par.cur.fid, &del_mids, true, &partial))
@@ -998,10 +998,11 @@ static ec_error_t mr_insert_to_cal(rxparam &par, const PROPID_ARRAY &propids,
 	};
 	for (auto t : rmprops)
 		prop.erase(t);
-	static constexpr uint32_t v_busy = olBusy;
+	static constexpr uint32_t v_busy = olBusy, stateflags = asfMeeting | asfReceived;
 	ec_error_t err;
 	if ((err = prop.set(PROP_TAG(PT_LONG, propids[l_response_status]), &accept_type)) != ecSuccess ||
 	    (err = prop.set(PROP_TAG(PT_LONG, propids[l_busy_status]), &v_busy)) != ecSuccess ||
+	    (err = prop.set(PROP_TAG(PT_LONG, propids[l_appt_state_flags]), &stateflags)) != ecSuccess ||
 	    (err = prop.set(PR_MESSAGE_CLASS, "IPM.Appointment")) != ecSuccess)
 		return err;
 	uint64_t cal_mid = 0, cal_cn = 0;
@@ -1183,8 +1184,10 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 		auto end_ts   = rop_util_nttime_to_unix(*end_nt);
 		/* XXX: May need PR_SENDER rather than Envelope-From */
 		response_allowed = freebusy_perms(par.ev_from, par.cur.dirc()) != 0;
-		if (!get_freebusy(nullptr, par.cur.dirc(), start_ts, end_ts, fbdata))
-			mlog(LV_ERR, "W-PREC: cannot retrieve freebusy %s", par.cur.dirc());
+		auto err = get_freebusy(nullptr, par.cur.dirc(), start_ts, end_ts, fbdata);
+		if (err != ecSuccess)
+			mlog(LV_ERR, "W-PREC: cannot retrieve freebusy %s: %s",
+				par.cur.dirc(), mapi_strerror(err));
 
 		for (const freebusy_event &event : fbdata)
 			if ((event.start_time >= start_ts && event.start_time <= end_ts) ||
@@ -1207,7 +1210,7 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 	}
 
 	/* Enter meeting into calendar */
-	auto tent = policy.accept_appts ? respAccepted : respTentative;
+	auto tent = policy.accept_appts ? respAccepted : respNotResponded;
 	auto cal_fid = rop_util_make_eid_ex(1, PRIVATE_FID_CALENDAR);
 	auto err = mr_insert_to_cal(par, propids, cal_fid, tent);
 	if (err != ecSuccess)
@@ -1314,7 +1317,7 @@ ec_error_t rxparam::run()
 			break;
 	}
 	if (del) {
-		const EID_ARRAY ids = {1, reinterpret_cast<uint64_t *>(&cur.mid)};
+		const EID_ARRAY ids = {1, &cur.mid};
 		BOOL partial;
 		if (!exmdb_client->delete_messages(cur.dirc(), CP_ACP, nullptr,
 		    cur.fid, &ids, true/*hard*/, &partial))

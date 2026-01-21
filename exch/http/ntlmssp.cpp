@@ -317,19 +317,19 @@ static bool ntlmssp_calc_ntlm2_key(uint8_t subkey[MD5_DIGEST_LENGTH],
 
 static std::string ntlmssp_utf8_to_utf16le(std::string_view sv)
 {
-	return iconvtext(sv.data(), sv.size(), "UTF-8", "UTF-16LE");
+	return iconvtext(sv, "UTF-8", "UTF-16LE");
 }
 
 static std::string ntlmssp_utf16le_to_utf8(std::string_view sv)
 {
-	return iconvtext(sv.data(), sv.size(), "UTF-16LE", "UTF-8");
+	return iconvtext(sv, "UTF-16LE", "UTF-8");
 }
 
 static bool ntlmssp_md4hash(const char *passwd, void *p16v) try
 {
 	auto p16 = static_cast<uint8_t *>(p16v);
 	memset(p16, 0, MD4_DIGEST_LENGTH);
-	auto upasswd = iconvtext(passwd, strlen(passwd), "UTF-8", "UTF-16LE");
+	auto upasswd = iconvtext(passwd, "UTF-8", "UTF-16LE");
 	std::unique_ptr<EVP_MD_CTX, sslfree> ctx(EVP_MD_CTX_new());
 	if (ctx == nullptr ||
 	    EVP_DigestInit(ctx.get(), EVP_md4()) <= 0 ||
@@ -343,16 +343,8 @@ static bool ntlmssp_md4hash(const char *passwd, void *p16v) try
 
 static bool ntlmssp_deshash(const char *passwd, uint8_t p16[16])
 {
-	int len;
 	char tmpbuf[14];
-	
-	if (strlen(passwd) >= sizeof(tmpbuf)) {
-		len = sizeof(tmpbuf) - 1;
-		memcpy(tmpbuf, passwd, len);
-		tmpbuf[len] = '\0';
-	} else {
-		strcpy(tmpbuf, passwd);
-	}
+	gx_strlcpy(tmpbuf, passwd, std::size(tmpbuf));
 	HX_strupper(tmpbuf);
 	/* Only the first 14 chars are considered */
 	return E_P16(reinterpret_cast<uint8_t *>(tmpbuf), p16);

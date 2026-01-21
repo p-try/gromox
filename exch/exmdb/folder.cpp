@@ -1758,7 +1758,7 @@ BOOL exmdb_server::movecopy_folder(const char *dir, cpid_t cpid, BOOL b_guest,
 
 BOOL exmdb_server::get_search_criteria(const char *dir, uint64_t folder_id,
     uint32_t *psearch_status, RESTRICTION **pprestriction,
-    LONGLONG_ARRAY *pfolder_ids)
+    EID_ARRAY *pfolder_ids)
 {
 	char sql_string[256];
 	
@@ -1787,7 +1787,7 @@ BOOL exmdb_server::get_search_criteria(const char *dir, uint64_t folder_id,
 			*pprestriction = NULL;
 		if (NULL != pfolder_ids) {
 			pfolder_ids->count = 0;
-			pfolder_ids->pll = NULL;
+			pfolder_ids->pids  = nullptr;
 		}
 		return TRUE;
 	}
@@ -1802,13 +1802,19 @@ BOOL exmdb_server::get_search_criteria(const char *dir, uint64_t folder_id,
 			return FALSE;
 	}
 	pstmt.finalize();
+	std::vector<uint64_t> src_fo;
 	if (pfolder_ids != nullptr &&
-	    !common_util_load_search_scopes(pdb->psqlite, fid_val, pfolder_ids))
+	    !cu_load_search_scopes(pdb->psqlite, fid_val, src_fo))
 		return FALSE;
 	pdb.reset();
-	if (pfolder_ids != nullptr)
+	if (pfolder_ids != nullptr) {
+		pfolder_ids->count = 0;
+		pfolder_ids->pids = cu_alloc<eid_t>(src_fo.size());
+		if (pfolder_ids->pids == nullptr)
+			return false;
 		for (size_t i = 0; i < pfolder_ids->count; ++i)
-			pfolder_ids->pll[i] = rop_util_make_eid_ex(1, pfolder_ids->pll[i]);
+			pfolder_ids->pids[i] = rop_util_make_eid_ex(1, src_fo[i]);
+	}
 	*psearch_status = 0;
 	if (db_engine_check_populating(dir, fid_val))
 		*psearch_status |= SEARCH_REBUILD;
@@ -1851,14 +1857,13 @@ static BOOL folder_clear_search_folder(db_conn_ptr &pdb,
 
 BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
     uint64_t folder_id, uint32_t search_flags, const RESTRICTION *prestriction,
-    const LONGLONG_ARRAY *pfolder_ids, BOOL *pb_result) try
+    const EID_ARRAY *pfolder_ids, BOOL *pb_result) try
 {
 	EXT_PULL ext_pull;
 	EXT_PUSH ext_push;
 	char sql_string[128];
 	static constexpr size_t buff_size = 0x8000;
 	auto tmp_buff = std::make_unique<uint8_t[]>(buff_size);
-	LONGLONG_ARRAY folder_ids{};
 	
 	if (!exmdb_server::is_private())
 		return FALSE;
@@ -1871,7 +1876,7 @@ BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
 	auto fid_val = rop_util_get_gc_value(folder_id);
 	if (pfolder_ids->count > 0) {
 		for (size_t i = 0; i < pfolder_ids->count; ++i) {
-			auto fid_val1 = rop_util_get_gc_value(pfolder_ids->pll[i]);
+			auto fid_val1 = rop_util_get_gc_value(pfolder_ids->pids[i]);
 			BOOL b_included = false;
 			if (!cu_is_descendant_folder(pdb->psqlite, fid_val,
 			    fid_val1, &b_included))
@@ -1925,11 +1930,9 @@ BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
 			return false;
 		pstmt.finalize();
 	}
+
+	std::vector<uint64_t> scope_list;
 	if (pfolder_ids->count > 0) {
-		folder_ids.count = 0;
-		folder_ids.pll = cu_alloc<uint64_t>(pfolder_ids->count);
-		if (folder_ids.pll == nullptr)
-			return false;
 		snprintf(sql_string, std::size(sql_string), "DELETE FROM search_scopes"
 		        " WHERE folder_id=%llu", LLU{fid_val});
 		if (pdb->exec(sql_string) != SQLITE_OK)
@@ -1944,9 +1947,8 @@ BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
 		if (pstmt1 == nullptr)
 			return false;
 		for (size_t i = 0; i < pfolder_ids->count; ++i) {
-			folder_ids.pll[folder_ids.count] =
-				rop_util_get_gc_value(pfolder_ids->pll[i]);
-			sqlite3_bind_int64(pstmt1, 1, folder_ids.pll[folder_ids.count]);
+			auto &le_folder = scope_list.emplace_back(rop_util_get_gc_value(pfolder_ids->pids[i]));
+			pstmt1.bind_int64(1, le_folder);
 			if (pstmt1.step() != SQLITE_ROW)
 				return false;
 			if (0 == sqlite3_column_int64(pstmt1, 0)) {
@@ -1954,16 +1956,15 @@ BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
 				sqlite3_reset(pstmt1);
 				continue;
 			}
-			sqlite3_bind_int64(pstmt, 1, folder_ids.pll[folder_ids.count]);
+			pstmt.bind_int64(1, le_folder);
 			if (pstmt.step() != SQLITE_DONE)
 				return false;
 			sqlite3_reset(pstmt);
 			sqlite3_reset(pstmt1);
-			folder_ids.count ++;
 		}
 	} else {
 		if (original_flags == 0 ||
-		    !common_util_load_search_scopes(pdb->psqlite, fid_val, &folder_ids))
+		    !cu_load_search_scopes(pdb->psqlite, fid_val, scope_list))
 			return false;
 	}
 
@@ -1981,14 +1982,14 @@ BOOL exmdb_server::set_search_criteria(const char *dir, cpid_t cpid,
 	}
 	if (b_update)
 		pdb->update_dynamic(fid_val, search_flags,
-			prestriction, &folder_ids, *dbase);
+			prestriction, scope_list, *dbase);
 	else
 		pdb->delete_dynamic(fid_val, dbase.get());
 	if (sql_transact.commit() != SQLITE_OK)
 		return false;
 	pdb.reset();
 	if (b_populate && !db_engine_enqueue_populating_criteria(dir,
-	    cpid, fid_val, b_recursive, prestriction, &folder_ids))
+	    cpid, fid_val, b_recursive, prestriction, std::move(scope_list)))
 		return FALSE;
 	*pb_result = TRUE;
 	return TRUE;

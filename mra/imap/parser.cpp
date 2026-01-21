@@ -70,7 +70,7 @@ static size_t g_context_num;
 static time_duration g_timeout, g_autologout_time;
 static pthread_t g_thr_id;
 static pthread_t g_scan_id;
-static gromox::atomic_bool g_notify_stop;
+static gromox::atomic_bool g_parser_stop;
 static std::unique_ptr<imap_context[]> g_context_list;
 static std::vector<SCHEDULE_CONTEXT *> g_context_list2;
 static std::unordered_map<std::string, std::vector<imap_context *>> g_select_hash; /* username=>context */
@@ -93,7 +93,7 @@ void imap_parser_init(int context_num, int average_num,
 	g_block_auth_fail       = block_auth_fail;
 	g_support_tls       = support_tls;
 	g_ssl_mutex_buf = nullptr;
-	g_notify_stop = true;
+	g_parser_stop = true;
 	if (!support_tls)
 		return;
 	g_force_tls = force_tls;
@@ -188,18 +188,18 @@ int imap_parser_run()
         return -10;
     }
 
-	g_notify_stop = false;
+	g_parser_stop = false;
 	auto ret = pthread_create4(&g_thr_id, nullptr, imps_thrwork, nullptr);
 	if (ret != 0) {
 		mlog(LV_ERR, "imap_parser: failed to create sleeping list scanning thread: %s", strerror(ret));
-		g_notify_stop = true;
+		g_parser_stop = true;
 		return -11;
 	}
 	pthread_setname_np(g_thr_id, "parser/worker");
 	ret = pthread_create4(&g_scan_id, nullptr, imps_scanwork, nullptr);
 	if (ret != 0) {
 		mlog(LV_ERR, "Failed to create select hash scanning thread: %s", strerror(ret));
-		g_notify_stop = true;
+		g_parser_stop = true;
 		if (!pthread_equal(g_thr_id, {})) {
 			pthread_kill(g_thr_id, SIGALRM);
 			pthread_join(g_thr_id, nullptr);
@@ -214,8 +214,8 @@ int imap_parser_run()
 void imap_parser_stop()
 {
 	system_services_install_event_stub(nullptr);
-	if (!g_notify_stop) {
-		g_notify_stop = true;
+	if (!g_parser_stop) {
+		g_parser_stop = true;
 		if (!pthread_equal(g_thr_id, {}))
 			pthread_kill(g_thr_id, SIGALRM);
 		if (!pthread_equal(g_scan_id, {}))
@@ -563,9 +563,27 @@ static tproc_status ps_literal_processing(imap_context &ctx)
 }
 
 /**
+ * Returns a pair consisting of:
+ * - the position of the newline (unspecified value if not found),
+ * - number of bytes representing the newline (0 if none found)
+ */
+static std::pair<uint32_t, uint8_t> nl_detect(const char *base, uint32_t size)
+{
+	auto ptr = static_cast<const char *>(memchr(base, '\n', size));
+	if (ptr == nullptr)
+		return {0, 0};
+	size_t pos = ptr - base;
+	if (pos >= size)
+		return {0, 0};
+	if (pos == 0 || base[pos-1] != '\r')
+		return {pos, 1};
+	return {pos - 1, 2};
+}
+
+/**
  * This function tries to mark off a whole line (i.e. find the newline). If
  * none is there yet, ps_cmd_processing will soon be invoked again, with a
- * read_buffer that has been _appended_ to -- so we will see the same leading
+ * read_buffer that has been _appended_ to – so we will see the same leading
  * string in pcontext->read_buffer.
  *
  * The maximum line length is sizeof(read_buffer), i.e. 64K.
@@ -574,23 +592,31 @@ static tproc_status ps_literal_processing(imap_context &ctx)
 static tproc_status ps_cmd_processing(imap_context &ctx)
 {
 	auto pcontext = &ctx;
-	for (ssize_t i = 0; i < pcontext->read_offset; ++i) {
-		auto nl_len = newline_size(&pcontext->read_buffer[i], pcontext->read_offset - i);
+	while (true) {
+		auto [i, nl_len] = nl_detect(ctx.read_buffer, ctx.read_offset);
 		if (nl_len == 0)
-			continue;
-		if (i >= 64 * 1024 || pcontext->command_len + i >= 64 * 1024) {
+			break;
+		if (ctx.command_len + i >= std::size(ctx.command_buffer)) {
 			imap_parser_log_info(pcontext, LV_WARN, "error in command buffer length");
 			/* IMAP_CODE_2180017: BAD literal size too large */
 			size_t string_length = 0;
 			auto imap_reply_str = resource_get_imap_code(1817, 1, &string_length);
 			return ps_end_processing(pcontext, imap_reply_str, string_length);
 		}
+
+		/* Copy line to Command Buffer */
 		memcpy(pcontext->command_buffer + pcontext->command_len,
 		       pcontext->read_buffer, i);
 		pcontext->command_len += i;
 		pcontext->command_buffer[pcontext->command_len] = '\0';
+
+		/* Pop front off read_buffer for the sake of the next iteration. */
 		pcontext->read_offset -= i + nl_len;
 		if (pcontext->read_offset > 0 && pcontext->read_offset < 64 * 1024)
+			/*
+			 * i=65535,nl_len=2 is impossible, but cov-scan does
+			 * not know that and complains about memmove.
+			 */
 			memmove(pcontext->read_buffer, &pcontext->read_buffer[i+nl_len],
 			        pcontext->read_offset);
 		else
@@ -1496,7 +1522,7 @@ static void *imps_thrwork(void *argp)
 	int peek_len;
 	char tmp_buff;
 
-	while (!g_notify_stop) {
+	while (!g_parser_stop) {
 		std::unique_lock ll_hold(g_list_lock);
 		imap_context *ptail = nullptr, *pcontext = nullptr;
 		if (g_sleeping_list.size() > 0)
@@ -1654,7 +1680,7 @@ static void *imps_scanwork(void *argp)
 	int i = 0;
 	int err_num;
 
-	while (!g_notify_stop) {
+	while (!g_parser_stop) {
 		i ++;
 		sleep(1);
 		if (i < SCAN_INTERVAL)

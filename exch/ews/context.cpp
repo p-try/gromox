@@ -1898,8 +1898,9 @@ BINARY EWSContext::serialize(const XID& xid) const
  */
 bool EWSContext::streamEvents(const tSubscriptionId& subscriptionId) const
 {
-	if (m_notify)
-		m_notify->nct_subs.emplace_back(subscriptionId);
+	if (!m_notify)
+		return false;
+	m_notify->nct_subs.emplace_back(subscriptionId);
 	return m_plugin.linkSubscription(subscriptionId, *this);
 }
 
@@ -1918,7 +1919,7 @@ EWSContext::MCONT_PTR EWSContext::toContent(const std::string& dir, std::string&
 		throw EWSError::ItemCorrupt(E3123);
 	auto getPropIds = [&](const PROPNAME_ARRAY* names, PROPID_ARRAY* ids)
 	{*ids = getNamedPropIds(dir, *names, true); return TRUE;};
-	MCONT_PTR cnt(oxcmail_import("utf-8", "UTC", &mail, EWSContext::alloc, getPropIds));
+	MCONT_PTR cnt(oxcmail_import(&mail, EWSContext::alloc, getPropIds));
 	if (!cnt)
 		throw EWSError::ItemCorrupt(E3124);
 	return cnt;

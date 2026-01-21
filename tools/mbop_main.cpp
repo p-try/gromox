@@ -80,14 +80,13 @@ static constexpr HXoption g_options_table[] = {
 
 void command_overview()
 {
-	fprintf(stderr, "Commands:\n\tcgkreset clear-photo clear-profile clear-rwz delmsg "
-		"echo-maildir echo-username "
-		"emptyfld freeze get-freebusy get-photo get-websettings "
-		"get-websettings-persistent "
-		"get-websettings-recipients ping "
+	fprintf(stderr, "Commands:\n\tcgkreset clear-photo clear-profile "
+		"clear-rwz delmsg echo-maildir echo-username emptyfld "
+		"freeze get-freebusy get-photo get-websettings "
+		"get-websettings-persistent get-websettings-recipients ping "
 		"purge-datafiles purge-softdelete recalc-sizes set-locale "
 		"set-photo set-websettings set-websettings-persistent "
-		"set-websettings-recipients thaw unload vacuum\n");
+		"set-websettings-recipients sync-midb thaw unload vacuum\n");
 	fprintf(stderr, "Command chaining: ( command1 c1args... ) ( command2 c2args... )...\n");
 }
 
@@ -270,7 +269,7 @@ int main(int argc, char **argv)
 	} else if (strcasecmp(g_folder_spec, "all") == 0) {
 		ret = send_cmd(host, port, "X-RSYM " + g_storedir_s + "\r\n");
 	} else {
-		eid_t eid = gi_lookup_eid_by_name(g_storedir, g_folder_spec);
+		auto eid = gi_lookup_eid_any_way(g_storedir, g_folder_spec);
 		if (eid == 0) {
 			mbop_fprintf(stderr, "Not recognized/found: \"%s\"\n", g_folder_spec);
 			return EXIT_FAILURE;
@@ -453,9 +452,9 @@ static errno_t clear_rwz()
 	if (!exmdb_client->query_table(g_storedir, nullptr, CP_ACP, table_id,
 	    &qtags, 0, rowcount, &rowset))
 		return EIO;
-	std::vector<uint64_t> ids;
+	std::vector<eid_t> ids;
 	for (unsigned int i = 0; i < rowset.count; ++i) {
-		auto mid = rowset.pparray[i]->get<const uint64_t>(PidTagMid);
+		auto mid = rowset.pparray[i]->get<const eid_t>(PidTagMid);
 		if (mid != nullptr)
 			ids.push_back(*mid);
 	}

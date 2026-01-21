@@ -412,14 +412,6 @@ pack_result EXT_PULL::g_uint64_a(LONGLONG_ARRAY *r)
 	return g_uint64_an(r, r->count);
 }
 
-pack_result EXT_PULL::g_uint64_sa(LONGLONG_ARRAY *r)
-{
-	uint16_t count;
-	TRY(g_uint16(&count));
-	CLAMP16(count);
-	return g_uint64_an(r, count);
-}
-
 pack_result EXT_PULL::g_float_an(FLOAT_ARRAY *r, uint32_t count)
 {
 	r->count = count;
@@ -812,8 +804,8 @@ pack_result EXT_PULL::g_svreid(SVREID *r)
 	TRY(g_uint16(&length));
 	TRY(g_uint8(&ours));
 	if (!ours) {
-		r->folder_id = 0;
-		r->message_id = 0;
+		r->folder_id = eid_t(0);
+		r->message_id = eid_t(0);
 		r->instance = 0;
 		r->pbin = anew<BINARY>();
 		if (r->pbin == nullptr)
@@ -829,8 +821,8 @@ pack_result EXT_PULL::g_svreid(SVREID *r)
 	if (length != 21)
 		return pack_result::format;
 	r->pbin = NULL;
-	TRY(g_uint64(&r->folder_id));
-	TRY(g_uint64(&r->message_id));
+	TRY(g_uint64(&r->folder_id.m_value));
+	TRY(g_uint64(&r->message_id.m_value));
 	return g_uint32(&r->instance);
 }
 
@@ -919,8 +911,8 @@ static pack_result ext_buffer_pull_zreply_action(EXT_PULL *e, ZREPLY_ACTION *r)
 
 static pack_result ext_buffer_pull_reply_action(EXT_PULL *pext, REPLY_ACTION *r)
 {
-	TRY(pext->g_uint64(&r->template_folder_id));
-	TRY(pext->g_uint64(&r->template_message_id));
+	TRY(pext->g_uint64(&r->template_folder_id.m_value));
+	TRY(pext->g_uint64(&r->template_message_id.m_value));
 	return pext->g_guid(&r->template_guid);
 }
 
@@ -1154,10 +1146,18 @@ pack_result EXT_PULL::g_proptag_a(PROPTAG_ARRAY *r)
 	return pack_result::ok;
 }
 
-pack_result EXT_PULL::g_proptag_a(std::vector<proptag_t> *r) try
+pack_result EXT_PULL::g_proptag_a(std::vector<proptag_t> *r, uint8_t ix) try
 {
-	uint16_t count;
-	TRY(g_uint16(&count));
+	size_t count = 0;
+	if (ix == 2) {
+		uint16_t z;
+		TRY(g_uint16(&z));
+		count = z;
+	} else if (ix == 4) {
+		uint32_t z;
+		TRY(g_uint32(&z));
+		count = z;
+	}
 	r->resize(count);
 	for (size_t i = 0; i < count; ++i)
 		TRY(g_uint32(&(*r)[i]));
@@ -1761,21 +1761,32 @@ pack_result EXT_PULL::g_flatentry_a(BINARY_ARRAY *r)
 	return pack_result::ok;
 }
 
-pack_result EXT_PULL::g_eid_a(EID_ARRAY *r)
+pack_result EXT_PULL::g_eid_a(EID_ARRAY *r, uint8_t ix)
 {
-	TRY(g_uint32(&r->count));
+	size_t count = 0;
+	if (ix == 2) {
+		uint16_t z;
+		TRY(g_uint16(&z));
+		CLAMP16(z);
+		count = z;
+	} else {
+		uint32_t z;
+		TRY(g_uint32(&z));
+		CLAMP32(z);
+		count = z;
+	}
+	r->count = count;
 	if (r->count == 0) {
 		r->pids = NULL;
 		return pack_result::ok;
 	}
-	CLAMP32(r->count);
-	r->pids = anew<uint64_t>(r->count);
+	r->pids = anew<eid_t>(r->count);
 	if (r->pids == nullptr) {
 		r->count = 0;
 		return pack_result::alloc;
 	}
 	for (size_t i = 0; i < r->count; ++i)
-		TRY(g_uint64(&r->pids[i]));
+		TRY(g_uint64(&r->pids[i].m_value));
 	return pack_result::ok;
 }
 

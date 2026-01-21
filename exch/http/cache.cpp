@@ -81,7 +81,7 @@ class directory_list : public std::vector<dir_node> {
 }
 
 static int g_context_num;
-static gromox::atomic_bool g_notify_stop;
+static gromox::atomic_bool g_httpcache_stpo;
 static pthread_t g_scan_tid;
 static std::mutex g_hash_lock;
 static directory_list g_directory_list;
@@ -125,7 +125,7 @@ static void *mod_cache_scanwork(void *pparam)
 	struct stat node_stat;
 	
 	count = 0;
-	while (!g_notify_stop) {
+	while (!g_httpcache_stpo) {
 		count ++;
 		if (count < 600) {
 			sleep(1);
@@ -148,7 +148,7 @@ static void *mod_cache_scanwork(void *pparam)
 
 void mod_cache_init(int context_num)
 {
-	g_notify_stop = true;
+	g_httpcache_stpo = true;
 	g_context_num = context_num;
 }
 
@@ -190,11 +190,11 @@ int mod_cache_run() try
 	if (ret < 0)
 		return ret;
 	g_context_list = std::make_unique<cache_context[]>(g_context_num);
-	g_notify_stop = false;
+	g_httpcache_stpo = false;
 	ret = pthread_create4(&g_scan_tid, nullptr, mod_cache_scanwork, nullptr);
 	if (ret != 0) {
 		mlog(LV_ERR, "mod_cache: failed to create scanning thread: %s", strerror(ret));
-		g_notify_stop = true;
+		g_httpcache_stpo = true;
 		return -4;
 	}
 	pthread_setname_np(g_scan_tid, "mod_cache");
@@ -206,8 +206,8 @@ int mod_cache_run() try
 
 void mod_cache_stop()
 {
-	if (!g_notify_stop) {
-		g_notify_stop = true;
+	if (!g_httpcache_stpo) {
+		g_httpcache_stpo = true;
 		if (!pthread_equal(g_scan_tid, {})) {
 			pthread_kill(g_scan_tid, SIGALRM);
 			pthread_join(g_scan_tid, NULL);
@@ -337,7 +337,7 @@ static uint32_t mod_cache_calculate_content_length(CACHE_CONTEXT *pcontext)
 		/* Content-Type: xxx\r\n */
 		content_length += 16 + ctype_len;
 		/* Content-Range: bytes x-x/xxx\r\n */
-		content_length += 25 + sprintf(num_buff, "%u%u%llu",
+		content_length += 23 + snprintf(num_buff, std::size(num_buff), "%u-%u/%llu",
 		                  pcontext->range[i].begin, pcontext->range[i].end,
 		                  static_cast<unsigned long long>(pcontext->pitem->sb.st_size));
 		content_length += 2; /* \r\n */
@@ -491,8 +491,8 @@ http_status mod_cache_take_request(http_context *phttp)
 		ptoken = strrchr(ptoken, '.');
 		if (NULL != ptoken) {
 			ptoken ++;
-			if (strlen(ptoken) < 16)
-				strcpy(suffix, ptoken);
+			if (strlen(ptoken) < std::size(suffix))
+				gx_strlcpy(suffix, ptoken, std::size(suffix));
 		}
 		auto it = g_directory_list.find(phttp->request.f_host.c_str(), request_uri);
 		if (it == g_directory_list.cend())
@@ -669,7 +669,7 @@ BOOL mod_cache_read_response(HTTP_CONTEXT *phttp)
 				auto pcontent_type = pcontext->pitem->content_type;
 				if (pcontent_type == nullptr)
 					pcontent_type = "application/octet-stream";
-				tmp_len = sprintf(tmp_buff,
+				tmp_len = snprintf(tmp_buff, std::size(tmp_buff),
 					"\r\n--%s\r\n"
 					"Content-Type: %s\r\n"
 					"Content-Range: bytes %u-%u/%llu\r\n\r\n",
@@ -678,7 +678,7 @@ BOOL mod_cache_read_response(HTTP_CONTEXT *phttp)
 					pcontext->range[pcontext->range_pos].end,
 				          static_cast<unsigned long long>(pcontext->pitem->sb.st_size));
 			} else {
-				tmp_len = sprintf(tmp_buff,
+				tmp_len = snprintf(tmp_buff, std::size(tmp_buff),
 					"\r\n--%s--\r\n",
 					BOUNDARY_STRING);
 				pcontext->range.clear();

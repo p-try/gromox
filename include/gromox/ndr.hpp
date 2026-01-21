@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <optional>
 #include <gromox/common_types.hpp>
 #include <gromox/double_list.hpp>
 #include <gromox/ext_buffer.hpp>
@@ -60,9 +61,11 @@ struct GX_EXPORT NDR_PULL {
 };
 
 struct GX_EXPORT NDR_PUSH {
-	void init(void *d, uint32_t asize, uint32_t fl);
+	NDR_PUSH() = default;
+	~NDR_PUSH();
+	NOMOVE(NDR_PUSH);
+	bool init(void *d, uint32_t asize, uint32_t fl, const EXT_BUFFER_MGT * = nullptr);
 	void set_ptrcnt(uint32_t c) { ptr_count = c; }
-	void destroy();
 	pack_result align(size_t);
 	pack_result union_align(size_t);
 	pack_result trailer_align(size_t);
@@ -83,9 +86,14 @@ struct GX_EXPORT NDR_PUSH {
 	pack_result p_blob(DATA_BLOB);
 	pack_result p_zero(uint32_t z);
 	pack_result p_unique_ptr(const void *v);
+	template<typename T> pack_result p_unique_ptr(const std::optional<T> &x)
+	{
+		return p_unique_ptr(x.has_value() ? &*x : nullptr);
+	}
 	pack_result p_ctx_handle(const CONTEXT_HANDLE &);
 
 	uint8_t *data = nullptr;
 	uint32_t flags = 0, alloc_size = 0, offset = 0, ptr_count = 0;
 	DOUBLE_LIST full_ptr_list{};
+	EXT_BUFFER_MGT m_mgt{};
 };

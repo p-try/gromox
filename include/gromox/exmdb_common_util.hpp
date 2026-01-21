@@ -65,7 +65,12 @@ template<typename T> T *cu_alloc(size_t elem)
 	return static_cast<T *>(common_util_alloc(sizeof(T) * elem));
 }
 extern char *common_util_dup(std::string_view);
-extern char *common_util_convert_copy(BOOL to_utf8, cpid_t, const char *s);
+extern std::string cu_cvt_str(std::string_view, cpid_t, bool to_utf8);
+extern char *cu_cvt_str_dup(std::string_view, cpid_t, bool to_utf8);
+static inline std::string cu_mb_to_utf8(cpid_t cpid, std::string_view sv) { return cu_cvt_str(std::move(sv), cpid, true); }
+static inline std::string cu_utf8_to_mb(cpid_t cpid, std::string_view sv) { return cu_cvt_str(std::move(sv), cpid, false); }
+extern char *cu_mb_to_utf8_dup(cpid_t, std::string_view);
+extern char *cu_utf8_to_mb_dup(cpid_t, std::string_view);
 extern STRING_ARRAY *common_util_convert_copy_string_array(BOOL to_utf8, cpid_t, const STRING_ARRAY *);
 BOOL common_util_allocate_eid(sqlite3 *psqlite, uint64_t *peid);
 BOOL common_util_allocate_eid_from_folder(sqlite3 *psqlite,
@@ -114,8 +119,7 @@ extern BOOL cu_get_folder_permission(sqlite3 *, uint64_t folder_id, const char *
 extern BOOL cu_is_descendant_folder(sqlite3 *, uint64_t inner_fid, uint64_t outer_fid, BOOL *pb_included);
 BOOL common_util_get_message_parent_folder(sqlite3 *psqlite,
 	uint64_t message_id, uint64_t *pfolder_id);
-BOOL common_util_load_search_scopes(sqlite3 *psqlite,
-	uint64_t folder_id, LONGLONG_ARRAY *pfolder_ids);
+extern bool cu_load_search_scopes(sqlite3 *, uint64_t folder_id, std::vector<uint64_t> &src_fo);
 extern bool cu_eval_folder_restriction(sqlite3 *, uint64_t folder_id, const RESTRICTION *);
 extern bool cu_eval_msg_restriction(sqlite3 *, cpid_t, uint64_t msgid, const RESTRICTION *);
 BOOL common_util_check_search_result(sqlite3 *psqlite,

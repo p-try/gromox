@@ -42,14 +42,10 @@ pack_result nsp_ext_pull::g_nsp_request(bind_request &req)
 
 	TRY(g_uint32(&req.flags));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
 		req.auxin = nullptr;
@@ -65,7 +61,8 @@ pack_result nsp_ext_pull::g_nsp_request(bind_request &req)
 
 pack_result nsp_ext_pull::g_nsp_request(unbind_request &req)
 {
-	TRY(g_uint32(&req.reserved));
+	uint32_t resv = 0;
+	TRY(g_uint32(&resv));
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
 		req.auxin = nullptr;
@@ -81,18 +78,15 @@ pack_result nsp_ext_pull::g_nsp_request(unbind_request &req)
 
 pack_result nsp_ext_pull::g_nsp_request(comparemids_request &req)
 {
+	uint32_t resv = 0;
 	uint8_t tmp_byte;
 
-	TRY(g_uint32(&req.reserved));
+	TRY(g_uint32(&resv));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint32(&req.mid1));
 	TRY(g_uint32(&req.mid2));
 	TRY(g_uint32(&req.cb_auxin));
@@ -110,18 +104,15 @@ pack_result nsp_ext_pull::g_nsp_request(comparemids_request &req)
 
 pack_result nsp_ext_pull::g_nsp_request(dntomid_request &req)
 {
+	uint32_t resv = 0;
 	uint8_t tmp_byte;
 
-	TRY(g_uint32(&req.reserved));
+	TRY(g_uint32(&resv));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.names = nullptr;
-	} else {
-		req.names = anew<STRING_ARRAY>();
-		if (req.names == nullptr)
-			return pack_result::alloc;
-		TRY(g_str_a(req.names));
-	}
+	if (tmp_byte == 0)
+		req.names.clear();
+	else
+		TRY(g_str_a(&req.names));
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
 		req.auxin = nullptr;
@@ -138,28 +129,23 @@ pack_result nsp_ext_pull::g_nsp_request(dntomid_request &req)
 pack_result nsp_ext_pull::g_nsp_request(getmatches_request &req)
 {
 	SCOPED_ABKFLAG(*this);
+	uint32_t resv = 0;
 	uint8_t tmp_byte;
 
 	TRY(g_uint32(&req.reserved1));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.inmids = nullptr;
-	} else {
-		req.inmids = anew<MID_ARRAY>();
-		if (req.inmids == nullptr)
+	if (tmp_byte != 0) {
+		auto inmids = anew<MID_ARRAY>();
+		if (inmids == nullptr)
 			return pack_result::alloc;
-		TRY(g_proptag_la(req.inmids));
+		TRY(g_proptag_la(inmids));
 	}
-	TRY(g_uint32(&req.reserved2));
+	TRY(g_uint32(&resv));
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
 		req.filter = nullptr;
@@ -181,12 +167,10 @@ pack_result nsp_ext_pull::g_nsp_request(getmatches_request &req)
 	TRY(g_uint32(&req.row_count));
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.columns = nullptr;
+		req.columns.reset();
 	} else {
-		req.columns = anew<LPROPTAG_ARRAY>();
-		if (req.columns == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.columns));
+		req.columns.emplace();
+		TRY(g_proptag_a(&*req.columns, 4));
 	}
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -226,22 +210,16 @@ pack_result nsp_ext_pull::g_nsp_request(getprops_request &req)
 
 	TRY(g_uint32(&req.flags));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.proptags = nullptr;
+		req.proptags.reset();
 	} else {
-		req.proptags = anew<LPROPTAG_ARRAY>();
-		if (req.proptags == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.proptags));
+		req.proptags.emplace();
+		TRY(g_proptag_a(&*req.proptags, 4));
 	}
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -262,14 +240,10 @@ pack_result nsp_ext_pull::g_nsp_request(getspecialtable_request &req)
 
 	TRY(g_uint32(&req.flags));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
 		req.version = nullptr;
@@ -349,26 +323,21 @@ pack_result nsp_ext_pull::g_nsp_request(modlinkatt_request &req)
 pack_result nsp_ext_pull::g_nsp_request(modprops_request &req)
 {
 	SCOPED_ABKFLAG(*this);
+	uint32_t resv = 0;
 	uint8_t tmp_byte;
 
-	TRY(g_uint32(&req.reserved));
+	TRY(g_uint32(&resv));
+	TRY(g_uint8(&tmp_byte));
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.stat = nullptr;
+		req.proptags.reset();
 	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
-	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.proptags = nullptr;
-	} else {
-		req.proptags = anew<LPROPTAG_ARRAY>();
-		if (req.proptags == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.proptags));
+		req.proptags.emplace();
+		TRY(g_proptag_a(&*req.proptags, 4));
 	}
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
@@ -399,24 +368,18 @@ pack_result nsp_ext_pull::g_nsp_request(queryrows_request &req)
 
 	TRY(g_uint32(&req.flags));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
-	TRY(g_proptag_la(&req.explicit_table));
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
+	TRY(g_proptag_a(&req.explicit_table, 4));
 	TRY(g_uint32(&req.count));
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.columns = nullptr;
+		req.columns.reset();
 	} else {
-		req.columns = anew<LPROPTAG_ARRAY>();
-		if (req.columns == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.columns));
+		req.columns.emplace();
+		TRY(g_proptag_a(&*req.columns, 4));
 	}
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -433,7 +396,8 @@ pack_result nsp_ext_pull::g_nsp_request(queryrows_request &req)
 
 pack_result nsp_ext_pull::g_nsp_request(querycolumns_request &req)
 {
-	TRY(g_uint32(&req.reserved));
+	uint32_t resv = 0;
+	TRY(g_uint32(&resv));
 	TRY(g_uint32(&req.flags));
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -455,32 +419,23 @@ pack_result nsp_ext_pull::g_nsp_request(resolvenames_request &req)
 
 	TRY(g_uint32(&req.reserved));
 	TRY(g_uint8(&tmp_byte));
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
+	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.stat = nullptr;
+		req.proptags.reset();
 	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
+		req.proptags.emplace();
+		TRY(g_proptag_a(&*req.proptags, 4));
 	}
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.proptags = nullptr;
+		req.names.clear();
 	} else {
-		req.proptags = anew<LPROPTAG_ARRAY>();
-		if (req.proptags == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.proptags));
-	}
-	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.names = nullptr;
-	} else {
-		req.names = anew<STRING_ARRAY>();
-		if (req.names == nullptr)
-			return pack_result::alloc;
 		SCOPED_ABK_DISABLE(*this);
-		TRY(g_wstr_a(req.names));
+		TRY(g_wstr_a(&req.names));
 	}
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -497,27 +452,20 @@ pack_result nsp_ext_pull::g_nsp_request(resolvenames_request &req)
 
 pack_result nsp_ext_pull::g_nsp_request(resortrestriction_request &req)
 {
+	uint32_t resv = 0;
 	uint8_t tmp_byte;
 
-	TRY(g_uint32(&req.reserved));
+	TRY(g_uint32(&resv));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.inmids = nullptr;
-	} else {
-		req.inmids = anew<MID_ARRAY>();
-		if (req.inmids == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.inmids));
-	}
+	if (tmp_byte == 0)
+		req.inmids.clear();
+	else
+		TRY(g_proptag_a(&req.inmids, 4));
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
 		req.auxin = nullptr;
@@ -538,40 +486,28 @@ pack_result nsp_ext_pull::g_nsp_request(seekentries_request &req)
 
 	TRY(g_uint32(&req.reserved));
 	TRY(g_uint8(&tmp_byte));
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
+	TRY(g_uint8(&tmp_byte));
+	if (tmp_byte == 0)
+		req.target = {};
+	else
+		TRY(g_tagged_pv(&req.target));
+	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.stat = nullptr;
+		req.explicit_table.reset();
 	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
+		req.explicit_table.emplace();
+		TRY(g_proptag_a(&*req.explicit_table, 4));
 	}
 	TRY(g_uint8(&tmp_byte));
 	if (tmp_byte == 0) {
-		req.target = nullptr;
+		req.columns.reset();
 	} else {
-		req.target = anew<TAGGED_PROPVAL>();
-		if (req.target == nullptr)
-			return pack_result::alloc;
-		TRY(g_tagged_pv(req.target));
-	}
-	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.explicit_table = nullptr;
-	} else {
-		req.explicit_table = anew<MID_ARRAY>();
-		if (req.explicit_table == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.explicit_table));
-	}
-	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.columns = nullptr;
-	} else {
-		req.columns = anew<LPROPTAG_ARRAY>();
-		if (req.columns == nullptr)
-			return pack_result::alloc;
-		TRY(g_proptag_la(req.columns));
+		req.columns.emplace();
+		TRY(g_proptag_a(&*req.columns, 4));
 	}
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -588,18 +524,15 @@ pack_result nsp_ext_pull::g_nsp_request(seekentries_request &req)
 
 pack_result nsp_ext_pull::g_nsp_request(updatestat_request &req)
 {
+	uint32_t resv = 0;
 	uint8_t tmp_byte;
 
-	TRY(g_uint32(&req.reserved));
+	TRY(g_uint32(&resv));
 	TRY(g_uint8(&tmp_byte));
-	if (tmp_byte == 0) {
-		req.stat = nullptr;
-	} else {
-		req.stat = anew<STAT>();
-		if (req.stat == nullptr)
-			return pack_result::alloc;
-		TRY(nsp_ext_g_stat(*this, *req.stat));
-	}
+	if (tmp_byte == 0)
+		req.stat = {};
+	else
+		TRY(nsp_ext_g_stat(*this, req.stat));
 	TRY(g_uint8(&req.delta_requested));
 	TRY(g_uint32(&req.cb_auxin));
 	if (req.cb_auxin == 0) {
@@ -697,11 +630,12 @@ pack_result nsp_ext_push::p_nsp_response(const dntomid_response &rsp)
 {
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.outmids == nullptr) {
+	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.13 SPR ¶1 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
-		TRY(p_proptag_la(*rsp.outmids));
+		TRY(p_proptag_la(rsp.outmids));
 	}
 	return p_uint32(0);
 }
@@ -711,19 +645,10 @@ pack_result nsp_ext_push::p_nsp_response(const getmatches_response &rsp)
 	SCOPED_ABKFLAG(*this);
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.stat == nullptr) {
-		TRY(p_uint8(0));
-	} else {
-		TRY(p_uint8(0xFF));
-		TRY(nsp_ext_p_stat(*this, *rsp.stat));
-	}
-	if (rsp.mids == nullptr) {
-		TRY(p_uint8(0));
-	} else {
-		TRY(p_uint8(0xFF));
-		TRY(p_proptag_la(*rsp.mids));
-	}
+	TRY(p_uint8(0xFF));
+	TRY(nsp_ext_p_stat(*this, rsp.stat));
 	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.10 SPR ¶4 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
@@ -737,11 +662,12 @@ pack_result nsp_ext_push::p_nsp_response(const getproplist_response &rsp)
 	SCOPED_ABKFLAG(*this);
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.proptags == nullptr) {
+	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.6 SPR ¶1 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
-		TRY(p_proptag_la(*rsp.proptags));
+		TRY(p_proptag_la(rsp.proptags));
 	}
 	return p_uint32(0);
 }
@@ -752,7 +678,9 @@ pack_result nsp_ext_push::p_nsp_response(const getprops_response &rsp)
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
 	TRY(p_uint32(rsp.codepage));
-	if (rsp.row == nullptr) {
+	if ((rsp.result != ecSuccess && rsp.result != ecWarnWithErrors) ||
+	    rsp.row == nullptr) {
+		/* ONXSPI v14 §3.1.4.1.7 SPR ¶2 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
@@ -773,7 +701,10 @@ pack_result nsp_ext_push::p_nsp_response(const getspecialtable_response &rsp)
 		TRY(p_uint8(0xFF));
 		TRY(p_uint32(*rsp.version));
 	}
-	if (rsp.count == 0) {
+	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.3 SPR ¶2 */
+		TRY(p_uint8(0));
+	} else if (rsp.count == 0) {
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
@@ -818,13 +749,10 @@ pack_result nsp_ext_push::p_nsp_response(const queryrows_response &rsp)
 	SCOPED_ABKFLAG(*this);
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.stat == nullptr) {
-		TRY(p_uint8(0));
-	} else {
-		TRY(p_uint8(0xFF));
-		TRY(nsp_ext_p_stat(*this, *rsp.stat));
-	}
+	TRY(p_uint8(0xFF));
+	TRY(nsp_ext_p_stat(*this, rsp.stat));
 	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.8 SPR ¶3 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
@@ -838,11 +766,12 @@ pack_result nsp_ext_push::p_nsp_response(const querycolumns_response &rsp)
 	SCOPED_ABKFLAG(*this);
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.columns == nullptr) {
+	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.5 SPR ¶1 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
-		TRY(p_proptag_la(*rsp.columns));
+		TRY(p_proptag_la(rsp.columns));
 	}
 	return p_uint32(0);
 }
@@ -853,15 +782,13 @@ pack_result nsp_ext_push::p_nsp_response(const resolvenames_response &rsp)
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
 	TRY(p_uint32(rsp.codepage));
-	if (rsp.mids == nullptr) {
+	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.16 SPR ¶3 */
+		TRY(p_uint8(0));
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
-		TRY(p_proptag_la(*rsp.mids));
-	}
-	if (rsp.result != ecSuccess) {
-		TRY(p_uint8(0));
-	} else {
+		TRY(p_proptag_la(rsp.mids));
 		TRY(p_uint8(0xFF));
 		TRY(nsp_ext_p_colrow(*this, &rsp.column_rows));
 	}
@@ -872,17 +799,14 @@ pack_result nsp_ext_push::p_nsp_response(const resortrestriction_response &rsp)
 {
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.stat == nullptr) {
+	TRY(p_uint8(0xFF));
+	TRY(nsp_ext_p_stat(*this, rsp.stat));
+	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.11 SPR ¶3 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
-		TRY(nsp_ext_p_stat(*this, *rsp.stat));
-	}
-	if (rsp.outmids == nullptr) {
-		TRY(p_uint8(0));
-	} else {
-		TRY(p_uint8(0xFF));
-		TRY(p_proptag_la(*rsp.outmids));
+		TRY(p_proptag_la(rsp.outmids));
 	}
 	return p_uint32(0);
 }
@@ -892,13 +816,10 @@ pack_result nsp_ext_push::p_nsp_response(const seekentries_response &rsp)
 	SCOPED_ABKFLAG(*this);
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.stat == nullptr) {
-		TRY(p_uint8(0));
-	} else {
-		TRY(p_uint8(0xFF));
-		TRY(nsp_ext_p_stat(*this, *rsp.stat));
-	}
+	TRY(p_uint8(0xFF));
+	TRY(nsp_ext_p_stat(*this, rsp.stat));
 	if (rsp.result != ecSuccess) {
+		/* OXNSPI v14 §3.1.4.1.9 SPR ¶4 */
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));
@@ -911,13 +832,9 @@ pack_result nsp_ext_push::p_nsp_response(const updatestat_response &rsp)
 {
 	TRY(p_uint32(rsp.status));
 	TRY(p_uint32(rsp.result));
-	if (rsp.stat == nullptr) {
-		TRY(p_uint8(0));
-	} else {
-		TRY(p_uint8(0xFF));
-		TRY(nsp_ext_p_stat(*this, *rsp.stat));
-	}
-	if (rsp.delta == nullptr) {
+	TRY(p_uint8(0xFF));
+	TRY(nsp_ext_p_stat(*this, rsp.stat));
+	if (!rsp.delta.has_value()) {
 		TRY(p_uint8(0));
 	} else {
 		TRY(p_uint8(0xFF));

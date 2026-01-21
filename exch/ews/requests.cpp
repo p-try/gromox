@@ -104,6 +104,57 @@ std::optional<std::string> readMessageBody(const std::string &path) try
 }
 
 /**
+ * @brief      Derive timezone information from request headers
+ *
+ * Attempts to construct a SerializableTimeZone from the SOAP TimeZoneContext
+ * header. The header layout is simplified to a single Period definition by
+ * Exchange clients and the Bias is expressed as an ISO-8601 duration string.
+ *
+ * @param      ctx   Request context
+ *
+ * @return     Populated timezone on success, empty optional otherwise
+ */
+std::optional<tSerializableTimeZone> timezone_from_context(const EWSContext& ctx)
+{
+	const XMLElement* tag = ctx.request().header;
+	if (tag == nullptr)
+		return std::nullopt;
+	/* SOAP::Envelope::clean() strips namespace prefixes from element names */
+	tag = tag->FirstChildElement("TimeZoneContext");
+	if (tag == nullptr)
+		return std::nullopt;
+	tag = tag->FirstChildElement("TimeZoneDefinition");
+	if (tag == nullptr)
+		return std::nullopt;
+	tag = tag->FirstChildElement("Periods");
+	if (tag == nullptr)
+		return std::nullopt;
+	tag = tag->FirstChildElement("Period");
+	if (tag == nullptr)
+		return std::nullopt;
+	const char* bias = tag->Attribute("Bias");
+	if (bias == nullptr || *bias == '\0')
+		return std::nullopt;
+
+	bool negative = false;
+	const char* cursor = bias;
+	if (*cursor == '-' || *cursor == '+') {
+		negative = *cursor == '-';
+		++cursor;
+	}
+
+	char* end = nullptr;
+	auto seconds = HX_strtoull8601p_sec(cursor, &end);
+	if (end == nullptr || end == cursor)
+		return std::nullopt;
+
+	auto minutes = static_cast<int32_t>(seconds / 60);
+	if (negative)
+		minutes = -minutes;
+	return tSerializableTimeZone(minutes);
+}
+
+/**
  * @brief      Write message body to reply file
  *
  * If either the ReplyBody or its Message field are empty, the file is deleted instead.
@@ -380,14 +431,11 @@ void process(mGetDelegateRequest&& request, XMLElement* response, const EWSConte
 	mGetDelegateResponse data;
 
 	std::vector<std::string> delegate_list;
-	std::string maildir = ctx.get_maildir(request.Mailbox);
-	auto path = maildir + "/config/delegates.txt";
-	auto err  = read_file_by_line(path.c_str(), delegate_list);
-	if (err != 0) {
+	if (!ctx.plugin().exmdb.read_delegates(ctx.get_maildir(request.Mailbox).c_str(),
+	    0, &delegate_list)) {
 		data.serialize(response);
 		return;
 	}
-
 	std::unordered_set<std::string> requested;
 	if (request.UserIds) {
 		for (auto &&uid : *request.UserIds)
@@ -473,10 +521,8 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 		request.MessageDisposition = Enum::SaveOnly;
 	if (!request.SendMeetingInvitations)
 		request.SendMeetingInvitations = Enum::SendToNone;
-	bool sendMessages = request.MessageDisposition == Enum::SendOnly
-		|| request.MessageDisposition == Enum::SendAndSaveCopy
-		|| request.SendMeetingInvitations == Enum::SendOnlyToAll
-		|| request.SendMeetingInvitations == Enum::SendToAllAndSaveCopy;
+	bool send_message = request.MessageDisposition == Enum::SendOnly ||
+	                    request.MessageDisposition == Enum::SendAndSaveCopy;
 
 	data.ResponseMessages.reserve(request.Items.size());
 	for (sItem &item : request.Items) try {
@@ -485,7 +531,6 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 
 		mCreateItemResponseMessage msg;
 		bool persist = !(std::holds_alternative<tMessage>(item) && request.MessageDisposition == Enum::SendOnly);
-		bool send = std::holds_alternative<tMessage>(item) && sendMessages;
 		auto content = ctx.toContent(dir, *targetFolder, item, persist);
 
 		auto updateRef = [&](const tItemId &refId, uint32_t resp) {
@@ -532,7 +577,7 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 		}
 		if (persist)
 			msg.Items.emplace_back(ctx.create(dir, *targetFolder, *content));
-		if (std::holds_alternative<tCalendarItem>(item) && sendMessages &&
+		if (std::holds_alternative<tCalendarItem>(item) &&
 		    request.SendMeetingInvitations == Enum::SendToAllAndSaveCopy) {
 			sFolderSpec sentitems = ctx.resolveFolder(tDistinguishedFolderId(Enum::sentitems));
 			uint64_t newMid;
@@ -566,7 +611,8 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 				throw EWSError::ItemNotFound(E3143);
 			ctx.send(dir, messageId, *sendcontent);
 		}
-		if (send)
+		if ((std::holds_alternative<tMessage>(item) && send_message) ||
+		    (std::holds_alternative<tCalendarItem>(item) && request.SendMeetingInvitations == Enum::SendOnlyToAll))
 			ctx.send(dir, 0, *content);
 		msg.success();
 		data.ResponseMessages.emplace_back(std::move(msg));
@@ -766,8 +812,8 @@ void process(mDeleteItemRequest&& request, XMLElement* response, const EWSContex
 
 			data.ResponseMessages.emplace_back().success();
 		} else {
-			uint64_t eid = meid.messageId();
-			uint64_t fid = rop_util_make_eid_ex(1, meid.folderId());
+			auto eid = meid.messageId();
+			auto fid = rop_util_make_eid_ex(1, meid.folderId());
 			EID_ARRAY eids{1, &eid};
 			BOOL hardDelete = request.DeleteType == Enum::HardDelete ? TRUE : false;
 			BOOL partial;
@@ -1268,11 +1314,9 @@ void process(mGetServiceConfigurationRequest&&, XMLElement* response, const EWSC
 /**
  * @brief      Process GetUserAvailabilityRequest
  *
- * Provides the functionality of GetUserAvailabilityRequest
- *
- * @todo       Implement timezone transformations
- * @todo       Check if error handling can be improved
- *             (using the response message instead of SOAP faults)
+ * Resolves the request timezone and returns free/busy data for the selected
+ * mailboxes. Any per-mailbox failures are reported through the response
+ * messages instead of aborting the whole SOAP request.
  *
  * @param      request   Request data
  * @param      response  XMLElement to store response in
@@ -1285,47 +1329,52 @@ void process(mGetUserAvailabilityRequest&& request, XMLElement* response, const 
 	if (!request.FreeBusyViewOptions && !request.SuggestionsViewOptions)
 		throw EWSError::InvalidFreeBusyViewType(E3013);
 	if (!request.TimeZone) {
-		auto tag = ctx.request().header;
-		if (tag != nullptr)
-			tag = tag->FirstChildElement("t:TimeZoneContext");
-		if (tag != nullptr)
-			tag = tag->FirstChildElement("t:TimeZoneDefinition");
-		if (tag != nullptr)
-			tag = tag->FirstChildElement("t:Periods");
-		if (tag != nullptr)
-			tag = tag->FirstChildElement("t:Period");
-		/* Input is like <t:Period Bias="P0DT0H0M0.0S" Name="Standard" Id="Std" /> */
-		auto bias = tag != nullptr ? tag->Attribute("Bias") : nullptr;
-		if (bias != nullptr) {
-			char *end = nullptr;
-			auto minutes = HX_strtoull8601p_sec(bias, &end) / 60;
-			if (minutes != 0 || end != nullptr)
-				request.TimeZone.emplace(minutes);
-		}
+		if (auto tz = timezone_from_context(ctx))
+			request.TimeZone.emplace(std::move(*tz));
 	}
-	if (!request.TimeZone)
-		throw EWSError::TimeZone(E3014);
+
+	mGetUserAvailabilityResponse data;
+	data.FreeBusyResponseArray.emplace().reserve(request.MailboxDataArray.size());
+
+	if (!request.TimeZone) {
+		const auto err = EWSError::TimeZone(E3014);
+		for (size_t i = 0; i < request.MailboxDataArray.size(); ++i) {
+			auto& fbr = data.FreeBusyResponseArray->emplace_back();
+			fbr.ResponseMessage.emplace(err);
+		}
+		data.serialize(response);
+		return;
+	}
 
 	tDuration &TimeWindow = request.FreeBusyViewOptions ?
 	                        request.FreeBusyViewOptions->TimeWindow :
 	                        request.SuggestionsViewOptions->DetailedSuggestionsWindow;
 
-	mGetUserAvailabilityResponse data;
-	data.FreeBusyResponseArray.emplace().reserve(request.MailboxDataArray.size());
+	const tSerializableTimeZone& timezone = *request.TimeZone;
+	const auto windowStart = timezone.remove(TimeWindow.StartTime);
+	const auto windowEnd = timezone.remove(TimeWindow.EndTime);
+	auto start = clock::to_time_t(windowStart);
+	auto end   = clock::to_time_t(windowEnd);
+
 	for (const tMailboxData &MailboxData : request.MailboxDataArray) try {
-		auto maildir = ctx.get_maildir(MailboxData.Email);
-		auto start = clock::to_time_t(request.TimeZone->remove(TimeWindow.StartTime));
-		auto end   = clock::to_time_t(request.TimeZone->remove(TimeWindow.EndTime));
+		std::string maildir = ctx.get_maildir(MailboxData.Email);
 		tFreeBusyView fbv(ctx.auth_info().username, maildir.c_str(), start, end);
 		mFreeBusyResponse& fbr = data.FreeBusyResponseArray->emplace_back(std::move(fbv));
-		for (auto &event : *fbr.FreeBusyView->CalendarEventArray) {
-			event.StartTime.offset = request.TimeZone->offset(event.StartTime.time);
-			event.EndTime.offset = request.TimeZone->offset(event.EndTime.time);
+		if (fbr.FreeBusyView && fbr.FreeBusyView->CalendarEventArray) {
+			for (auto &event : *fbr.FreeBusyView->CalendarEventArray) {
+				event.StartTime.offset = timezone.offset(event.StartTime.time);
+				event.EndTime.offset = timezone.offset(event.EndTime.time);
+			}
 		}
 		fbr.ResponseMessage.emplace().success();
 	} catch(const EWSError& err) {
 		mFreeBusyResponse& fbr = data.FreeBusyResponseArray->emplace_back();
 		fbr.ResponseMessage.emplace(err);
+	} catch(const std::exception& err) {
+		mlog(LV_ERR, "[ews#%d] failed to resolve availability for %s: %s",
+		    ctx.context_id(), MailboxData.Email.Address.c_str(), err.what());
+		mFreeBusyResponse& fbr = data.FreeBusyResponseArray->emplace_back();
+		fbr.ResponseMessage.emplace(EWSError::InternalServerError(err.what()));
 	}
 
 	data.serialize(response);

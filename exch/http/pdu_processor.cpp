@@ -175,15 +175,6 @@ static void pdu_processor_free_stack_root(NDR_STACK_ROOT *pstack_root)
 	delete pstack_root;
 }
 
-static size_t pdu_processor_ndr_stack_size(NDR_STACK_ROOT *pstack_root, int type)
-{
-	if (type == NDR_STACK_IN)
-		return pstack_root->in_stack.get_total();
-	else if (type == NDR_STACK_OUT)
-		return pstack_root->out_stack.get_total();
-	return 0;
-}
-
 void pdu_processor_init(int connection_num, const char *netbios_name,
     const char *dns_name, const char *dns_domain, BOOL header_signing,
     size_t max_request_mem, std::span<const generic_module> &&names)
@@ -1383,7 +1374,6 @@ static BOOL pdu_processor_reply_request(DCERPC_CALL *pcall,
 	uint32_t flags;
 	uint32_t length;
 	size_t sig_size;
-	size_t alloc_size;
 	uint32_t chunk_size;
 	uint32_t total_length;
 	
@@ -1393,30 +1383,26 @@ static BOOL pdu_processor_reply_request(DCERPC_CALL *pcall,
 	if (pcall->pcontext->b_ndr64)
 		flags |= NDR_FLAG_NDR64;
 	auto prequest = static_cast<dcerpc_request *>(pcall->pkt.payload);
-	alloc_size = pdu_processor_ndr_stack_size(pstack_root, NDR_STACK_OUT);
-	alloc_size = 2 * alloc_size + 1024;
-	std::unique_ptr<uint8_t, stdlib_delete> pdata(me_alloc<uint8_t>(alloc_size));
-	if (NULL == pdata) {
-		pdu_processor_free_stack_root(pstack_root);
-		mlog(LV_DEBUG, "pdu_processor: push fail on RPC call %u on %s",
-			prequest->opnum, pcall->pcontext->pinterface->name);
-		return pdu_processor_fault(pcall, DCERPC_FAULT_OTHER);
-	}
 	NDR_PUSH ndr_push;
-	ndr_push.init(pdata.get(), alloc_size, flags);
+	if (!ndr_push.init(nullptr, 0, flags)) {
+		pdu_processor_free_stack_root(pstack_root);
+		return pdu_processor_fault(pcall, DCERPC_FAULT_NDR);
+	}
 	ndr_push.set_ptrcnt(pcall->ptr_cnt);
 	
 	/* marshaling the NDR out param data */
 	auto ret = pcall->pcontext->pinterface->ndr_push(prequest->opnum, ndr_push, pout);
 	if (ret != pack_result::ok) {
-		mlog(LV_ERR, "E-1918: ndr_push failed with result code %u",
+		mlog(LV_ERR, "E-1918: ndr_push(%s,%u) failed with pack_result::%u",
+			pcall->pcontext->pinterface->name,
+			prequest->opnum,
 			static_cast<unsigned int>(ret));
 		pdu_processor_free_stack_root(pstack_root);
 		return pdu_processor_fault(pcall, DCERPC_FAULT_NDR);
 	}
 	pdu_processor_free_stack_root(pstack_root);
 	DATA_BLOB stub;
-	stub.pb = pdata.get();
+	stub.pb = ndr_push.data;
 	stub.cb = ndr_push.offset;
 	total_length = stub.cb;
 	sig_size = 0;
@@ -1529,7 +1515,7 @@ static uint32_t pdu_processor_apply_async_id()
 	pasync_node->pstack_root = pstack_root;
 	gx_strlcpy(pasync_node->vconn_host, pcontext->host, std::size(pasync_node->vconn_host));
 	pasync_node->vconn_port = pcontext->port;
-	strcpy(pasync_node->vconn_cookie, pchannel_in->connection_cookie);
+	gx_strlcpy(pasync_node->vconn_cookie, pchannel_in->connection_cookie, std::size(pasync_node->vconn_cookie));
 	
 	auto ctx_num = g_connection_num * g_connection_ratio;
 	auto async_id = get_next_async_id();
@@ -1847,7 +1833,6 @@ static void pdu_processor_process_orphaned(DCERPC_CALL *pcall)
 void pdu_processor_rts_echo(char *pbuff)
 {
 	int flags;
-	NDR_PUSH ndr;
 	dcerpc_ncacn_packet pkt(g_bigendian);
 	
 	pkt.pkt_type = DCERPC_PKT_RTS;
@@ -1862,9 +1847,9 @@ void pdu_processor_rts_echo(char *pbuff)
 		flags = NDR_FLAG_BIGENDIAN;
 	else
 		flags = 0;
+	NDR_PUSH ndr;
 	ndr.init(pbuff, 20, flags);
 	pdu_ndr_push_ncacnpkt(&ndr, &pkt);
-	ndr.destroy();
 }
 
 BOOL dcerpc_call::rts_ping() try

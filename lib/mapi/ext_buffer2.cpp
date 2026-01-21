@@ -7,6 +7,8 @@
 #include <vector>
 #include <gromox/ext_buffer.hpp>
 #define TRY(expr) do { pack_result klfdv{expr}; if (klfdv != pack_result::success) return klfdv; } while (false)
+#define CLAMP16(v) ((v) = std::min((v), static_cast<uint16_t>(UINT16_MAX)))
+#define CLAMP32(v) ((v) = std::min((v), static_cast<uint32_t>(UINT32_MAX)))
 using namespace gromox;
 
 /*
@@ -40,11 +42,20 @@ using namespace gromox;
 	}
 
 #define PULL_AC(T, t, C, c, fn) \
-	pack_result EXT_PULL::g_ ## fn ## _a(std::vector<T> *r) \
+	pack_result EXT_PULL::g_ ## fn ## _a(std::vector<T> *r, uint8_t ix) \
 	{ \
-		C count; \
-		TRY(g_ ## c(&count)); \
-		count = std::min(count, std::numeric_limits<C>::max()); \
+		size_t count = 0; \
+		if (ix == 2) { \
+			uint16_t z; \
+			TRY(g_uint16(&z)); \
+			CLAMP16(z); \
+			count = z; \
+		} else if (ix == 4) { \
+			uint32_t z; \
+			TRY(g_uint32(&z)); \
+			CLAMP32(z); \
+			count = z; \
+		} \
 		return g_ ## t ## _an(r, count); \
 	}
 
@@ -162,6 +173,19 @@ pack_result EXT_PUSH::p_str_a(std::span<const char *const> r)
 	return pack_result::ok;
 }
 
+pack_result EXT_PUSH::p_str_a(std::span<const std::string> r)
+{
+	if (r.size() > UINT32_MAX)
+		return pack_result::format;
+	TRY(p_uint32(r.size()));
+	for (uint32_t i = 0; i < r.size(); ++i) {
+		if (m_flags & EXT_FLAG_ABK)
+			TRY(p_uint8(0xFF));
+		TRY(p_str(r[i]));
+	}
+	return pack_result::ok;
+}
+
 pack_result EXT_PUSH::p_wstr_a(std::span<const char *const> r)
 {
 	if (r.size() > UINT32_MAX)
@@ -190,11 +214,11 @@ pack_result EXT_PUSH::p_guid_a(std::span<const GUID> r)
 	return pack_result::ok;
 }
 
-pack_result EXT_PULL::g_propid_a(std::vector<uint16_t> *a)
+pack_result EXT_PULL::g_propid_a(std::vector<propid_t> *a)
 {
 	uint16_t count;
 	TRY(g_uint16(&count));
-	count = std::min(count, std::numeric_limits<uint16_t>::max());
+	count = std::min(count, std::numeric_limits<propid_t>::max());
 	return g_uint16_an(a, count);
 }
 
@@ -383,12 +407,18 @@ pack_result EXT_PUSH::p_problem_a(std::span<const PROPERTY_PROBLEM> r)
 	return pack_result::ok;
 }
 
-pack_result EXT_PUSH::p_eid_a(std::span<const uint64_t> r)
+pack_result EXT_PUSH::p_eid_a(std::span<const eid_t> r, uint8_t ix)
 {
-	if (r.size() > UINT32_MAX)
-		return pack_result::format;
-	TRY(p_uint32(r.size()));
+	if (ix == 2) {
+		if (r.size() > UINT16_MAX)
+			return pack_result::format;
+		TRY(p_uint16(r.size()));
+	} else if (ix == 4) {
+		if (r.size() > UINT32_MAX)
+			return pack_result::format;
+		TRY(p_uint32(r.size()));
+	}
 	for (auto eid : r)
-		TRY(p_uint64(eid));
+		TRY(p_uint64(eid.m_value));
 	return pack_result::ok;
 }

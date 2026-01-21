@@ -352,27 +352,10 @@ static bool tpropval_subject_handler(TPROPVAL_ARRAY *ar, const TAGGED_PROPVAL &p
 	return true;
 }
 
-static char *u16convert(const uint8_t *data, size_t inbytes)
+static char *u16convert(std::string_view sv)
 {
-	size_t bytes = inbytes * 3 / 2 + 1;
-	auto outbuf = me_alloc<char>(bytes);
-	if (outbuf == nullptr)
-		return nullptr;
-	auto cd = iconv_open("UTF-8", "UTF-16LE");
-	if (cd == iconv_t(-1)) {
-		free(outbuf);
-		return nullptr;
-	}
-	auto icv_in = reinterpret_cast<char *>(const_cast<uint8_t *>(data));
-	auto icv_out = outbuf;
-	auto icv_obytes = bytes;
-	iconv(cd, &icv_in, &inbytes, &icv_out, &icv_obytes);
-	iconv_close(cd);
-	if (icv_obytes > 0)
-		*icv_out = '\0';
-	else
-		outbuf[bytes-1] = '\0';
-	return outbuf;
+	auto s = iconvtext(sv, "UTF-16LE", "UTF-8");
+	return strndup(s.c_str(), s.size());
 }
 
 static std::unique_ptr<TPROPVAL_ARRAY, gi_delete>
@@ -430,7 +413,7 @@ mv_decode_str(proptag_t proptag, const uint8_t *data, size_t dsize)
 		if (PROP_TYPE(proptag) == PT_MV_STRING8)
 			ba->ppstr[i] = strndup(reinterpret_cast<const char *>(&data[ofs]), next_ofs - ofs);
 		else
-			ba->ppstr[i] = u16convert(&data[ofs], next_ofs - ofs);
+			ba->ppstr[i] = u16convert({reinterpret_cast<const char *>(&data[ofs]), next_ofs - ofs});
 		if (ba->ppstr[i] == nullptr)
 			throw std::bad_alloc();
 	}
@@ -540,7 +523,7 @@ static void emit_namedprop(namedprop_bimap &name_map, libpff_record_entry_t *ren
 	if (!ep.init(nullptr, 0, EXT_FLAG_WCOUNT))
 		throw std::bad_alloc();
 	if (ep.p_uint32(GXMT_NAMEDPROP) != pack_result::success ||
-	    ep.p_uint32(proptag) != pack_result::success ||
+	    ep.p_uint64(proptag) != pack_result::success ||
 	    ep.p_uint32(0) != pack_result::success ||
 	    ep.p_uint64(0) != pack_result::success ||
 	    ep.p_propname(static_cast<PROPERTY_NAME>(pn_req)) != pack_result::success)
@@ -590,10 +573,6 @@ static void recordent_to_tpropval(libpff_record_entry_t *rent,
 	union {
 		BINARY bin;
 		GUID guid;
-		struct {
-			BINARY svbin;
-			SVREID svreid;
-		};
 		SHORT_ARRAY sa;
 		LONG_ARRAY la;
 		LONGLONG_ARRAY lla;
@@ -601,6 +580,7 @@ static void recordent_to_tpropval(libpff_record_entry_t *rent,
 		DOUBLE_ARRAY da;
 		GUID_ARRAY ga;
 	} u;
+	SVREID svreid;
 	std::unique_ptr<TPROPVAL_ARRAY, gi_delete> uextra;
 	TAGGED_PROPVAL pv;
 	pv.proptag = PROP_TAG(vtype, etype);
@@ -646,8 +626,8 @@ static void recordent_to_tpropval(libpff_record_entry_t *rent,
 				throw az_error("PF-1036", err);
 		} else if (vtype == PT_UNICODE) {
 			fprintf(stderr, "PF-1041: Garbage in string which cannot be represented in UTF-8\n");
-			auto s = iconvtext(reinterpret_cast<char *>(buf.get()), dsize,
-			         "UTF-16", "UTF-8//IGNORE");
+			auto s = iconvtext({reinterpret_cast<char *>(buf.get()), dsize},
+			         "UTF-16", "UTF-8");
 			if (errno != 0)
 				throw YError("PF-1140: "s + strerror(errno));
 			dsize = s.size() + 1;
@@ -655,8 +635,8 @@ static void recordent_to_tpropval(libpff_record_entry_t *rent,
 			memcpy(buf.get(), s.data(), dsize);
 		} else if (vtype == PT_STRING8) {
 			fprintf(stderr, "PF-1041: Garbage in string which cannot be represented in UTF-8\n");
-			auto s = iconvtext(reinterpret_cast<char *>(buf.get()), dsize,
-			         g_ascii_charset, "UTF-8//IGNORE");
+			auto s = iconvtext({reinterpret_cast<char *>(buf.get()), dsize},
+			         g_ascii_charset, "UTF-8");
 			if (errno != 0)
 				throw YError("PF-1141: "s + strerror(errno));
 			dsize = s.size() * 3 + 1;
@@ -682,13 +662,13 @@ static void recordent_to_tpropval(libpff_record_entry_t *rent,
 		pv.pvalue = &u.guid;
 		break;
 	case PT_SVREID:
-		pv.pvalue = &u.svreid;
-		u.svbin.cb = dsize;
-		u.svbin.pv = buf.get();
-		u.svreid.pbin = &u.svbin;
-		u.svreid.folder_id = 0;
-		u.svreid.message_id = 0;
-		u.svreid.instance = 0;
+		u.bin.cb = dsize;
+		u.bin.pv = buf.get();
+		svreid.pbin = &u.bin;
+		svreid.folder_id = eid_t{};
+		svreid.message_id = eid_t{};
+		svreid.instance = 0;
+		pv.pvalue = &svreid;
 		break;
 	case PT_MV_SHORT:
 		u.sa.count = dsize / sizeof(uint16_t);
@@ -862,7 +842,7 @@ static int do_folder(unsigned int depth, const parent_desc &parent,
 	if (!ep.init(nullptr, 0, EXT_FLAG_WCOUNT))
 		throw std::bad_alloc();
 	ep.p_uint32(static_cast<uint32_t>(MAPI_FOLDER));
-	ep.p_uint32(ident);
+	ep.p_uint64(ident);
 	ep.p_uint32(static_cast<uint32_t>(parent.type));
 	ep.p_uint64(parent.folder_id);
 	ep.p_tpropval_a(*props);
@@ -933,7 +913,7 @@ static int do_message(unsigned int depth, const parent_desc &parent,
 		throw std::bad_alloc();
 	++g_msg_count;
 	if (ep.p_uint32(static_cast<uint32_t>(MAPI_MESSAGE)) != pack_result::ok ||
-	    ep.p_uint32(ident) != pack_result::ok ||
+	    ep.p_uint64(ident) != pack_result::ok ||
 	    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
 	    ep.p_uint64(parent.folder_id) != pack_result::ok ||
 	    ep.p_msgctnt(*ctnt) != pack_result::ok ||
@@ -1209,7 +1189,7 @@ static errno_t do_file(const char *filename) try
 	}
 
 	uint8_t xsplice = g_splice;
-	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0004", 8) < 0)
+	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0005", 8) < 0)
 		throw YError("PF-1132: %s", strerror(errno));
 	if (HXio_fullwrite(STDOUT_FILENO, &xsplice, sizeof(xsplice)) < 0)
 		throw YError("PF-1133: %s", strerror(errno));

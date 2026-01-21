@@ -9,8 +9,8 @@ Whereas a TNEF file only records one object, GXMT can record many, folders
 included. GXMT is streamable; there are no forward references, so the stream
 need not be buffered by a reader to resolve refs. Backreferences are typically
 named properties and folders that were created as part of processing earlier
-parts of a stream. Out of convenience of implementation, the mt2exm program
-buffers one entire object at a time before acting on it.
+parts of a stream. Out of convenience of implementation, the gromox-import
+program buffers one entire object at a time before acting on it.
 
 
 Spec
@@ -18,7 +18,7 @@ Spec
 
 All integers are to be in little-endian form.
 
-* ``char magic[8] = "GXMT0004";``
+* ``char magic[8] = "GXMT0005";``
   Magic fixed value to indicate the MT stream revision.
 * ``uint8_t splice_flag;``
   Indicates whether the root object of this MT stream is to become a new folder
@@ -36,7 +36,7 @@ All integers are to be in little-endian form.
 	* ``uint64_t fm_entries;``
 	  The number of entries in the folder map
 	* Repeat *fm_entries* times:
-		* ``uint32_t nid;``
+		* ``uint64_t nid;``
 		  Numeric identifier for the folder within the MT stream.
 		* ``uint8_t create;``
 		  Indicates that a new folder is to be created (1), or that a
@@ -65,34 +65,34 @@ All integers are to be in little-endian form.
 		  translations if the proptype matches.
 		* PROPERTY_NAME serialized struct
 
-The remainder of the stream is a set of "instructions" (so to speak) to mt2exm
-to create folders/messages in the target mailbox. Each packet/frame is:
+The remainder of the stream is a set of "instructions" (so to speak) to
+gromox-import to create folders/messages in the target mailbox. Each
+packet/frame is:
 
 * ``uint64_t obj_size;``
   Size in bytes for this frame.
   The obj_size value does not include obj_size's own field size.
 * Frame:
 	* ``uint32_t mapi_objtype;``
-	  ``MAPI_FOLDER`` (3), ``MAPI_MESSAGE`` (5), ``MAPI_ATTACH`` (7), or a
+	  ``MAPI_FOLDER`` (3), ``MAPI_MESSAGE`` (5), or a
 	  named property (250).
-	* ``uint32_t nid;``
+	* ``uint64_t nid;``
 	  A unique identifier for this object in the MT stream.
 	  Value 0 is reserved and must not be used.
+	  Value 0xffffffffffffffff is reserved and should not be used.
 	* ``uint32_t parent_type;``
 		* If mapi_objtype is MAPI_FOLDER, parent_type must be
 		  MAPI_FOLDER or zero (0 only allowed if parent_fid does not
 		  indicate a real parent).
 		* If mapi_objtype is MAPI_MESSAGE, parent_type must be
-		  MAPI_FOLDER, MAPI_ATTACH (7), or zero (0 only allowed if
+		  MAPI_FOLDER or zero (0 only allowed if
 		  parent_fid does not indicate a real parent)
-		* If mapi_objtype is MAPI_ATTACH, parent_type must be
-		  MAPI_MESSAGE.
 		* If mapi_objtype is namedprop/250, parent_type is ignored.
 		* Reader implementations are free to ignore this field if they
 		  kept track of the parent object's type in another way.
 		* Writer implementations must be truthful about the value.
 	* ``uint64_t parent_fid;``
-		* Parent object of a folder, message or attachment.
+		* Parent object of a folder or message.
 		* The value 0 is reserved.
 		* The value 0xffffffffffffffff indicates an "unanchored"
 		  message that does not belong to any particular folder.
@@ -112,6 +112,10 @@ to create folders/messages in the target mailbox. Each packet/frame is:
 	  frame. A reader implementation may choose to continue parsing at
 	  the next frame (the ``obj_size`` field is helpful in knowing where
 	  the next frame starts), or abort parsing altogether.
+
+Attachments should be tied to a MESSAGE_CONTENT struct and encoded as such.
+GXMT decoders do not expect to see packets with objtype MAPI_ATTACH (7) or
+packets with parent_type MAPI_ATTACH.
 
 
 ATTACHMENT_CONTENT serialization
@@ -190,10 +194,10 @@ TAGGED_PROPVAL serialization
 	* PT_NULL (0x1): (no value)
 	* PT_SHORT (0x2): a s16LE integer follows
 	* PT_LONG (0x3): a s32LE integer follows
-	* PT_FLOAT (0x4): a IEEE754 32-bit fp value follows
-	* PT_DOUBLE (0x5): a IEEE754 64-bit fp value follows
+	* PT_FLOAT (0x4): a IEEE754 binary32 (LE) value follows
+	* PT_DOUBLE (0x5): a IEEE754 binary64 (LE) value follows
 	* PT_CURRENCY (0x6): a s64LE integer indicating a quantity in units of 1/10000.
-	* PT_APPTIME (0x7): a IEEE754 64-bit fp value follows
+	* PT_APPTIME (0x7): a IEEE754 binary64 (LE) value follows
 	* PT_ERROR (0xa): a u32LE value indicating a MAPI error code;
 	  doesn't normally occur in GXMT streams
 	* PT_BOOLEAN (0xb): a uint8_t indicating false (0) or true (1). Writers

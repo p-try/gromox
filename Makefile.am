@@ -38,7 +38,7 @@ dist_unit_DATA = system/gromox-cleaner.service system/gromox-cleaner.timer \
 	system/gromox-snapshot.service system/gromox-snapshot.timer \
 	system/gromox-timer.service system/gromox-zcore.service
 
-sbin_PROGRAMS = gromox-abktconv gromox-compress gromox-dbop gromox-e2ghelper gromox-eml2mbox gromox-eml2mt gromox-exm2eml gromox-mailq gromox-mbck gromox-mbop gromox-mbsize gromox-mkmidb gromox-mkprivate gromox-mkpublic gromox-kdb2mt gromox-mt2exm
+sbin_PROGRAMS = gromox-abktconv gromox-compress gromox-dbop gromox-e2ghelper gromox-eml2mbox gromox-eml2mt gromox-export gromox-import gromox-mailq gromox-mbck gromox-mbop gromox-mbsize gromox-mkmidb gromox-mkprivate gromox-mkpublic gromox-kdb2mt
 if HAVE_CURL
 sbin_PROGRAMS += gromox-dscli
 endif
@@ -51,7 +51,7 @@ endif
 if HAVE_PFF
 sbin_PROGRAMS += gromox-pff2mt
 endif
-dist_sbin_SCRIPTS = gromox-abktpull tools/gromox-exm2ical tools/gromox-exm2mt tools/gromox-exm2tnef tools/gromox-exm2vcf tools/gromox-ical2mt tools/gromox-mbox2mt tools/gromox-tnef2mt tools/gromox-vcf2mt
+dist_sbin_SCRIPTS = gromox-abktpull tools/gromox-exm2eml tools/gromox-exm2ical tools/gromox-exm2mt tools/gromox-exm2tnef tools/gromox-exm2vcf tools/gromox-ical2mt tools/gromox-mbox2mt tools/gromox-mt2exm tools/gromox-tnef2mt tools/gromox-vcf2mt
 dist_pkglibexec_SCRIPTS = tools/kdb-uidextract tools/kdb-uidextract-limited
 noinst_DATA = dldcheck.stamp
 
@@ -191,14 +191,14 @@ gromox_eml2mbox_SOURCES = tools/eml2mbox.cpp
 gromox_eml2mbox_LDADD = ${libHX_LIBS}
 gromox_eml2mt_SOURCES = tools/eml2mt.cpp tools/genimport.cpp tools/genimport.hpp
 gromox_eml2mt_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la
-gromox_exm2eml_SOURCES = tools/exm2eml.cpp tools/genimport.cpp tools/genimport.hpp
-gromox_exm2eml_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la
+gromox_export_SOURCES = tools/exporter.cpp tools/genimport.cpp tools/genimport.hpp
+gromox_export_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la
 gromox_mailq_SOURCES = tools/mailq.cpp
 gromox_mailq_LDADD = libgromox_common.la
 gromox_mbck_SOURCES = tools/mbck.cpp
 gromox_mbck_LDADD = ${libHX_LIBS} ${fmt_LIBS} ${sqlite_LIBS} libgromox_common.la
 gromox_mbop_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/mbop.hpp tools/mbop.cpp
-EXTRA_DIST += tools/mbop_delmsg.cpp tools/mbop_emptyfld.cpp tools/mbop_foreach.cpp tools/mbop_freebusy.cpp tools/mbop_locale.cpp tools/mbop_main.cpp tools/mbop_purge.cpp tools/staticnpmap.cpp
+EXTRA_DIST += tools/kdbsub.cpp tools/mbop_delmsg.cpp tools/mbop_emptyfld.cpp tools/mbop_foreach.cpp tools/mbop_freebusy.cpp tools/mbop_locale.cpp tools/mbop_main.cpp tools/mbop_purge.cpp tools/mbop_walk.cpp tools/staticnpmap.cpp
 gromox_mbop_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la libgxs_midb_agent.la
 gromox_mbsize_SOURCES = tools/mbsize.cpp
 gromox_mbsize_LDADD = ${sqlite_LIBS} libgromox_common.la
@@ -210,8 +210,8 @@ gromox_mkpublic_SOURCES = tools/mkpublic.cpp tools/mkshared.cpp tools/mkshared.h
 gromox_mkpublic_LDADD = ${fmt_LIBS} ${libHX_LIBS} ${mysql_LIBS} ${libssl_LIBS} ${sqlite_LIBS} libgromox_common.la libgromox_dbop.la libgromox_mapi.la
 gromox_kdb2mt_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/kdb2mt.cpp
 gromox_kdb2mt_LDADD = ${fmt_LIBS} ${libHX_LIBS} ${jsoncpp_LIBS} ${mysql_LIBS} ${libpff_LIBS} ${zlib_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la
-gromox_mt2exm_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/mt2exm.cpp
-gromox_mt2exm_LDADD = ${fmt_LIBS} ${jsoncpp_LIBS} ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la libgxs_ruleproc.la
+gromox_import_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/importer.cpp
+gromox_import_LDADD = ${fmt_LIBS} ${jsoncpp_LIBS} ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la libgxs_ruleproc.la
 gromox_oxm2mt_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/oxm2mt.cpp
 gromox_oxm2mt_LDADD = ${libHX_LIBS} ${fmt_LIBS} ${iconv_LIBS} ${mysql_LIBS} ${libolecf_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la
 gromox_pff2mt_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/pff2mt.cpp
@@ -230,7 +230,7 @@ mapi_la_LDFLAGS += -Wl,--allow-shlib-undefined
 endif
 EXTRA_mapi_la_DEPENDENCIES = default.sym
 
-noinst_PROGRAMS = dldcheck tests/compress tests/dnsbl_check tests/exrpctest tests/gxl-383 tests/jsontest tests/oxcmail_ie tests/ucvttest tests/udb tests/utf8filter tests/utiltest tests/vcard tools/tzdump
+noinst_PROGRAMS = dldcheck tests/bodyconv tests/compress tests/dnsbl_check tests/exrpctest tests/gxl-383 tests/jsontest tests/oxcmail_ie tests/ucvttest tests/udb tests/utf8filter tests/utiltest tests/vcard tools/tzdump
 if HAVE_ESEDB
 noinst_PROGRAMS += tests/epv_unpack
 endif
@@ -239,9 +239,11 @@ noinst_PROGRAMS += tests/gssauth
 endif
 dldcheck_SOURCES = tools/dldcheck.cpp
 dldcheck_LDADD = ${dl_LIBS}
-TESTS = tests/utiltest
+TESTS = tests/bodyconv tests/utiltest
 tests_udb_SOURCES = tests/userdb.cpp
 tests_udb_LDADD = ${libHX_LIBS} libgromox_common.la libgxs_mysql_adaptor.la
+tests_bodyconv_SOURCES = tests/bodyconv.cpp
+tests_bodyconv_LDADD = ${libHX_LIBS} libgromox_common.la libgromox_mapi.la
 tests_compress_SOURCES = tests/compress.cpp
 tests_compress_LDADD = libgromox_common.la
 tests_dnsbl_check_SOURCES = tests/dnsbl_check.cpp
@@ -289,13 +291,14 @@ dist_man_MANS = \
 	doc/gromox-abktpull.8 doc/gromox-cleaner.service.8 \
 	doc/gromox-dbop.8 doc/gromox-dscli.8 \
 	doc/gromox-e2ghelper.8 \
-	doc/gromox-eml2mbox.8 doc/gromox-eml2mt.8 doc/gromox-exm2eml.8 \
+	doc/gromox-eml2mbox.8 doc/gromox-eml2mt.8 \
 	doc/gromox-exm2ical.8 doc/gromox-exm2mt.8 doc/gromox-exm2tnef.8 \
-	doc/gromox-exm2vcf.8 doc/gromox-ical2mt.8 \
+	doc/gromox-exm2vcf.8 doc/gromox-export.8 doc/gromox-ical2mt.8 \
+	doc/gromox-import.8 \
 	doc/gromox-kdb2mt.8 doc/gromox-mailq.8 doc/gromox-mbck.8 doc/gromox-mbop.8 \
 	doc/gromox-mbsize.8 \
 	doc/gromox-mkmidb.8 doc/gromox-mkprivate.8 doc/gromox-mkpublic.8 \
-	doc/gromox-mt2exm.8 doc/gromox-selinux.5 \
+	doc/gromox-selinux.5 \
 	doc/gromox-snapshot.8 doc/gromox-vcf2mt.8 doc/http.8gx \
 	doc/imap.8gx doc/istore.8gx \
 	doc/kdb-uidextract.8 doc/kdb-uidextract-limited.8 \
@@ -326,7 +329,7 @@ tzd_files += data/Greenwich.tzd data/Haiti.tzd data/Hawaiian.tzd data/India.tzd 
 tzd_files += data/Saratov.tzd data/Singapore.tzd data/South_Africa.tzd data/South_Sudan.tzd data/Sri_Lanka.tzd data/Sudan.tzd data/Syria.tzd data/Taipei.tzd data/Tasmania.tzd data/Tocantins.tzd data/Tokyo.tzd data/Tomsk.tzd data/Tonga.tzd data/Transbaikal.tzd data/Turkey.tzd data/Turks_And_Caicos.tzd data/US_Eastern.tzd data/US_Mountain.tzd data/UTC+12.tzd data/UTC+13.tzd data/UTC-02.tzd data/UTC-08.tzd data/UTC-09.tzd data/UTC-11.tzd data/UTC.tzd data/Ulaanbaatar.tzd data/Venezuela.tzd data/Vladivostok.tzd data/Volgograd.tzd data/W__Australia.tzd data/W__Central_Africa.tzd data/W__Europe.tzd data/W__Mongolia.tzd data/West_Asia.tzd data/West_Bank.tzd data/West_Pacific.tzd data/Yakutsk.tzd data/Yukon.tzd
 tzd_files += data/windowsZones.xml
 header_files = include/gromox/ab_tree.hpp include/gromox/algorithm.hpp include/gromox/archive.hpp include/gromox/atomic.hpp include/gromox/authmgr.hpp include/gromox/bounce_gen.hpp include/gromox/clock.hpp include/gromox/common_types.hpp include/gromox/config_file.hpp include/gromox/contexts_pool.hpp include/gromox/cookie_parser.hpp include/gromox/cryptoutil.hpp include/gromox/database.h include/gromox/database_mysql.hpp include/gromox/dbop.h include/gromox/dcerpc.hpp include/gromox/defs.h include/gromox/double_list.hpp include/gromox/dsn.hpp include/gromox/eid_array.hpp include/gromox/element_data.hpp include/gromox/exmdb_client.hpp include/gromox/exmdb_common_util.hpp include/gromox/exmdb_ext.hpp include/gromox/exmdb_idef.hpp include/gromox/exmdb_provider_client.hpp include/gromox/exmdb_rpc.hpp include/gromox/exmdb_server.hpp include/gromox/ext_buffer.hpp
-header_files += include/gromox/fileio.h include/gromox/flat_set.hpp include/gromox/flusher_common.h include/gromox/freebusy.hpp include/gromox/gab.hpp include/gromox/generic_connection.hpp include/gromox/hook_common.h include/gromox/hpm_common.h include/gromox/http.hpp include/gromox/ical.hpp include/gromox/icase.hpp include/gromox/idset.hpp include/gromox/json.hpp include/gromox/list_file.hpp include/gromox/lzxpress.hpp include/gromox/mail.hpp include/gromox/mail_func.hpp include/gromox/mapi_types.hpp include/gromox/mapidefs.h include/gromox/mapierr.hpp include/gromox/mapitags.hpp include/gromox/midb.hpp include/gromox/midb_agent.hpp include/gromox/mime.hpp include/gromox/mjson.hpp include/gromox/mysql_adaptor.hpp include/gromox/ndr.hpp include/gromox/oxcmail.hpp include/gromox/oxoabkt.hpp
+header_files += include/gromox/fileio.h include/gromox/flat_set.hpp include/gromox/flusher_common.h include/gromox/freebusy.hpp include/gromox/gab.hpp include/gromox/generic_connection.hpp include/gromox/hook_common.h include/gromox/hpm_common.h include/gromox/http.hpp include/gromox/ical.hpp include/gromox/icase.hpp include/gromox/idset.hpp include/gromox/json.hpp include/gromox/list_file.hpp include/gromox/lzxpress.hpp include/gromox/mail.hpp include/gromox/mail_func.hpp include/gromox/mapi_types.hpp include/gromox/mapidefs.h include/gromox/mapierr.hpp include/gromox/mapitags.hpp include/gromox/midb.hpp include/gromox/midb_agent.hpp include/gromox/mime.hpp include/gromox/mjson.hpp include/gromox/mysql_adaptor.hpp include/gromox/ndr.hpp include/gromox/notify_types.hpp include/gromox/oxcmail.hpp include/gromox/oxoabkt.hpp
 header_files += include/gromox/paths.h include/gromox/pcl.hpp include/gromox/plugin.hpp include/gromox/proc_common.h include/gromox/process.hpp include/gromox/proptag_array.hpp include/gromox/propval.hpp include/gromox/range_set.hpp include/gromox/resource_pool.hpp include/gromox/restriction.hpp include/gromox/rop_util.hpp include/gromox/rpc_types.hpp include/gromox/rule_actions.hpp include/gromox/safeint.hpp include/gromox/simple_tree.hpp include/gromox/sortorder_set.hpp include/gromox/stream.hpp include/gromox/svc_common.h include/gromox/svc_loader.hpp include/gromox/textmaps.hpp include/gromox/threads_pool.hpp include/gromox/tie.hpp include/gromox/tnef.hpp include/gromox/usercvt.hpp include/gromox/util.hpp include/gromox/vcard.hpp include/gromox/xarray2.hpp include/gromox/zcore_client.hpp include/gromox/zcore_rpc.hpp include/gromox/zcore_types.hpp include/gromox/zz_ndr_stack.hpp
 if ENABLE_PRIVATE_HEADERS
 pkginclude_HEADERS = ${header_files}

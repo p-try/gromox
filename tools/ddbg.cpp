@@ -28,11 +28,13 @@ using LLU = unsigned long long;
 enum {
 	CM_NONE, CM_DEC_ACTION, CM_DEC_ANYTHING, CM_DEC_ENTRYID, CM_DEC_GUID,
 	CM_DEC_NTTIME, CM_DEC_RESTRICT, CM_DEC_UNIXTIME,
-	CM_LZXDEC, CM_LZXENC, CM_HTMLTORTF,
+	CM_BIN2HEX, CM_BIN2TXT, CM_LZXDEC, CM_LZXENC, CM_HTMLTORTF,
 	CM_HTMLTOTEXT, CM_RTFCP, CM_RTFTOHTML, CM_TEXTTOHTML, CM_UNRTFCP,
 };
 static unsigned int g_dowhat, g_hex2bin;
 static constexpr struct HXoption g_options_table[] = {
+	{"bin2hex", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_BIN2HEX, "Run bin2hex"},
+	{"bin2txt", 0, HXTYPE_VAL, &g_dowhat, {}, {}, CM_BIN2TXT, "Run bin2txt"},
 	{"decode", 'd', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_ANYTHING, "Try all decoders"},
 	{"decode-action", 'A', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_ACTION, "Decode rule action blob"},
 	{"decode-entryid", 'e', HXTYPE_VAL, &g_dowhat, {}, {}, CM_DEC_ENTRYID, "Decode entryid"},
@@ -474,6 +476,22 @@ static int do_lzx(std::string_view data, bool enc)
 static int do_process_2(std::string_view &&data, const char *str)
 {
 	switch (g_dowhat) {
+	case CM_BIN2HEX: {
+		auto out = bin2hex(data);
+		if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
+	case CM_BIN2TXT: {
+		auto out = bin2txt(data.data(), data.size());
+		if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {
+			perror("write");
+			return -1;
+		}
+		return 0;
+	}
 	case CM_DEC_ANYTHING: {
 		try_entryid(data);
 		try_guid(data);
@@ -538,6 +556,7 @@ static int do_process_2(std::string_view &&data, const char *str)
 	}
 	case CM_RTFTOHTML: {
 		auto at = attachment_list_init();
+		auto cl_0 = HX::make_scope_exit([&]() { attachment_list_free(at); });
 		std::string out;
 		auto err = rtf_to_html(data, "utf-8", out, at);
 		if (err != ecSuccess) {
@@ -562,16 +581,12 @@ static int do_process_2(std::string_view &&data, const char *str)
 		return 0;
 	}
 	case CM_UNRTFCP: {
-		auto unc_size = rtfcp_uncompressed_size(data);
-		if (unc_size == -1) {
-			fprintf(stderr, "Bad header magic, or data stream is shorter than the header says it should be.\n");
-			return -1;
-		} else if (unc_size == 0) {
-			return 0;
-		}
 		std::string out;
 		auto err = rtfcp_uncompress(data, out);
-		if (err != ecSuccess) {
+		if (err == ecInvalidParam) {
+			fprintf(stderr, "Bad header magic, or data stream is shorter than the header says it should be.\n");
+			return -1;
+		} else if (err != ecSuccess) {
 			fprintf(stderr, "rtfcp_uncompress: %s\n", mapi_strerror(err));
 			return -1;
 		} else if (HXio_fullwrite(STDOUT_FILENO, out.data(), out.size()) < 0) {

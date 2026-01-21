@@ -78,7 +78,7 @@ struct tgt_folder {
 };
 
 using attachment_content_ptr = std::unique_ptr<ATTACHMENT_CONTENT, gi_delete>;
-using gi_folder_map_t = std::unordered_map<uint32_t, tgt_folder>;
+using gi_folder_map_t = std::unordered_map<uint64_t, tgt_folder>;
 using message_content_ptr = std::unique_ptr<MESSAGE_CONTENT, gromox::mc_delete>;
 using propname_array_ptr = std::unique_ptr<PROPNAME_ARRAY, gi_delete>;
 using tarray_set_ptr = std::unique_ptr<TARRAY_SET, gi_delete>;
@@ -107,5 +107,6 @@ extern int gi_setup_from_user(const char *);
 extern int gi_setup_from_dir(const char *);
 extern int gi_startup_client(unsigned int maxconn = 1);
 extern eid_t gi_lookup_eid_by_name(const char *dir, const char *name);
+extern eid_t gi_lookup_eid_any_way(const char *dir, const char *name); /* also accepts numeric folder ID */
 extern void gi_shutdown();
 extern gromox::errno_t gi_decapsulate_attachment(message_content_ptr &, unsigned int);

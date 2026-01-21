@@ -3,6 +3,7 @@
 // This file is part of Gromox.
 #include <cassert>
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <csignal>
@@ -23,6 +24,7 @@
 #include <gromox/defs.h>
 #include <gromox/mapidefs.h>
 #include <gromox/mysql_adaptor.hpp>
+#include <gromox/notify_types.hpp>
 #include <gromox/proc_common.h>
 #include <gromox/process.hpp>
 #include <gromox/rop_util.hpp>
@@ -95,7 +97,7 @@ static time_point g_start_time;
 static pthread_t g_scan_id;
 static std::mutex g_lock; /* protects g_handle_hash & g_user_hash */
 static std::mutex g_notify_lock;
-static gromox::atomic_bool g_notify_stop{true};
+static gromox::atomic_bool g_emsi_stop{true};
 static thread_local HANDLE_DATA *g_handle_key;
 static std::unordered_map<GUID, HANDLE_DATA> g_handle_hash;
 static std::unordered_map<std::string, std::vector<HANDLE_DATA *>> g_user_hash;
@@ -433,10 +435,10 @@ void emsmdb_interface_init()
 
 int emsmdb_interface_run()
 {
-	g_notify_stop = false;
+	g_emsi_stop = false;
 	auto ret = pthread_create4(&g_scan_id, nullptr, emsi_scanwork, nullptr);
 	if (ret != 0) {
-		g_notify_stop = true;
+		g_emsi_stop = true;
 		mlog(LV_ERR, "E-1447: pthread_create: %s", strerror(ret));
 		return -4;
 	}
@@ -446,8 +448,8 @@ int emsmdb_interface_run()
 
 void emsmdb_interface_stop()
 {
-	if (!g_notify_stop) {
-		g_notify_stop = true;
+	if (!g_emsi_stop) {
+		g_emsi_stop = true;
 		if (!pthread_equal(g_scan_id, {})) {
 			pthread_kill(g_scan_id, SIGALRM);
 			pthread_join(g_scan_id, NULL);
@@ -517,11 +519,11 @@ static void emsmdb_interface_encode_version(BOOL high_bit,
 ec_error_t emsmdb_interface_connect_ex(uint64_t hrpc, CXH *pcxh, const char *puser_dn,
     uint32_t flags, uint32_t con_mode, uint32_t limit, cpid_t cpid,
     uint32_t lcid_string, uint32_t lcid_sort, uint32_t cxr_link, uint16_t cnvt_cps,
-	uint32_t *pmax_polls, uint32_t *pmax_retry, uint32_t *pretry_delay,
-	uint16_t *pcxr, char *pdn_prefix, char *pdisplayname,
-	const uint16_t pclient_vers[3], uint16_t pserver_vers[3],
-	uint16_t pbest_vers[3], uint32_t *ptimestamp, const uint8_t *pauxin,
-	uint32_t cb_auxin, uint8_t *pauxout, uint32_t *pcb_auxout)
+    uint32_t *pmax_polls, uint32_t *pmax_retry, uint32_t *pretry_delay,
+    uint16_t *pcxr, std::string &pdn_prefix, std::string &pdisplayname,
+    const uint16_t pclient_vers[3], uint16_t pserver_vers[3],
+    uint16_t pbest_vers[3], uint32_t *ptimestamp, const uint8_t *pauxin,
+    uint32_t cb_auxin, uint8_t *pauxout, uint32_t *pcb_auxout) try
 {
 	AUX_INFO aux_out;
 	EXT_PUSH ext_push;
@@ -538,7 +540,7 @@ ec_error_t emsmdb_interface_connect_ex(uint64_t hrpc, CXH *pcxh, const char *pus
 		*pmax_retry = 0;
 		*pretry_delay = 0;
 		*pcxr = 0;
-		pdisplayname[0] = '\0';
+		pdisplayname.clear();
 		memset(pserver_vers, 0, 3 * sizeof(*pserver_vers));
 		memset(pbest_vers, 0, 3 * sizeof(*pbest_vers));
 		*ptimestamp = 0;
@@ -572,7 +574,7 @@ ec_error_t emsmdb_interface_connect_ex(uint64_t hrpc, CXH *pcxh, const char *pus
 	              0 : ext_push.m_offset;
 	aux_out.aux_list.clear();
 	
-	pdn_prefix[0] = '\0';
+	pdn_prefix.clear();
 	rpc_info = get_rpc_info();
 	if (flags & FLAG_PRIVILEGE_ADMIN)
 		return ecLoginPerm;
@@ -593,12 +595,20 @@ ec_error_t emsmdb_interface_connect_ex(uint64_t hrpc, CXH *pcxh, const char *pus
 	if (strcasecmp(username.c_str(), rpc_info.username) != 0)
 		return ecAccessDenied;
 	std::string uds;
-	if (!mysql_adaptor_get_user_displayname(username.c_str(), uds) ||
-	    cu_utf8_to_mb(cpid, uds.c_str(), pdisplayname, 1024) < 0)
+	if (!mysql_adaptor_get_user_displayname(username.c_str(), uds))
 		return ecRpcFailed;
-	if (uds.empty())
-		strcpy(pdisplayname, rpc_info.username);
-	
+	pdisplayname.clear();
+	if (!uds.empty()) {
+		auto uds_cvt = cu_utf8_to_mb(cpid, uds);
+		if (errno == ENOMEM)
+			return ecServerOOM;
+		else if (errno != 0)
+			return ecRpcFailed;
+		pdisplayname = std::move(uds_cvt);
+	}
+	if (pdisplayname.empty())
+		pdisplayname = rpc_info.username;
+
 	emsmdb_interface_decode_version(pclient_vers, client_version);
 	emsmdb_interface_encode_version(TRUE, server_normal_version, pserver_vers);
 	pbest_vers[0] = pclient_vers[0];
@@ -621,6 +631,8 @@ ec_error_t emsmdb_interface_connect_ex(uint64_t hrpc, CXH *pcxh, const char *pus
 		return ecLoginFailure;
 	is_success = true;
 	return ecSuccess;
+} catch (const std::bad_alloc &) {
+	return ecServerOOM;
 }
 
 static bool enable_rop_chaining(uint16_t v[4])
@@ -637,7 +649,6 @@ ec_error_t emsmdb_interface_rpc_ext2(CXH &cxh, uint32_t *pflags,
 	uint32_t *pcb_auxout, uint32_t *ptrans_time) try
 {
 	auto pcxh = &cxh;
-	char username[UADDR_SIZE];
 	HANDLE_DATA *phandle;
 	auto input_flags = *pflags;
 	*pflags = 0;
@@ -693,7 +704,7 @@ ec_error_t emsmdb_interface_rpc_ext2(CXH &cxh, uint32_t *pflags,
 		input_flags |= GROMOX_READSTREAM_NOCHAIN;
 
 	auto result = rop_processor_proc(input_flags, pin, cb_in, pout, pcb_out);
-	std::string usrname = phandle->username;
+	std::string username = phandle->username;
 	uint16_t cxr = phandle->cxr;
 	BOOL b_wakeup = double_list_get_nodes_num(&phandle->notify_list) == 0 ? false : TRUE;
 	emsmdb_interface_put_handle_data(phandle);
@@ -1078,7 +1089,7 @@ void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
 		return;
 	case db_notify_type::hiertbl_row_modified:
 		if (!emsmdb_interface_merge_hierarchy_row_modified(
-		    static_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED *>(pdb_notify->pdata),
+		    std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED>(&pdb_notify->pdata),
 		    obj_handle, logon_id, &phandle->notify_list))
 			break;
 		b_processing = phandle->b_processing;
@@ -1092,14 +1103,14 @@ void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
 		return;
 	case db_notify_type::message_modified:
 		if (!emsmdb_interface_merge_message_modified(
-		    static_cast<const DB_NOTIFY_MESSAGE_MODIFIED *>(pdb_notify->pdata),
+		    std::any_cast<const DB_NOTIFY_MESSAGE_MODIFIED>(&pdb_notify->pdata),
 		    obj_handle, logon_id, &phandle->notify_list))
 			break;
 		emsmdb_interface_put_handle_notify_list(phandle);
 		return;
 	case db_notify_type::folder_modified:
 		if (!emsmdb_interface_merge_folder_modified(
-		    static_cast<const DB_NOTIFY_FOLDER_MODIFIED *>(pdb_notify->pdata),
+		    std::any_cast<const DB_NOTIFY_FOLDER_MODIFIED>(&pdb_notify->pdata),
 		    obj_handle, logon_id, &phandle->notify_list))
 			break;
 		emsmdb_interface_put_handle_notify_list(phandle);
@@ -1151,7 +1162,7 @@ void emsmdb_interface_event_proc(const char *dir, BOOL b_table,
 
 static void *emsi_scanwork(void *pparam)
 {
-	while (!g_notify_stop) {
+	while (!g_emsi_stop) {
 		std::vector<GUID> temp_list;
 		auto cur_time = tp_now();
 		std::unique_lock gl_hold(g_lock);

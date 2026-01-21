@@ -164,8 +164,9 @@ template<typename T> static inline T *re_alloc(void *x, size_t elem) {
 	static_assert(std::is_trivially_default_constructible_v<T> && std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>);
 	return static_cast<T *>(realloc(x, sizeof(T) * elem));
 }
-static inline const char *snul(const std::string &s) { return s.size() != 0 ? s.c_str() : nullptr; }
 static inline const char *znul(const char *s) { return s != nullptr ? s : ""; }
+static inline bool zhasval(const char *s) { return s != nullptr && *s != '\0'; }
+static inline bool znoval(const char *s) { return s == nullptr || *s == '\0'; }
 
 #if defined(COMPILE_DIAG) && !defined(__clang__)
 struct GX_EXPORT errno_t {

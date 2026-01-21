@@ -442,10 +442,10 @@ static pack_result exmdb_pull(EXT_PULL &x, exreq_set_search_criteria &d)
 			return pack_result::alloc;
 		TRY(x.g_restriction(d.prestriction));
 	}
-	d.pfolder_ids = cu_alloc<LONGLONG_ARRAY>();
+	d.pfolder_ids = cu_alloc<EID_ARRAY>();
 	if (d.pfolder_ids == nullptr)
 		return pack_result::alloc;
-	return x.g_uint64_a(d.pfolder_ids);
+	return x.g_eid_a(d.pfolder_ids);
 }
 
 static pack_result exmdb_push(EXT_PUSH &x, const exreq_set_search_criteria &d)
@@ -459,7 +459,7 @@ static pack_result exmdb_push(EXT_PUSH &x, const exreq_set_search_criteria &d)
 		TRY(x.p_uint8(1));
 		TRY(x.p_restriction(*d.prestriction));
 	}
-	return x.p_uint64_a(*d.pfolder_ids);
+	return x.p_eid_a(*d.pfolder_ids);
 }
 
 static pack_result exmdb_pull(EXT_PULL &x, exreq_movecopy_message &d)
@@ -2236,6 +2236,28 @@ static pack_result exmdb_push(EXT_PUSH &x, const exreq_set_maintenance &d)
 	return x.p_uint32(d.mode);
 }
 
+static pack_result exmdb_push(EXT_PUSH &x, const exresp_read_delegates &d)
+{
+	return x.p_str_a(d.userlist);
+}
+
+static pack_result exmdb_pull(EXT_PULL &x, exresp_read_delegates &d)
+{
+	return x.g_str_a(&d.userlist);
+}
+
+static pack_result exmdb_push(EXT_PUSH &x, const exreq_write_delegates &d)
+{
+	TRY(x.p_uint32(d.mode));
+	return x.p_str_a(d.userlist);
+}
+
+static pack_result exmdb_pull(EXT_PULL &x, exreq_write_delegates &d)
+{
+	TRY(x.g_uint32(&d.mode));
+	return x.g_str_a(&d.userlist);
+}
+
 #define RQ_WITH_ARGS \
 	E(get_named_propids) \
 	E(get_named_propnames) \
@@ -2361,7 +2383,9 @@ static pack_result exmdb_push(EXT_PUSH &x, const exreq_set_maintenance &d)
 	E(cgkreset) \
 	E(set_maintenance) \
 	E(autoreply_getprop) \
-	E(autoreply_setprop)
+	E(autoreply_setprop) \
+	E(read_delegates) \
+	E(write_delegates)
 
 /**
  * This uses *& because we do not know which request type we are going to get
@@ -2752,7 +2776,7 @@ static pack_result exmdb_pull(EXT_PULL &x, exresp_get_search_criteria &d)
 			return pack_result::alloc;
 		TRY(x.g_restriction(d.prestriction));
 	}
-	return x.g_uint64_a(&d.folder_ids);
+	return x.g_eid_a(&d.folder_ids);
 }
 
 static pack_result exmdb_push(EXT_PUSH &x, const exresp_get_search_criteria &d)
@@ -2764,7 +2788,7 @@ static pack_result exmdb_push(EXT_PUSH &x, const exresp_get_search_criteria &d)
 		TRY(x.p_uint8(1));
 		TRY(x.p_restriction(*d.prestriction));
 	}
-	return x.p_uint64_a(d.folder_ids);
+	return x.p_eid_a(d.folder_ids);
 }
 
 static pack_result exmdb_pull(EXT_PULL &x, exresp_set_search_criteria &d)
@@ -3676,7 +3700,8 @@ static pack_result exmdb_push(EXT_PUSH &x, const exresp_purge_softdelete &d)
 	E(imapfile_write) \
 	E(imapfile_delete) \
 	E(cgkreset) \
-	E(set_maintenance)
+	E(set_maintenance) \
+	E(write_delegates)
 #define RSP_WITH_ARGS \
 	E(get_all_named_propids) \
 	E(get_named_propids) \
@@ -3777,7 +3802,8 @@ static pack_result exmdb_push(EXT_PUSH &x, const exresp_purge_softdelete &d)
 	E(imapfile_read) \
 	E(autoreply_getprop) \
 	E(autoreply_setprop) \
-	E(purge_softdelete)
+	E(purge_softdelete) \
+	E(read_delegates)
 
 /* exmdb_callid::connect, exmdb_callid::listen_notification not included */
 /*
@@ -3845,7 +3871,7 @@ pack_result exmdb_ext_push_response(const exresp *presponse, BINARY *pbin_out)
 }
 
 pack_result exmdb_ext_pull_db_notify(const BINARY *pbin_in,
-	DB_NOTIFY_DATAGRAM *pnotify)
+    DB_NOTIFY_DATAGRAM *pnotify) try
 {
 	uint8_t tmp_byte;
 	EXT_PULL ext_pull;
@@ -3863,73 +3889,49 @@ pack_result exmdb_ext_pull_db_notify(const BINARY *pbin_in,
 	case db_notify_type::srchtbl_row_modified:
 		break;
 	case db_notify_type::new_mail: {
-		auto n = cu_alloc<DB_NOTIFY_NEW_MAIL>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_NEW_MAIL>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->message_id));
 		TRY(ext_pull.g_uint32(&n->message_flags));
 		return ext_pull.g_str(const_cast<char **>(&n->pmessage_class));
 	}
 	case db_notify_type::folder_created: {
-		auto n = cu_alloc<DB_NOTIFY_FOLDER_CREATED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_CREATED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->parent_id));
 		return ext_pull.g_proptag_a(&n->proptags);
 	}
 	case db_notify_type::message_created: {
-		auto n = cu_alloc<DB_NOTIFY_MESSAGE_CREATED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_CREATED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->message_id));
 		return ext_pull.g_proptag_a(&n->proptags);
 	}
 	case db_notify_type::link_created: {
-		auto n = cu_alloc<DB_NOTIFY_LINK_CREATED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_LINK_CREATED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->message_id));
 		TRY(ext_pull.g_uint64(&n->parent_id));
 		return ext_pull.g_proptag_a(&n->proptags);
 	}
 	case db_notify_type::folder_deleted: {
-		auto n = cu_alloc<DB_NOTIFY_FOLDER_DELETED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_DELETED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		return ext_pull.g_uint64(&n->parent_id);
 	}
 	case db_notify_type::message_deleted: {
-		auto n = cu_alloc<DB_NOTIFY_MESSAGE_DELETED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_DELETED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		return ext_pull.g_uint64(&n->message_id);
 	}
 	case db_notify_type::link_deleted: {
-		auto n = cu_alloc<DB_NOTIFY_LINK_DELETED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_LINK_DELETED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->message_id));
 		return ext_pull.g_uint64(&n->parent_id);
 	}
 	case db_notify_type::folder_modified: {
-		auto n = cu_alloc<DB_NOTIFY_FOLDER_MODIFIED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_MODIFIED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint8(&tmp_byte));
 		if (0 == tmp_byte) {
@@ -3952,20 +3954,14 @@ pack_result exmdb_ext_pull_db_notify(const BINARY *pbin_in,
 		return ext_pull.g_proptag_a(&n->proptags);
 	}
 	case db_notify_type::message_modified: {
-		auto n = cu_alloc<DB_NOTIFY_MESSAGE_MODIFIED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_MODIFIED>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->message_id));
 		return ext_pull.g_proptag_a(&n->proptags);
 	}
 	case db_notify_type::folder_moved:
 	case db_notify_type::folder_copied: {
-		auto n = cu_alloc<DB_NOTIFY_FOLDER_MVCP>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_MVCP>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->parent_id));
 		TRY(ext_pull.g_uint64(&n->old_folder_id));
@@ -3973,38 +3969,26 @@ pack_result exmdb_ext_pull_db_notify(const BINARY *pbin_in,
 	}
 	case db_notify_type::message_moved:
 	case db_notify_type::message_copied: {
-		auto n = cu_alloc<DB_NOTIFY_MESSAGE_MVCP>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_MVCP>();
 		TRY(ext_pull.g_uint64(&n->folder_id));
 		TRY(ext_pull.g_uint64(&n->message_id));
 		TRY(ext_pull.g_uint64(&n->old_folder_id));
 		return ext_pull.g_uint64(&n->old_message_id);
 	}
 	case db_notify_type::search_completed: {
-		auto n = cu_alloc<DB_NOTIFY_SEARCH_COMPLETED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_SEARCH_COMPLETED>();
 		return ext_pull.g_uint64(&n->folder_id);
 	}
 	case db_notify_type::hiertbl_changed:
 	case db_notify_type::cttbl_changed:
 		return pack_result::ok;
 	case db_notify_type::hiertbl_row_added: {
-		auto n = cu_alloc<DB_NOTIFY_HIERARCHY_TABLE_ROW_ADDED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_HIERARCHY_TABLE_ROW_ADDED>();
 		TRY(ext_pull.g_uint64(&n->row_folder_id));
 		return ext_pull.g_uint64(&n->after_folder_id);
 	}
 	case db_notify_type::cttbl_row_added: {
-		auto n = cu_alloc<DB_NOTIFY_CONTENT_TABLE_ROW_ADDED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_CONTENT_TABLE_ROW_ADDED>();
 		TRY(ext_pull.g_uint64(&n->row_folder_id));
 		TRY(ext_pull.g_uint64(&n->row_message_id));
 		TRY(ext_pull.g_uint64(&n->row_instance));
@@ -4013,34 +3997,22 @@ pack_result exmdb_ext_pull_db_notify(const BINARY *pbin_in,
 		return ext_pull.g_uint64(&n->after_instance);
 	}
 	case db_notify_type::hiertbl_row_deleted: {
-		auto n = cu_alloc<DB_NOTIFY_HIERARCHY_TABLE_ROW_DELETED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_HIERARCHY_TABLE_ROW_DELETED>();
 		return ext_pull.g_uint64(&n->row_folder_id);
 	}
 	case db_notify_type::cttbl_row_deleted: {
-		auto n = cu_alloc<DB_NOTIFY_CONTENT_TABLE_ROW_DELETED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_CONTENT_TABLE_ROW_DELETED>();
 		TRY(ext_pull.g_uint64(&n->row_folder_id));
 		TRY(ext_pull.g_uint64(&n->row_message_id));
 		return ext_pull.g_uint64(&n->row_instance);
 	}
 	case db_notify_type::hiertbl_row_modified: {
-		auto n = cu_alloc<DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED>();
 		TRY(ext_pull.g_uint64(&n->row_folder_id));
 		return ext_pull.g_uint64(&n->after_folder_id);
 	}
 	case db_notify_type::cttbl_row_modified: {
-		auto n = cu_alloc<DB_NOTIFY_CONTENT_TABLE_ROW_MODIFIED>();
-		if (n == nullptr)
-			return pack_result::alloc;
-		pnotify->db_notify.pdata = n;
+		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_CONTENT_TABLE_ROW_MODIFIED>();
 		TRY(ext_pull.g_uint64(&n->row_folder_id));
 		TRY(ext_pull.g_uint64(&n->row_message_id));
 		TRY(ext_pull.g_uint64(&n->row_instance));
@@ -4050,6 +4022,9 @@ pack_result exmdb_ext_pull_db_notify(const BINARY *pbin_in,
 	}
 	}
 	return pack_result::bad_callid;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return pack_result::alloc;
 }
 
 static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
@@ -4069,7 +4044,7 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		ret = pack_result::bad_callid;
 		break;
 	case db_notify_type::new_mail: {
-		auto n = static_cast<const DB_NOTIFY_NEW_MAIL *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_NEW_MAIL>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		TRY(ext_push.p_uint32(n->message_flags));
@@ -4077,21 +4052,21 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		break;
 	}
 	case db_notify_type::folder_created: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_CREATED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_CREATED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->parent_id));
 		TRY(ext_push.p_proptag_a(n->proptags));
 		break;
 	}
 	case db_notify_type::message_created: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_CREATED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_CREATED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		TRY(ext_push.p_proptag_a(n->proptags));
 		break;
 	}
 	case db_notify_type::link_created: {
-		auto n = static_cast<const DB_NOTIFY_LINK_CREATED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_LINK_CREATED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		TRY(ext_push.p_uint64(n->parent_id));
@@ -4099,26 +4074,26 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		break;
 	}
 	case db_notify_type::folder_deleted: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_DELETED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_DELETED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->parent_id));
 		break;
 	}
 	case db_notify_type::message_deleted: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_DELETED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_DELETED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		break;
 	}
 	case db_notify_type::link_deleted: {
-		auto n = static_cast<const DB_NOTIFY_LINK_DELETED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_LINK_DELETED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		TRY(ext_push.p_uint64(n->parent_id));
 		break;
 	}
 	case db_notify_type::folder_modified: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_MODIFIED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MODIFIED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		if (n->ptotal != nullptr) {
 			TRY(ext_push.p_uint8(1));
@@ -4136,7 +4111,7 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		break;
 	}
 	case db_notify_type::message_modified: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_MODIFIED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MODIFIED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		TRY(ext_push.p_proptag_a(n->proptags));
@@ -4144,7 +4119,7 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 	}
 	case db_notify_type::folder_moved:
 	case db_notify_type::folder_copied: {
-		auto n = static_cast<const DB_NOTIFY_FOLDER_MVCP *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MVCP>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->parent_id));
 		TRY(ext_push.p_uint64(n->old_folder_id));
@@ -4153,7 +4128,7 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 	}
 	case db_notify_type::message_moved:
 	case db_notify_type::message_copied: {
-		auto n = static_cast<const DB_NOTIFY_MESSAGE_MVCP *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		TRY(ext_push.p_uint64(n->message_id));
 		TRY(ext_push.p_uint64(n->old_folder_id));
@@ -4161,7 +4136,7 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		break;
 	}
 	case db_notify_type::search_completed: {
-		auto n = static_cast<const DB_NOTIFY_SEARCH_COMPLETED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_SEARCH_COMPLETED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->folder_id));
 		break;
 	}
@@ -4169,13 +4144,13 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 	case db_notify_type::cttbl_changed:
 		break;
 	case db_notify_type::hiertbl_row_added: {
-		auto n = static_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_ADDED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_ADDED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->row_folder_id));
 		TRY(ext_push.p_uint64(n->after_folder_id));
 		break;
 	}
 	case db_notify_type::cttbl_row_added: {
-		auto n = static_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_ADDED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_ADDED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->row_folder_id));
 		TRY(ext_push.p_uint64(n->row_message_id));
 		TRY(ext_push.p_uint64(n->row_instance));
@@ -4185,25 +4160,25 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		break;
 	}
 	case db_notify_type::hiertbl_row_deleted: {
-		auto n = static_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_DELETED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_DELETED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->row_folder_id));
 		break;
 	}
 	case db_notify_type::cttbl_row_deleted: {
-		auto n = static_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_DELETED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_DELETED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->row_folder_id));
 		TRY(ext_push.p_uint64(n->row_message_id));
 		TRY(ext_push.p_uint64(n->row_instance));
 		break;
 	}
 	case db_notify_type::hiertbl_row_modified: {
-		auto n = static_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->row_folder_id));
 		TRY(ext_push.p_uint64(n->after_folder_id));
 		break;
 	}
 	case db_notify_type::cttbl_row_modified: {
-		auto n = static_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_MODIFIED *>(pnotify->db_notify.pdata);
+		auto n = std::any_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_MODIFIED>(&pnotify->db_notify.pdata);
 		TRY(ext_push.p_uint64(n->row_folder_id));
 		TRY(ext_push.p_uint64(n->row_message_id));
 		TRY(ext_push.p_uint64(n->row_instance));

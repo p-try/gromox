@@ -1,13 +1,56 @@
-Gromox 3.2.21
-=============
-
-Enhancements:
-
-* oxvcard: do export Outlook contact photo
+Gromox 3.3.9
+============
 
 Fixes:
 
-* Revert "ews: avoid sending out emClient's draft messages", this did not work
+* mrautoproc: server-side processed meeting requests automatically entered into
+  the calendar had lacked the flags asfMeeting+asfReceived, which was fixed.
+
+
+Gromox 3.3 (2025-12-27)
+=======================
+
+Enhancements:
+
+* oxvcard: include photo when converting MAPI contact objects to VCARD
+* exporter: support export of multiple messages to GXMT
+* exporter: support for folder export to GXMT
+* importer: support a read-only mode
+* exmdb: include RTF in the cross-body format synchronization when the message
+  is saved, making Outlook Notes or Outlook Contact notes display something in
+  grommunio-web and other clients
+* exmdb: new read_delegate/write_delegate EXRPCs so that delegates.txt is no
+  longer accessed via filesystem
+* exch: allow user sending mail with From: line set to own aliases
+* mysql_adaptor: regard aliases for user_ids and displayname
+* midb: log when incoming connection count has been reached
+* ews: recognize <TimeZoneContext> elements located in the SOAP header
+
+Fixes:
+
+* ews: avoid sending newly created message items when message invitation flag
+  is set
+* zcore: obtain freebusy information for own mailbox using owner mode, so that
+  setting e.g. the "default" ACL default for one's calender does not deprive
+  the user of his own freebusy view.
+* exmdb: the event volley when the last row of a MAPI table with categories
+  got deleted had wrong event data
+* nsp: results from nspiGetMatches were not always capped as requested by
+  clients (potentially crashing OL)
+* zcore: make openstream treat MAPI_BEST_ACCESS as documented
+* emsmdb: calls over RPCH with large outputs would sometimes just report an
+  error due to insufficient buffer sizes, which has been fixed.
+* mapi_lib: repair botched html_to_rtf with non-UTF-8 HTML input
+* rtf_to_html and html_to_plain misconverted U+007F,U+07FF,U+7FFF,U+7FFFF to
+  faulty UTF-8, which has been fixed
+* mbsize: NTS error rate computation had an unsigned underflow and was
+  misreported
+
+Changes:
+
+* tools: renamed gromox-{mt2exm,exm2eml} to gromox-{import,export}
+  and added the old aliases for the tools
+* nsp: make resolvenames skip over empty strings in line with the specification
 
 
 Gromox 3.2 (2025-11-24)

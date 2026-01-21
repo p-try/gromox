@@ -28,6 +28,7 @@
 #include <gromox/mapi_types.hpp>
 #include <gromox/mapidefs.h>
 #include <gromox/mysql_adaptor.hpp>
+#include <gromox/notify_types.hpp>
 #include <gromox/process.hpp>
 #include <gromox/rop_util.hpp>
 #include <gromox/safeint.hpp>
@@ -70,7 +71,7 @@ struct NOTIFY_ITEM {
 }
 
 static size_t g_table_size;
-static gromox::atomic_bool g_notify_stop;
+static gromox::atomic_bool g_zserver_stop;
 static int g_ping_interval;
 static pthread_t g_scan_id;
 static int g_cache_interval;
@@ -159,7 +160,7 @@ static void *zcorezs_scanwork(void *param)
 	zcresp_notifdequeue response{};
 	response.call_id = zcore_callid::notifdequeue;
 	response.result = ecSuccess;
-	while (!g_notify_stop) {
+	while (!g_zserver_stop) {
 		sleep(1);
 		count ++;
 		if (count >= g_ping_interval)
@@ -298,7 +299,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	switch (pdb_notify->type) {
 	case db_notify_type::new_mail: {
 		pnotification->event_type = fnevNewMail;
-		auto nt = static_cast<const DB_NOTIFY_NEW_MAIL *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_NEW_MAIL>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		message_id = rop_util_make_eid_ex(1, nt->message_id);
 		pnew_mail->pentryid = cu_mid_to_entryid_s(*pstore, folder_id, message_id);
@@ -324,7 +325,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::folder_created: {
 		pnotification->event_type = fnevObjectCreated;
-		auto nt = static_cast<const DB_NOTIFY_FOLDER_CREATED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_FOLDER_CREATED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		parent_id = rop_util_nfid_to_eid(nt->parent_id);
 		oz->object_type = MAPI_FOLDER;
@@ -338,7 +339,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::message_created: {
 		pnotification->event_type = fnevObjectCreated;
-		auto nt = static_cast<const DB_NOTIFY_MESSAGE_CREATED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_MESSAGE_CREATED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		message_id = rop_util_make_eid_ex(1, nt->message_id);
 		oz->object_type = MAPI_MESSAGE;
@@ -352,7 +353,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::folder_deleted: {
 		pnotification->event_type = fnevObjectDeleted;
-		auto nt = static_cast<const DB_NOTIFY_FOLDER_DELETED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_FOLDER_DELETED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		parent_id = rop_util_nfid_to_eid(nt->parent_id);
 		oz->object_type = MAPI_FOLDER;
@@ -366,7 +367,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::message_deleted: {
 		pnotification->event_type = fnevObjectDeleted;
-		auto nt = static_cast<const DB_NOTIFY_MESSAGE_DELETED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_MESSAGE_DELETED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		message_id = rop_util_make_eid_ex(1, nt->message_id);
 		oz->object_type = MAPI_MESSAGE;
@@ -380,7 +381,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::folder_modified: {
 		pnotification->event_type = fnevObjectModified;
-		auto nt = static_cast<const DB_NOTIFY_FOLDER_MODIFIED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_FOLDER_MODIFIED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		oz->object_type = MAPI_FOLDER;
 		oz->pentryid.emplace(cu_fid_to_entryid_s(*pstore, folder_id));
@@ -390,7 +391,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::message_modified: {
 		pnotification->event_type = fnevObjectModified;
-		auto nt = static_cast<const DB_NOTIFY_MESSAGE_MODIFIED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_MESSAGE_MODIFIED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		message_id = rop_util_make_eid_ex(1, nt->message_id);
 		oz->object_type = MAPI_MESSAGE;
@@ -406,7 +407,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	case db_notify_type::folder_copied: {
 		pnotification->event_type = pdb_notify->type == db_notify_type::folder_moved ?
 		                            fnevObjectMoved : fnevObjectCopied;
-		auto nt = static_cast<const DB_NOTIFY_FOLDER_MVCP *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_FOLDER_MVCP>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		parent_id = rop_util_nfid_to_eid(nt->parent_id);
 		old_eid = rop_util_nfid_to_eid(nt->old_folder_id);
@@ -430,7 +431,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	case db_notify_type::message_copied: {
 		pnotification->event_type = pdb_notify->type == db_notify_type::message_moved ?
 		                            fnevObjectMoved : fnevObjectCopied;
-		auto nt = static_cast<const DB_NOTIFY_MESSAGE_MVCP *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP>(&pdb_notify->pdata);
 		old_parentid = rop_util_nfid_to_eid(nt->old_folder_id);
 		old_eid = rop_util_make_eid_ex(1, nt->old_message_id);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
@@ -452,7 +453,7 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 	}
 	case db_notify_type::search_completed: {
 		pnotification->event_type = fnevSearchComplete;
-		auto nt = static_cast<const DB_NOTIFY_SEARCH_COMPLETED *>(pdb_notify->pdata);
+		auto nt = std::any_cast<const DB_NOTIFY_SEARCH_COMPLETED>(&pdb_notify->pdata);
 		folder_id = rop_util_nfid_to_eid(nt->folder_id);
 		oz->object_type = MAPI_FOLDER;
 		oz->pentryid.emplace(cu_fid_to_entryid_s(*pstore, folder_id));
@@ -512,7 +513,7 @@ void zserver_init(size_t table_size, int cache_interval, int ping_interval)
 
 int zserver_run()
 {
-	g_notify_stop = false;
+	g_zserver_stop = false;
 	auto ret = pthread_create4(&g_scan_id, nullptr, zcorezs_scanwork, nullptr);
 	if (ret != 0) {
 		mlog(LV_ERR, "E-1443: pthread_create: %s", strerror(ret));
@@ -524,7 +525,7 @@ int zserver_run()
 
 void zserver_stop()
 {
-	g_notify_stop = true;
+	g_zserver_stop = true;
 	if (!pthread_equal(g_scan_id, {})) {
 		pthread_kill(g_scan_id, SIGALRM);
 		pthread_join(g_scan_id, NULL);
@@ -714,10 +715,7 @@ ec_error_t zs_openentry(GUID hsession, BINARY entryid,
 	BOOL b_private;
 	int account_id;
 	std::string essdn;
-	uint64_t folder_id;
-	uint64_t message_id;
 	uint32_t address_type;
-	uint16_t type;
 	
 	auto pinfo = zs_query_session(hsession);
 	if (pinfo == nullptr)
@@ -735,7 +733,8 @@ ec_error_t zs_openentry(GUID hsession, BINARY entryid,
 	}
 
 	/* Arbitrary GUID, it's probably a FOLDER_ENTRYID/MESSAGE_ENTRYID. */
-	type = common_util_get_messaging_entryid_type(entryid);
+	auto type = common_util_get_messaging_entryid_type(entryid);
+	eid_t folder_id{}, message_id{};
 	switch (type) {
 	case EITLT_PRIVATE_FOLDER:
 	case EITLT_PUBLIC_FOLDER: {
@@ -780,7 +779,7 @@ static ec_error_t zs_openentry_emsab(GUID hsession, BINARY entryid,
 
 	BOOL b_private;
 	int user_id;
-	uint64_t eid;
+	eid_t eid{};
 	uint8_t loc_type;
 	if (!common_util_exmdb_locinfo_from_string(essdn + 7,
 	    &loc_type, &user_id, &eid))
@@ -822,15 +821,11 @@ ec_error_t zs_openstoreentry(GUID hsession, uint32_t hobject, BINARY entryid,
 	BOOL b_del;
 	BOOL b_exist;
 	void *pvalue;
-	uint64_t eid;
-	uint16_t type;
 	BOOL b_private;
 	int account_id;
 	uint64_t fid_val;
 	uint8_t loc_type;
 	zs_objtype mapi_type;
-	uint64_t folder_id;
-	uint64_t message_id;
 	uint32_t tag_access;
 	uint32_t permission;
 	uint32_t address_type;
@@ -843,21 +838,24 @@ ec_error_t zs_openstoreentry(GUID hsession, uint32_t hobject, BINARY entryid,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::store)
 		return ecNotSupported;
+
+	eid_t folder_id{}, message_id{};
 	if (0 == entryid.cb) {
 		folder_id = rop_util_make_eid_ex(1, pstore->b_private ?
 		            PRIVATE_FID_ROOT : PUBLIC_FID_ROOT);
-		message_id = 0;
+		message_id = eid_t(0);
 	} else {
+		eid_t eid{};
 		std::string essdn_s;
 		const char *essdn = essdn_s.c_str();
 
-		type = common_util_get_messaging_entryid_type(entryid);
+		auto type = common_util_get_messaging_entryid_type(entryid);
 		switch (type) {
 		case EITLT_PRIVATE_FOLDER:
 		case EITLT_PUBLIC_FOLDER:
 			if (cu_entryid_to_fid(entryid,
 			    &b_private, &account_id, &folder_id)) {
-				message_id = 0;
+				message_id = eid_t(0);
 				goto CHECK_LOC;
 			}
 			break;
@@ -884,7 +882,7 @@ ec_error_t zs_openstoreentry(GUID hsession, uint32_t hobject, BINARY entryid,
 		case LOC_TYPE_PRIVATE_FOLDER:
 			b_private = TRUE;
 			folder_id = eid;
-			message_id = 0;
+			message_id = eid_t(0);
 			break;
 		case LOC_TYPE_PRIVATE_MESSAGE:
 			b_private = TRUE;
@@ -893,7 +891,7 @@ ec_error_t zs_openstoreentry(GUID hsession, uint32_t hobject, BINARY entryid,
 		case LOC_TYPE_PUBLIC_FOLDER:
 			b_private = FALSE;
 			folder_id = eid;
-			message_id = 0;
+			message_id = eid_t(0);
 			break;
 		case LOC_TYPE_PUBLIC_MESSAGE:
 			b_private = FALSE;
@@ -908,7 +906,7 @@ ec_error_t zs_openstoreentry(GUID hsession, uint32_t hobject, BINARY entryid,
 			    nullptr, CP_ACP, message_id, PidTagParentFolderId,
 			    &pvalue) || pvalue == nullptr)
 				return ecError;
-			folder_id = *static_cast<uint64_t *>(pvalue);
+			folder_id = *static_cast<eid_t *>(pvalue);
 		}
  CHECK_LOC:
 		if (b_private != pstore->b_private ||
@@ -1597,9 +1595,8 @@ ec_error_t zs_deletemessages(GUID hsession, uint32_t hfolder,
 	BOOL b_private;
 	BOOL b_partial;
 	zs_objtype mapi_type;
-	uint64_t folder_id;
+	eid_t folder_id{}, message_id{};
 	uint32_t permission;
-	uint64_t message_id;
 	MESSAGE_CONTENT *pbrief;
 	TPROPVAL_ARRAY tmp_propvals;
 	bool notify_non_read = flags & GX_DELMSG_NOTIFY_UNREAD;
@@ -1626,7 +1623,7 @@ ec_error_t zs_deletemessages(GUID hsession, uint32_t hfolder,
 			return ecNotFound;
 	}
 	ids.count = 0;
-	ids.pids = cu_alloc<uint64_t>(pentryids->count);
+	ids.pids  = cu_alloc<eid_t>(pentryids->count);
 	if (ids.pids == nullptr)
 		return ecServerOOM;
 	for (size_t i = 0; i < pentryids->count; ++i) {
@@ -1648,7 +1645,7 @@ ec_error_t zs_deletemessages(GUID hsession, uint32_t hfolder,
 		return ecSuccess;
 	}
 	ids1.count = 0;
-	ids1.pids  = cu_alloc<uint64_t>(ids.count);
+	ids1.pids  = cu_alloc<eid_t>(ids.count);
 	if (ids1.pids == nullptr)
 		return ecServerOOM;
 	for (auto i_eid : ids) {
@@ -1693,8 +1690,6 @@ ec_error_t zs_copymessages(GUID hsession, uint32_t hsrcfolder,
 	BOOL b_private;
 	int account_id;
 	zs_objtype mapi_type;
-	uint64_t folder_id;
-	uint64_t message_id;
 	uint32_t permission;
 	
 	if (pentryids->count == 0)
@@ -1738,6 +1733,7 @@ ec_error_t zs_copymessages(GUID hsession, uint32_t hsrcfolder,
 				return ecAccessDenied;
 		}
 		for (size_t i = 0; i < pentryids->count; ++i) {
+			eid_t folder_id{}, message_id{};
 			if (!cu_entryid_to_mid(pentryids->pbin[i],
 			    &b_private, &account_id, &folder_id, &message_id))
 				return ecError;
@@ -1770,10 +1766,11 @@ ec_error_t zs_copymessages(GUID hsession, uint32_t hsrcfolder,
 
 	EID_ARRAY ids;
 	ids.count = 0;
-	ids.pids = cu_alloc<uint64_t>(pentryids->count);
+	ids.pids  = cu_alloc<eid_t>(pentryids->count);
 	if (ids.pids == nullptr)
 		return ecServerOOM;
 	for (size_t i = 0; i < pentryids->count; ++i) {
+		eid_t folder_id{}, message_id{};
 		if (!cu_entryid_to_mid(pentryids->pbin[i],
 		    &b_private, &account_id, &folder_id, &message_id))
 			return ecError;
@@ -1811,9 +1808,7 @@ ec_error_t zs_setreadflags(GUID hsession, uint32_t hfolder,
 	uint32_t table_id;
 	zs_objtype mapi_type;
 	uint32_t row_count;
-	uint64_t folder_id;
 	TARRAY_SET tmp_set;
-	uint64_t message_id;
 	BOOL b_notify = TRUE; /* TODO: Read from config or USER_INFO. */
 	BINARY_ARRAY tmp_bins;
 	PROBLEM_ARRAY problems;
@@ -1868,6 +1863,7 @@ ec_error_t zs_setreadflags(GUID hsession, uint32_t hfolder,
 		}
 	}
 	for (size_t i = 0; i < pentryids->count; ++i) {
+		eid_t folder_id{}, message_id{};
 		if (!cu_entryid_to_mid(pentryids->pbin[i],
 		    &b_private, &account_id, &folder_id, &message_id))
 			return ecError;
@@ -2060,7 +2056,6 @@ ec_error_t zs_deletefolder(GUID hsession,
 	BOOL b_private;
 	int account_id;
 	zs_objtype mapi_type;
-	uint64_t folder_id;
 	uint32_t permission;
 	
 	auto pinfo = zs_query_session(hsession);
@@ -2072,6 +2067,7 @@ ec_error_t zs_deletefolder(GUID hsession,
 	if (mapi_type != zs_objtype::folder)
 		return ecNotSupported;
 	auto pstore = pfolder->pstore;
+	eid_t folder_id{};
 	if (!cu_entryid_to_fid(entryid,
 	    &b_private, &account_id, &folder_id))
 		return ecError;
@@ -2175,7 +2171,6 @@ ec_error_t zs_copyfolder(GUID hsession, uint32_t hsrc_folder, BINARY entryid,
 	BOOL b_partial;
 	int account_id;
 	zs_objtype mapi_type;
-	uint64_t folder_id;
 	uint32_t permission;
 	
 	auto pinfo = zs_query_session(hsession);
@@ -2190,6 +2185,7 @@ ec_error_t zs_copyfolder(GUID hsession, uint32_t hsrc_folder, BINARY entryid,
 	if (mapi_type != zs_objtype::folder)
 		return ecNotSupported;
 	auto src_store = psrc_parent->pstore;
+	eid_t folder_id{};
 	if (!cu_entryid_to_fid(entryid,
 	    &b_private, &account_id, &folder_id))
 		return ecError;
@@ -2372,12 +2368,9 @@ ec_error_t zs_storeadvise(GUID hsession, uint32_t hstore,
     const BINARY *pentryid, uint32_t event_mask, uint32_t *psub_id)
 {
 	char dir[256];
-	uint16_t type;
 	BOOL b_private;
 	int account_id;
 	zs_objtype mapi_type;
-	uint64_t folder_id;
-	uint64_t message_id;
 	
 	auto pinfo = zs_query_session(hsession);
 	if (pinfo == nullptr)
@@ -2387,10 +2380,10 @@ ec_error_t zs_storeadvise(GUID hsession, uint32_t hstore,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::store)
 		return ecNotSupported;
-	folder_id = 0;
-	message_id = 0;
+	eid_t folder_id{}, message_id{};
 	if (NULL != pentryid) {
-		type = common_util_get_messaging_entryid_type(*pentryid);
+		eid_t eid{};
+		auto type = common_util_get_messaging_entryid_type(*pentryid);
 		switch (type) {
 		case EITLT_PRIVATE_FOLDER:
 		case EITLT_PUBLIC_FOLDER:
@@ -3058,7 +3051,7 @@ ec_error_t zs_modifyrecipients(GUID hsession,
 		memcpy(ppropval, prcpt->ppropval,
 			sizeof(TAGGED_PROPVAL)*prcpt->count);
 		ppropval[prcpt->count].proptag = PR_ROWID;
-		ppropval[prcpt->count].pvalue = cu_alloc<uint32_t>();
+		ppropval[prcpt->count].pvalue  = cu_alloc<eid_t>();
 		if (ppropval[prcpt->count].pvalue == nullptr)
 			return ecServerOOM;
 		*static_cast<uint32_t *>(ppropval[prcpt->count++].pvalue) = last_rowid;
@@ -3710,8 +3703,16 @@ ec_error_t zs_openembedded(GUID hsession,
 		return zh_error(hstore);
 	auto b_writable = pattachment->writable();
 	auto tag_access = pattachment->get_tag_access();
-	if ((flags & MAPI_CREATE) && !b_writable)
-		return ecAccessDenied;
+	if (!b_writable && (flags & MAPI_CREATE)) {
+		/*
+		 * MAPI_BEST_ACCESS is supposed to imply a fallback to readonly,
+		 * so downgrade MAPI_BEST_ACCESS to read-only when lacking
+		 * write permissions instead of returning ecAccessDenied.
+		 */
+		if ((flags & MAPI_BEST_ACCESS) != MAPI_BEST_ACCESS)
+			return ecAccessDenied;
+		flags &= ~MAPI_BEST_ACCESS;
+	}
 	auto pmessage = message_object::create(pstore, false, pinfo->cpid, 0,
 	                pattachment, tag_access, b_writable ? TRUE : false, nullptr);
 	if (pmessage == nullptr)
@@ -4511,7 +4512,6 @@ ec_error_t zs_importdeletion(GUID hsession,
 	XID tmp_xid;
 	void *pvalue;
 	BOOL b_exist;
-	uint64_t eid;
 	BOOL b_owner;
 	BOOL b_result;
 	BOOL b_partial;
@@ -4548,7 +4548,7 @@ ec_error_t zs_importdeletion(GUID hsession,
 	}
 	if (SYNC_TYPE_CONTENTS == sync_type) {
 		message_ids.count = 0;
-		message_ids.pids = cu_alloc<uint64_t>(pbins->count);
+		message_ids.pids  = cu_alloc<eid_t>(pbins->count);
 		if (message_ids.pids == nullptr)
 			return ecServerOOM;
 	}
@@ -4557,6 +4557,7 @@ ec_error_t zs_importdeletion(GUID hsession,
 			return ecInvalidParam;
 		if (!common_util_binary_to_xid(&pbins->pbin[i], &tmp_xid))
 			return ecError;
+		eid_t eid{};
 		if (pstore->b_private) {
 			auto tmp_guid = rop_util_make_user_guid(pstore->account_id);
 			if (tmp_guid != tmp_xid.guid)
@@ -4716,7 +4717,7 @@ ec_error_t zs_getsearchcriteria(GUID hsession,
 	RESTRICTION **pprestriction, uint32_t *psearch_stat)
 {
 	zs_objtype mapi_type;
-	LONGLONG_ARRAY folder_ids;
+	EID_ARRAY folder_ids;
 	
 	auto pinfo = zs_query_session(hsession);
 	if (pinfo == nullptr)
@@ -4741,7 +4742,7 @@ ec_error_t zs_getsearchcriteria(GUID hsession,
 	if (pfolder_array->pbin == nullptr)
 		return ecServerOOM;
 	for (size_t i = 0; i < folder_ids.count; ++i) {
-		auto pbin = cu_fid_to_entryid(*pstore, folder_ids.pll[i]);
+		auto pbin = cu_fid_to_entryid(*pstore, folder_ids.pids[i]);
 		if (pbin == nullptr)
 			return ecError;
 		pfolder_array->pbin[i] = *pbin;
@@ -4758,7 +4759,7 @@ ec_error_t zs_setsearchcriteria(GUID hsession, uint32_t hfolder, uint32_t flags,
 	zs_objtype mapi_type;
 	uint32_t permission;
 	uint32_t search_status;
-	LONGLONG_ARRAY folder_ids;
+	EID_ARRAY folder_ids;
 	
 	if (!(flags & (RESTART_SEARCH | STOP_SEARCH)))
 		/* make the default search_flags */
@@ -4795,18 +4796,18 @@ ec_error_t zs_setsearchcriteria(GUID hsession, uint32_t hfolder, uint32_t flags,
 			return ecSuccess;
 	}
 	folder_ids.count = pfolder_array->count;
-	folder_ids.pll   = cu_alloc<uint64_t>(folder_ids.count);
-	if (folder_ids.pll == nullptr)
+	folder_ids.pids  = cu_alloc<eid_t>(folder_ids.count);
+	if (folder_ids.pids == nullptr)
 		return ecServerOOM;
 	for (size_t i = 0; i < pfolder_array->count; ++i) {
 		if (!cu_entryid_to_fid(pfolder_array->pbin[i],
-		    &b_private, &db_id, &folder_ids.pll[i]))
+		    &b_private, &db_id, &folder_ids.pids[i]))
 			return ecError;
 		if (!b_private || db_id != pstore->account_id)
 			return ecSearchFolderScopeViolation;
 		if (!pstore->owner_mode()) {
 			if (!exmdb_client->get_folder_perm(pstore->get_dir(),
-			    folder_ids.pll[i], pinfo->get_username(), &permission))
+			    folder_ids.pids[i], pinfo->get_username(), &permission))
 				return ecError;
 			if (!(permission & (frightsOwner | frightsReadAny)))
 				return ecAccessDenied;
@@ -4973,8 +4974,11 @@ ec_error_t zs_getuserfreebusy(GUID hsession, BINARY entryid,
 	    mysql_adaptor_userid_to_name, username) != ecSuccess ||
 	    mysql_adaptor_meta(username.c_str(), WANTPRIV_METAONLY, mres) != 0)
 		return ecSuccess;
-	return get_freebusy(pinfo->get_username(), mres.maildir.c_str(),
-	       starttime, endtime, *fb_data) ? ecSuccess : ecError;
+	auto actor = pinfo->get_username();
+	if (strcmp(actor, mres.username.c_str()) == 0)
+		actor = nullptr;
+	return get_freebusy(actor, mres.maildir.c_str(),
+	       starttime, endtime, *fb_data);
 }
 
 ec_error_t zs_getuserfreebusyical(GUID hsession, BINARY entryid,
@@ -4990,9 +4994,10 @@ ec_error_t zs_getuserfreebusyical(GUID hsession, BINARY entryid,
 	    mysql_adaptor_meta(username.c_str(), WANTPRIV_METAONLY, mres) != 0)
 		return ecSuccess;
 	std::vector<freebusy_event> fb_data;
-	if (!get_freebusy(pinfo->get_username(), mres.maildir.c_str(),
-	    starttime, endtime, fb_data))
-		return ecError;
+	auto err = get_freebusy(pinfo->get_username(), mres.maildir.c_str(),
+	           starttime, endtime, fb_data);
+	if (err != ecSuccess)
+		return err;
 	return cu_fbdata_to_ical(pinfo->get_username(), username.c_str(),
 	       starttime, endtime, fb_data, bin);
 }
@@ -5012,9 +5017,7 @@ ec_error_t zs_linkmessage(GUID hsession,
 	BOOL b_private1;
 	char maildir[256];
 	zs_objtype mapi_type;
-	uint64_t folder_id;
-	uint64_t folder_id1;
-	uint64_t message_id;
+	eid_t folder_id{}, folder_id1{}, message_id{};
 	uint32_t account_id;
 	uint32_t account_id1;
 	

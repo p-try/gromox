@@ -38,73 +38,6 @@ using namespace hpm_mh;
 DECLARE_HPM_API(mh_nsp, );
 using namespace mh_nsp;
 
-using NspRequest = std::variant<
-	bind_request,
-	unbind_request,
-	comparemids_request,
-	dntomid_request,
-	getmatches_request,
-	getproplist_request,
-	getprops_request,
-	getspecialtable_request,
-	gettemplateinfo_request,
-	modlinkatt_request,
-	modprops_request,
-	querycolumns_request,
-	queryrows_request,
-	resolvenames_request,
-	resortrestriction_request,
-	seekentries_request,
-	updatestat_request,
-	getmailboxurl_request,
-	getaddressbookurl_request
->;
-
-using NspResponse = std::variant<
-	bind_response,
-	unbind_response,
-	comparemids_response,
-	dntomid_response,
-	getmatches_response,
-	getproplist_response,
-	getprops_response,
-	getspecialtable_response,
-	gettemplateinfo_response,
-	modlinkatt_response,
-	modprops_response,
-	querycolumns_response,
-	queryrows_response,
-	resolvenames_response,
-	resortrestriction_response,
-	seekentries_response,
-	updatestat_response,
-	getmailboxurl_response,
-	getaddressbookurl_response
->;
-
-enum ReqIndex : size_t
-{
-	IBind,
-	IUnbind,
-	IComparemids,
-	IDntomid,
-	IGetmatches,
-	IGetproplist,
-	IGetprops,
-	IGetspecialtable,
-	IGettemplateinfo,
-	IModlinkatt,
-	IModprops,
-	IQuerycolumns,
-	IQueryrows,
-	IResolvenames,
-	IResortrestriction,
-	ISeekentries,
-	IUpdatestat,
-	IGetmailboxurl,
-	IGetaddressbookurl
-};
-
 static constexpr int AVERAGE_SESSION_PER_CONTEXT = 10;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -114,9 +47,6 @@ static constexpr int AVERAGE_SESSION_PER_CONTEXT = 10;
  */
 struct MhNspContext : public MhContext
 {
-	template<size_t I> using Request_t = std::variant_alternative_t<I, NspRequest>;	///< Request type by index
-	template<size_t I> using Response_t = std::variant_alternative_t<I, NspResponse>; ///< Response type by index
-
 	explicit MhNspContext(int contextId, const std::string &excver) :
 		MhContext(contextId, *get_request(contextId),
 		get_auth_info(contextId), excver)
@@ -126,11 +56,9 @@ struct MhNspContext : public MhContext
 		epush = &ext_push;
 	}
 
-	ec_error_t getaddressbookurl(std::string * = nullptr);
-	ec_error_t getmailboxurl();
+	ec_error_t getaddressbookurl(std::string *);
+	ec_error_t getmailboxurl(const getmailboxurl_request &, getmailboxurl_response &);
 
-	NspRequest request{};
-	NspResponse response{};
 	nsp_ext_pull ext_pull{};
 	nsp_ext_push ext_push{};
 };
@@ -156,9 +84,7 @@ private:
 	ProcRes unbind(MhNspContext&);
 	ProcRes getMailboxUrl(MhNspContext&);
 	ProcRes getAddressBookUrl(MhNspContext&);
-
-	template<size_t RI, bool copystat = false>
-	ProcRes proxy(MhNspContext&);
+	template<typename RQ, typename RS> ProcRes proxy(MhNspContext &);
 
 	gromox::atomic_bool stop = false;
 	pthread_t scan;
@@ -169,24 +95,24 @@ private:
 
 	static constexpr std::pair<const char *, MhNspPlugin::ProcRes(MhNspPlugin::*)(MhNspContext&)> reqProcessors[19] = {
 		{"bind", &MhNspPlugin::bind},
-		{"comparemids", &MhNspPlugin::proxy<IComparemids>},
-		{"dntomid", &MhNspPlugin::proxy<IDntomid>},
+		{"comparemids", &MhNspPlugin::proxy<comparemids_request, comparemids_response>},
+		{"dntomid", &MhNspPlugin::proxy<dntomid_request, dntomid_response>},
 		{"getaddressbookurl", &MhNspPlugin::getAddressBookUrl},
 		{"getmailboxurl", &MhNspPlugin::getMailboxUrl},
-		{"getmatches", &MhNspPlugin::proxy<IGetmatches, true>},
-		{"getproplist", &MhNspPlugin::proxy<IGetproplist>},
-		{"getprops", &MhNspPlugin::proxy<IGetprops>},
-		{"getspecialtable", &MhNspPlugin::proxy<IGetspecialtable>},
-		{"gettemplateinfo", &MhNspPlugin::proxy<IGettemplateinfo>},
-		{"modlinkatt", &MhNspPlugin::proxy<IModlinkatt>},
-		{"modprops", &MhNspPlugin::proxy<IModprops>},
-		{"querycolumn", &MhNspPlugin::proxy<IQuerycolumns>},
-		{"queryrows", &MhNspPlugin::proxy<IQueryrows, true>},
-		{"resolvenames", &MhNspPlugin::proxy<IResolvenames>},
-		{"resortrestriction", &MhNspPlugin::proxy<IResortrestriction, true>},
-		{"seekentries", &MhNspPlugin::proxy<ISeekentries, true>},
+		{"getmatches", &MhNspPlugin::proxy<getmatches_request, getmatches_response>},
+		{"getproplist", &MhNspPlugin::proxy<getproplist_request, getproplist_response>},
+		{"getprops", &MhNspPlugin::proxy<getprops_request, getprops_response>},
+		{"getspecialtable", &MhNspPlugin::proxy<getspecialtable_request, getspecialtable_response>},
+		{"gettemplateinfo", &MhNspPlugin::proxy<gettemplateinfo_request, gettemplateinfo_response>},
+		{"modlinkatt", &MhNspPlugin::proxy<modlinkatt_request, modlinkatt_response>},
+		{"modprops", &MhNspPlugin::proxy<modprops_request, modprops_response>},
+		{"querycolumn", &MhNspPlugin::proxy<querycolumns_request, querycolumns_response>},
+		{"queryrows", &MhNspPlugin::proxy<queryrows_request, queryrows_response>},
+		{"resolvenames", &MhNspPlugin::proxy<resolvenames_request, resolvenames_response>},
+		{"resortrestriction", &MhNspPlugin::proxy<resortrestriction_request, resortrestriction_response>},
+		{"seekentries", &MhNspPlugin::proxy<seekentries_request, seekentries_response>},
 		{"unbind", &MhNspPlugin::unbind},
-		{"updatestat", &MhNspPlugin::proxy<IUpdatestat, true>},
+		{"updatestat", &MhNspPlugin::proxy<updatestat_request, updatestat_response>},
 	};
 };
 
@@ -388,8 +314,6 @@ ec_error_t MhNspContext::getaddressbookurl(std::string *dest) try
 {
 	unsigned int user_id = 0;
 
-	if (dest == nullptr)
-		dest = &std::get<getaddressbookurl_response>(response).server_url;
 	if (!mysql_adaptor_get_user_ids(auth_info.username, &user_id, nullptr, nullptr))
 		return ecError;
 	char username1[13]{};
@@ -410,10 +334,9 @@ ec_error_t MhNspContext::getaddressbookurl(std::string *dest) try
 	return ecServerOOM;
 }
 
-ec_error_t MhNspContext::getmailboxurl() try
+ec_error_t MhNspContext::getmailboxurl(const getmailboxurl_request &req,
+    getmailboxurl_response &resp) try
 {
-	const auto& req = std::get<getmailboxurl_request>(request);
-	auto& resp = std::get<getmailboxurl_response>(response);
 	std::string tmp_buff = req.user_dn;
 	auto token = strrchr(tmp_buff.data(), '/');
 	if (token == nullptr || strncasecmp(token, "/cn=", 4) != 0)
@@ -517,10 +440,10 @@ MhNspPlugin::ProcRes MhNspPlugin::loadCookies(MhNspContext& ctx)
 
 MhNspPlugin::ProcRes MhNspPlugin::bind(MhNspContext& ctx)
 {
-	auto& request = ctx.request.emplace<bind_request>();
-	auto& response = ctx.response.emplace<bind_response>();
+	bind_request request;
 	if (ctx.ext_pull.g_nsp_request(request) != pack_result::ok)
 		return ctx.error_responsecode(resp_code::invalid_rq_body);
+	bind_response response;
 	response.result = nsp_bridge_run(ctx.session_guid, request, response);
 	if (response.result != ecSuccess) {
 		if (ctx.ext_push.p_nsp_response(response) != pack_result::ok)
@@ -532,7 +455,7 @@ MhNspPlugin::ProcRes MhNspPlugin::bind(MhNspContext& ctx)
 		auto sd_iter = sessions.find(ctx.session_string);
 		if (sd_iter != sessions.end()) {
 			auto& psession = sd_iter->second;
-			nsp_bridge_unbind(psession.session_guid, 0);
+			nsp_bridge_unbind(psession.session_guid);
 			psession.session_guid = ctx.session_guid;
 		}
 	} else {
@@ -544,14 +467,14 @@ MhNspPlugin::ProcRes MhNspPlugin::bind(MhNspContext& ctx)
 			auto emplaced = sessions.try_emplace(ctx.session_string, ctx.session_guid, ctx.sequence_guid, ctx.auth_info.username, exptime);
 			if (!emplaced.second) {
 				hl_hold.unlock();
-				nsp_bridge_unbind(ctx.session_guid, 0);
+				nsp_bridge_unbind(ctx.session_guid);
 				return ctx.failure_response(ecInsufficientResrc);
 			}
 			auto ucount = users.emplace(emplaced.first->second.username, 0);
 			++ucount.first->second;
 		}  catch (std::bad_alloc&) {
 			hl_hold.unlock();
-			nsp_bridge_unbind(ctx.session_guid, 0);
+			nsp_bridge_unbind(ctx.session_guid);
 			return ctx.failure_response(ecServerOOM);
 		}
 	}
@@ -562,11 +485,11 @@ MhNspPlugin::ProcRes MhNspPlugin::bind(MhNspContext& ctx)
 
 MhNspPlugin::ProcRes MhNspPlugin::unbind(MhNspContext& ctx)
 {
-	auto& request = ctx.request.emplace<unbind_request>();
-	auto& response = ctx.response.emplace<unbind_response>();
+	unbind_request request;
 	if (ctx.ext_pull.g_nsp_request(request) != pack_result::ok)
 		return ctx.error_responsecode(resp_code::invalid_rq_body);
-	response.result = nsp_bridge_unbind(ctx.session_guid, request.reserved);
+	unbind_response response;
+	response.result = nsp_bridge_unbind(ctx.session_guid);
 	std::unique_lock hl_hold(hashLock);
 	removeSession(ctx.session_string);
 	hl_hold.unlock();
@@ -575,16 +498,14 @@ MhNspPlugin::ProcRes MhNspPlugin::unbind(MhNspContext& ctx)
 	return std::nullopt;
 }
 
-template<size_t RI, bool copystat>
-MhNspPlugin::ProcRes MhNspPlugin::proxy(MhNspContext& ctx)
+template<typename RQ, typename RS>
+MhNspPlugin::ProcRes MhNspPlugin::proxy(MhNspContext &ctx)
 {
-	auto& request = ctx.request.emplace<RI>();
-	auto& response = ctx.response.emplace<RI>();
+	RQ request;
 	if (ctx.ext_pull.g_nsp_request(request) != pack_result::ok)
 		return ctx.error_responsecode(resp_code::invalid_rq_body);
+	RS response;
 	response.result = nsp_bridge_run(ctx.session_guid, request, response);
-	if constexpr(copystat)
-		response.stat = request.stat;
 	if (ctx.ext_push.p_nsp_response(response) != pack_result::ok)
 		return ctx.failure_response(RPC_X_BAD_STUB_DATA);
 	return std::nullopt;
@@ -592,11 +513,11 @@ MhNspPlugin::ProcRes MhNspPlugin::proxy(MhNspContext& ctx)
 
 MhNspPlugin::ProcRes MhNspPlugin::getMailboxUrl(MhNspContext& ctx)
 {
-	auto& request = ctx.request.emplace<getmailboxurl_request>();
-	auto& response = ctx.response.emplace<getmatches_response>();
+	getmailboxurl_request request;
 	if (ctx.ext_pull.g_nsp_request(request) != pack_result::ok)
 		return ctx.error_responsecode(resp_code::invalid_rq_body);
-	response.result = ctx.getmailboxurl();
+	getmailboxurl_response response;
+	response.result = ctx.getmailboxurl(request, response);
 	if (ctx.ext_push.p_nsp_response(response) != pack_result::ok)
 		return ctx.failure_response(RPC_X_BAD_STUB_DATA);
 	return std::nullopt;
@@ -604,11 +525,11 @@ MhNspPlugin::ProcRes MhNspPlugin::getMailboxUrl(MhNspContext& ctx)
 
 MhNspPlugin::ProcRes MhNspPlugin::getAddressBookUrl(MhNspContext& ctx)
 {
-	auto& request = ctx.request.emplace<getaddressbookurl_request>();
-	auto& response = ctx.response.emplace<getaddressbookurl_response>();
+	getaddressbookurl_request request;
 	if (ctx.ext_pull.g_nsp_request(request) != pack_result::ok)
 		return ctx.error_responsecode(resp_code::invalid_rq_body);
-	response.result = ctx.getaddressbookurl();
+	getaddressbookurl_response response;
+	response.result = ctx.getaddressbookurl(&response.server_url);
 	if (ctx.ext_push.p_nsp_response(response) != pack_result::ok)
 		return ctx.failure_response(RPC_X_BAD_STUB_DATA);
 	return std::nullopt;

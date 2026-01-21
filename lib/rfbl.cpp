@@ -546,9 +546,10 @@ static int utf8_writeout(FILE *fp, const void *vsrc, size_t src_size, const char
  * @outbuf: result variable for caller
  *
  * It is valid for @inbuf to point to the same object as @outbuf.
- * Returns 0 on success, non-zero on error with errno set.
+ * Returns 0 on success, negative non-zero on error with errno set.
+ * @outbuf is only replaced on success.
  */
-int feed_w3m(std::string_view inbuf, const char *cset, std::string &outbuf) try
+int feed_w3m(std::string_view inbuf, const char *cset, std::string &final_buf) try
 {
 	std::string filename;
 	auto tmpdir = getenv("TMPDIR");
@@ -584,13 +585,17 @@ int feed_w3m(std::string_view inbuf, const char *cset, std::string &outbuf) try
 		return -1;
 	int status = 0;
 	auto cl3 = HX::make_scope_exit([&]() { waitpid(pid, &status, 0); });
-	outbuf.clear();
+
+	std::string outbuf;
 	ssize_t ret;
 	char fbuf[4096];
 	while ((ret = read(fout, fbuf, std::size(fbuf))) > 0)
 		outbuf.append(fbuf, ret);
-	if (!WIFEXITED(status))
+	cl3.release();
+	waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return -1;
+	final_buf = std::move(outbuf);
 	if (outbuf.empty())
 		return 0;
 	/* The caller can just look at outbuf.size() */
@@ -1524,8 +1529,8 @@ errno_t parse_imap_seq(imap_seq_list &r, const char *s) try
 }
 
 /**
- * @h: class on message
- * @n: class to test
+ * @h:  PR_MESSAGE_CLASS/PR_CONTAINER_CLASS value
+ * @n:  prefix to test for
  *
  * On match, 0 is returned; otherwise whatever strcasecmp would yield.
  */
@@ -1541,7 +1546,11 @@ int class_match_prefix(const char *h, const char *n)
 }
 
 /**
+ * @h:  PR_MESSAGE_CLASS/PR_CONTAINER_CLASS value
+ * @n:  suffix to test for
+ *
  * On match, 0 is returned; otherwise anything non-zero.
+ * This function is not meant for testing for root classes like "IPM".
  */
 int class_match_suffix(const char *h, const char *n)
 {
@@ -1576,41 +1585,54 @@ size_t utf8_printable_prefix(const void *vinput, size_t max)
  * escape without conversion to ENOMEM. Callers should ideally check for ENOMEM
  * anyway.
  */
-std::string iconvtext(const char *src, size_t src_size,
-    const char *from, const char *to)
+std::string iconvtext(std::string_view sv,
+    const char *from, const char *to, unsigned int flags) try
 {
 	if (strcasecmp(from, to) == 0) {
 		errno = 0;
-		return {reinterpret_cast<const char *>(src), src_size};
+		return std::string(sv);
 	}
-	auto cs = to + "//IGNORE"s;
-	auto cd = iconv_open(cs.c_str(), from);
+	auto cd = iconv_open(to, from);
 	if (cd == reinterpret_cast<iconv_t>(-1)) {
-		mlog(LV_ERR, "E-2116: iconv_open %s: %s",
-		        cs.c_str(), strerror(errno));
+		mlog(LV_ERR, "E-2116: iconv_open(%s -> %s): %s", from, to, strerror(errno));
 		errno = EINVAL;
 		return {};
 	}
 	auto cleanup = HX::make_scope_exit([&]() { iconv_close(cd); });
 	char buffer[4096];
 	std::string out;
+	bool last_bad = false;
+	auto src = deconst(sv.data());
+	size_t src_size = sv.size();
 
 	while (src_size > 0) {
 		auto dst = buffer;
 		size_t dst_size = sizeof(buffer);
-		auto ret = iconv(cd, (char**)&src, &src_size, (char**)&dst, &dst_size);
-		if (ret != static_cast<size_t>(-1) || dst_size != sizeof(buffer)) {
+		errno = 0;
+		auto ret = iconv(cd, &src, &src_size, &dst, &dst_size);
+		if (dst_size != sizeof(buffer)) {
+			last_bad = false;
 			out.append(buffer, sizeof(buffer) - dst_size);
+		}
+		if (ret != (size_t)-1 || src_size == 0) {
+			last_bad = false;
 			continue;
 		}
-		if (src_size > 0) {
+		if (errno == EILSEQ || errno == EINVAL) {
 			--src_size;
 			++src;
+			if (flags & ICONVTEXT_TRANSLIT) {
+				if (!last_bad)
+					out += '?';
+				last_bad = true;
+			}
 		}
-		out.append(buffer, sizeof(buffer) - dst_size);
 	}
 	errno = 0;
 	return out;
+} catch (const std::bad_alloc &) {
+	errno = ENOMEM;
+	return {};
 }
 
 std::string base64_encode(const std::string_view &x)
@@ -1844,7 +1866,7 @@ int gx_mkbasedir(const char *file, unsigned int mode)
 {
 	std::unique_ptr<char[], stdlib_delete> base(HX_dirname(file));
 	if (base == nullptr)
-		return ENOMEM;
+		return -ENOMEM;
 	if (mode & (S_IRUSR | S_IWUSR))
 		mode |= S_IXUSR;
 	if (mode & (S_IRGRP | S_IWGRP))
@@ -2170,4 +2192,38 @@ generic_connection generic_connection::accept(int sv_sock,
 	conn.server_port = strtoul(txtport, nullptr, 0);
 	conn.last_timestamp = tp_now();
 	return conn;
+}
+
+/**
+ * Convert Unicode code point @wchar to its UTF-8 representation.
+ */
+std::string wchar_to_utf8(uint32_t w)
+{
+	std::string s;
+	if (w <= 0x7f) {
+		s.resize(1);
+		s[0] = w;
+	} else if (w <= 0x7ff) {
+		s.resize(2);
+		s[0] = 192 + w / 64;
+		s[1] = 128 + w % 64;
+	} else if (w <= 0xffff) {
+		s.resize(3);
+		s[0] = 224 + w / 4096;
+		s[1] = 128 + w / 64 % 64;
+		s[2] = 128 + w % 64;
+	} else if (w <= 0x10ffff) {
+		s.resize(4);
+		s[0] = 240 + w / 262144;
+		s[1] = 128 + w / 4096 % 64;
+		s[2] = 128 + w / 64 % 64;
+		s[3] = 128 + w % 64;
+	} else {
+		s.resize(3);
+		w = 0xfffd;
+		s[0] = 224 + w / 4096;
+		s[1] = 128 + w / 64 % 64;
+		s[2] = 128 + w % 64;
+	}
+	return s;
 }

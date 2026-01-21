@@ -1666,8 +1666,7 @@ static void oxcmail_enum_attachment(const MIME *pmime, void *pparam)
 			tmp_int32 = ATTACH_EMBEDDED_MSG;
 			if (pattachment->proplist.set(PR_ATTACH_METHOD, &tmp_int32) != ecSuccess)
 				return;
-			pmsg = oxcmail_import(pmime_enum->charset,
-				pmime_enum->str_zone, &mail,
+			pmsg = oxcmail_import(&mail,
 				pmime_enum->alloc, pmime_enum->get_propids);
 			if (pmsg == nullptr)
 				return;
@@ -2465,8 +2464,8 @@ static std::nullptr_t xlog_null(const char *func, unsigned int line)
 }
 
 #define imp_null xlog_null(__func__, __LINE__)
-MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
-    const MAIL *pmail, EXT_BUFFER_ALLOC alloc, GET_PROPIDS get_propids) try
+MESSAGE_CONTENT *oxcmail_import(const MAIL *pmail, EXT_BUFFER_ALLOC alloc,
+    GET_PROPIDS get_propids) try
 {
 	namemap phash;
 	MIME_ENUM_PARAM mime_enum{phash};
@@ -2484,10 +2483,8 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 	pmsg->set_rcpts_internal(prcpts);
 
 	std::string default_charset;
-	if (charset == nullptr)
-		charset = "us-ascii";
 	if (!pmail->get_charset(default_charset))
-		default_charset = charset;
+		default_charset = "us-ascii";
 	field_param.alloc = alloc;
 	field_param.pmail = pmail;
 	field_param.pmsg = pmsg.get();
@@ -2557,7 +2554,7 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 				return imp_null;
 			std::swap(pmsg->children.prcpts, pmsg1->children.prcpts);
 			if (field_param.b_flag_del)
-				oxcmail_remove_flag_properties(pmsg1.get(), get_propids);
+				oxcmail_remove_flag_properties(pmsg1.get(), std::move(get_propids));
 			return pmsg1.release();
 		}
 	}
@@ -2591,7 +2588,7 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 					return imp_null;
 				std::swap(pmsg->children.prcpts, pmsg1->children.prcpts);
 				if (field_param.b_flag_del)
-					oxcmail_remove_flag_properties(pmsg1.get(), get_propids);
+					oxcmail_remove_flag_properties(pmsg1.get(), std::move(get_propids));
 				return pmsg1.release();
 			}
 		}
@@ -2609,7 +2606,6 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 	mime_enum.b_result = true;
 	mime_enum.attach_id = 0;
 	mime_enum.charset = default_charset.c_str();
-	mime_enum.str_zone = str_zone;
 	mime_enum.get_propids = get_propids;
 	mime_enum.alloc = alloc;
 	mime_enum.pmsg = pmsg.get();
@@ -2666,7 +2662,7 @@ MESSAGE_CONTENT *oxcmail_import(const char *charset, const char *str_zone,
 			if (!ical.load_from_str_move(&pcontent[content_len+1])) {
 				mime_enum.pcalendar = nullptr;
 			} else {
-				pmsg1.reset(oxcical_import_single(str_zone, ical, alloc,
+				pmsg1.reset(oxcical_import_single(ical, alloc,
 				        get_propids, oxcmail_username_to_entryid).release());
 				if (pmsg1 == nullptr) {
 					mlog(LV_WARN, "W-2728: oxcmail_import_single returned no object (parse error?); placing ical as attachment instead");

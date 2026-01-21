@@ -7,18 +7,16 @@
 using NSPI_HANDLE = CONTEXT_HANDLE;
 
 struct STAT {
-	uint32_t sort_type;
-	uint32_t container_id;
-	uint32_t cur_rec;
-	int32_t delta;
-	uint32_t num_pos;
-	uint32_t total_rec;
-	cpid_t codepage;
-	uint32_t template_locale;
-	uint32_t sort_locale;
+	uint32_t sort_type = 0, container_id = 0, cur_rec = 0;
+	int32_t delta = 0;
+	uint32_t num_pos = 0, total_rec = 0;
+	cpid_t codepage{};
+	uint32_t template_locale = 0, sort_locale = 0;
 };
 
 /* MID_ARRAY is semantically different, but layout-compatible to LPROPTAG_ARRAY (and exchange_nsp uses the proptag deserializer). */
+using minid_t = uint32_t;
+using minid_cspan = proptag_cspan;
 using MID_ARRAY = LPROPTAG_ARRAY;
 using MINID_ARRAY = LPROPTAG_ARRAY;
 
@@ -27,9 +25,6 @@ struct NSP_PROPNAME {
 	uint32_t reserved;
 	uint32_t id;
 };
-
-/* MS-OXNSPI v13 §2.2.2.6 vs §2.2.7.1 oddity that is irrelevant for our implementation */
-using STRINGS_ARRAY = STRING_ARRAY;
 
 struct FILETIME {
 	uint32_t low_datetime;

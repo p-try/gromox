@@ -104,7 +104,7 @@ static message_ptr do_mail(const char *file, const char *data, size_t dsize)
 		fprintf(stderr, "Unable to parse %s\n", file);
 		return nullptr;
 	}
-	message_ptr msg(oxcmail_import(nullptr, "UTC", &imail, gi_alloc, ee_get_propids));
+	message_ptr msg(oxcmail_import(&imail, gi_alloc, ee_get_propids));
 	if (msg == nullptr)
 		fprintf(stderr, "Failed to convert IM %s to MAPI\n", file);
 	return msg;
@@ -239,7 +239,7 @@ static errno_t do_ical(const char *file, std::vector<message_ptr> &mv)
 		fprintf(stderr, "ical_parse %s unsuccessful\n", file);
 		return EIO;
 	}
-	auto err = oxcical_import_multi("UTC", ical, zalloc, ee_get_propids,
+	auto err = oxcical_import_multi(ical, zalloc, ee_get_propids,
 	           oxcmail_username_to_entryid, mv);
 	if (err == ecNotFound) {
 		fprintf(stderr, "%s: Not an iCalendar object, or an incomplete one.\n", file);
@@ -409,7 +409,7 @@ int main(int argc, char **argv) try
 			osize, msgs.size());
 	}
 
-	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0004", 8) < 0)
+	if (HXio_fullwrite(STDOUT_FILENO, "GXMT0005", 8) < 0)
 		throw YError("PG-1014: %s", strerror(errno));
 	uint8_t flag = false;
 	if (HXio_fullwrite(STDOUT_FILENO, &flag, sizeof(flag)) < 0) /* splice flag */
@@ -433,7 +433,7 @@ int main(int argc, char **argv) try
 			return EXIT_FAILURE;
 		}
 		if (ep.p_uint32(static_cast<uint32_t>(MAPI_MESSAGE)) != pack_result::ok ||
-		    ep.p_uint32(i + 1) != pack_result::ok ||
+		    ep.p_uint64(i + 1) != pack_result::ok ||
 		    ep.p_uint32(static_cast<uint32_t>(parent.type)) != pack_result::ok ||
 		    ep.p_uint64(parent.folder_id) != pack_result::ok ||
 		    ep.p_msgctnt(*msgs[i].content) != pack_result::ok) {

@@ -89,7 +89,6 @@ char g_org_name[256];
 static thread_local const char *g_dir_key;
 static thread_local unsigned int g_env_refcount;
 static thread_local std::unique_ptr<env_context> g_env_key;
-static char g_default_charset[32];
 static char g_submit_command[1024];
 static constexpr char ZCORE_UA[] = PACKAGE_NAME "-zcore " PACKAGE_VERSION;
 
@@ -165,12 +164,8 @@ static int cu_test_delegate_perm_MD(const char *account,
     const char *maildir, bool send_as) try
 {
 	std::vector<std::string> delegate_list;
-	auto path = maildir + std::string(send_as ? "/config/sendas.txt" : "/config/delegates.txt");
-	auto ret = read_file_by_line(path.c_str(), delegate_list);
-	if (ret != 0 && ret != ENOENT) {
-		mlog(LV_WARN, "W-2057: %s: %s", path.c_str(), strerror(ret));
-		return ret;
-	}
+	if (!exmdb_client->read_delegates(maildir, send_as, &delegate_list))
+		return -1;
 	for (const auto &d : delegate_list)
 		if (strcasecmp(d.c_str(), account) == 0)
 			return 1;
@@ -206,6 +201,8 @@ repr_grant cu_get_delegate_perm_AA(const char *account, const char *repr)
 	sql_meta_result mres;
 	if (mysql_adaptor_meta(repr, WANTPRIV_METAONLY, mres) != 0)
 		return repr_grant::error;
+	if (strcasecmp(account, mres.username.c_str()) == 0)
+		return repr_grant::send_as;
 	return cu_get_delegate_perm_MD(account, mres.maildir.c_str());
 }
 
@@ -291,9 +288,8 @@ BOOL common_util_essdn_to_ids(const char *pessdn,
 	return TRUE;	
 }
 
-BOOL common_util_exmdb_locinfo_from_string(
-	const char *loc_string, uint8_t *ptype,
-	int *pdb_id, uint64_t *peid)
+bool common_util_exmdb_locinfo_from_string(const char *loc_string,
+    uint8_t *ptype, int *pdb_id, eid_t *peid)
 {
 	int tmp_len;
 	uint64_t tmp_val;
@@ -328,12 +324,11 @@ BOOL common_util_exmdb_locinfo_from_string(
 	return TRUE;
 }
 
-void common_util_init(const char *org_name, const char *default_charset,
+void common_util_init(const char *org_name,
     unsigned int max_rcpt, size_t max_mail_len,
     unsigned int max_rule_len, std::string &&smtp_url, const char *submit_command)
 {
 	gx_strlcpy(g_org_name, org_name, std::size(g_org_name));
-	gx_strlcpy(g_default_charset, default_charset, std::size(g_default_charset));
 	g_max_rcpt = max_rcpt;
 	g_max_mail_len = max_mail_len;
 	g_max_rule_len = g_max_extrule_len = max_rule_len;
@@ -537,8 +532,7 @@ uint16_t common_util_get_messaging_entryid_type(BINARY bin)
 	return folder_type;
 }
 
-BOOL cu_entryid_to_fid(BINARY bin,
-	BOOL *pb_private, int *pdb_id, uint64_t *pfolder_id)
+bool cu_entryid_to_fid(BINARY bin, BOOL *pb_private, int *pdb_id, eid_t *pfolder_id)
 {
 	uint16_t replid;
 	EXT_PULL ext_pull;
@@ -577,8 +571,8 @@ BOOL cu_entryid_to_fid(BINARY bin,
 	}
 }
 
-BOOL cu_entryid_to_mid(BINARY bin, BOOL *pb_private,
-	int *pdb_id, uint64_t *pfolder_id, uint64_t *pmessage_id)
+bool cu_entryid_to_mid(BINARY bin, BOOL *pb_private,
+    int *pdb_id, eid_t *pfolder_id, eid_t *pmessage_id)
 {
 	uint16_t replid;
 	EXT_PULL ext_pull;
@@ -1064,12 +1058,10 @@ static BOOL common_util_get_propname(propid_t propid, PROPERTY_NAME **pppropname
 ec_error_t cu_send_message(store_object *pstore, message_object *msg,
     const char *ev_from) try
 {
-	uint64_t message_id = msg->get_id();
+	eid_t message_id = msg->get_id();
 	void *pvalue;
 	BOOL b_private, b_partial = false;
 	int account_id;
-	uint64_t new_id;
-	uint64_t folder_id;
 	TAGGED_PROPVAL *ppropval;
 	MESSAGE_CONTENT *pmsgctnt;
 	
@@ -1123,8 +1115,8 @@ ec_error_t cu_send_message(store_object *pstore, message_object *msg,
 
 	imail.set_header("X-Mailer", ZCORE_UA);
 	if (zcore_backfill_transporthdr) {
-		std::unique_ptr<MESSAGE_CONTENT, mc_delete> rmsg(oxcmail_import(nullptr,
-			"UTC", &imail, common_util_alloc, common_util_get_propids));
+		std::unique_ptr<MESSAGE_CONTENT, mc_delete> rmsg(oxcmail_import(
+			&imail, common_util_alloc, common_util_get_propids));
 		if (rmsg != nullptr) {
 			for (auto tag : {PR_TRANSPORT_MESSAGE_HEADERS, PR_TRANSPORT_MESSAGE_HEADERS_A}) {
 				auto th = rmsg->proplist.get<const char>(tag);
@@ -1154,6 +1146,7 @@ ec_error_t cu_send_message(store_object *pstore, message_object *msg,
 	common_util_remove_propvals(&pmsgctnt->proplist, PidTagSentMailSvrEID);
 	auto ptarget = pmsgctnt->proplist.get<BINARY>(PR_TARGET_ENTRYID);
 	if (NULL != ptarget) {
+		eid_t folder_id{}, new_id{};
 		if (!cu_entryid_to_mid(*ptarget,
 		    &b_private, &account_id, &folder_id, &new_id))
 			return ecWarnWithErrors;
@@ -1173,6 +1166,7 @@ ec_error_t cu_send_message(store_object *pstore, message_object *msg,
 	if (!exmdb_client->clear_submit(pstore->get_dir(), message_id, false))
 		return ecWarnWithErrors;
 	ptarget = pmsgctnt->proplist.get<BINARY>(PR_SENTMAIL_ENTRYID);
+	eid_t folder_id{};
 	if (ptarget == nullptr || !cu_entryid_to_fid(*ptarget,
 	    &b_private, &account_id, &folder_id))
 		folder_id = rop_util_make_eid_ex(1, PRIVATE_FID_SENT_ITEMS);
@@ -1252,7 +1246,7 @@ static MOVECOPY_ACTION *cu_cvt_from_zmovecopy(const ZMOVECOPY_ACTION &src)
 	if (!cu_entryid_to_fid(src.folder_eid,
 	    &b_private, &db_id, &psvreid->folder_id))
 		return NULL;
-	psvreid->message_id = 0;
+	psvreid->message_id = eid_t(0);
 	psvreid->instance = 0;
 	dst->pfolder_eid = psvreid;
 	return dst;
@@ -1604,11 +1598,11 @@ static EID_ARRAY *common_util_load_folder_messages(store_object *pstore,
 	if (pmessage_ids == nullptr)
 		return NULL;
 	pmessage_ids->count = 0;
-	pmessage_ids->pids = cu_alloc<uint64_t>(tmp_set.count);
+	pmessage_ids->pids = cu_alloc<eid_t>(tmp_set.count);
 	if (pmessage_ids->pids == nullptr)
 		return NULL;
 	for (size_t i = 0; i < tmp_set.count; ++i) {
-		auto pmid = tmp_set.pparray[i]->get<uint64_t>(PidTagMid);
+		auto pmid = tmp_set.pparray[i]->get<eid_t>(PidTagMid);
 		if (pmid == nullptr)
 			return NULL;
 		pmessage_ids->pids[pmessage_ids->count++] = *pmid;
@@ -1761,26 +1755,13 @@ static void zc_unwrap_clearsigned(MAIL &ma) try
 MESSAGE_CONTENT *cu_rfc822_to_message(store_object *pstore,
     unsigned int mxf_flags, /* effective-moved-from */ BINARY *peml_bin)
 {
-	char charset[32];
-	auto pinfo = zs_get_info();
 	MAIL imail;
 	if (!imail.refonly_parse(peml_bin->pc, peml_bin->cb))
 		return NULL;
 	if (mxf_flags & MXF_UNWRAP_SMIME_CLEARSIGNED)
 		zc_unwrap_clearsigned(imail);
-	auto c = lang_to_charset(pinfo->get_lang());
-	if (c != nullptr && *c != '\0')
-		gx_strlcpy(charset, c, std::size(charset));
-	else
-		strcpy(charset, g_default_charset);
-	sql_meta_result mres;
-	auto tmzone = mysql_adaptor_meta(pinfo->get_username(),
-	              WANTPRIV_METAONLY, mres) == 0 ?
-	              mres.timezone.c_str() : nullptr;
-	if (*znul(tmzone) == '\0')
-		tmzone = common_util_get_default_timezone();
 	common_util_set_dir(pstore->get_dir());
-	auto pmsgctnt = oxcmail_import(charset, tmzone, &imail,
+	auto pmsgctnt = oxcmail_import(&imail,
 	                common_util_alloc, common_util_get_propids_create);
 	return pmsgctnt;
 }
@@ -1820,13 +1801,6 @@ BOOL common_util_message_to_ical(store_object *pstore, uint64_t message_id,
 message_ptr cu_ical_to_message(store_object *pstore, const BINARY *pical_bin) try
 {
 	ical ical;
-	auto pinfo = zs_get_info();
-	sql_meta_result mres;
-	auto tmzone = mysql_adaptor_meta(pinfo->get_username(),
-	              WANTPRIV_METAONLY, mres) == 0 ?
-	              mres.timezone.c_str() : nullptr;
-	if (*znul(tmzone) == '\0')
-		tmzone = common_util_get_default_timezone();
 	auto pbuff = cu_alloc<char>(pical_bin->cb + 1);
 	if (pbuff == nullptr)
 		return nullptr;
@@ -1835,7 +1809,7 @@ message_ptr cu_ical_to_message(store_object *pstore, const BINARY *pical_bin) tr
 	if (!ical.load_from_str_move(pbuff))
 		return NULL;
 	common_util_set_dir(pstore->get_dir());
-	return oxcical_import_single(tmzone, ical, common_util_alloc,
+	return oxcical_import_single(ical, common_util_alloc,
 	       common_util_get_propids_create, common_util_username_to_entryid);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
@@ -1845,19 +1819,11 @@ message_ptr cu_ical_to_message(store_object *pstore, const BINARY *pical_bin) tr
 ec_error_t cu_ical_to_message2(store_object *store, char *ical_data,
     std::vector<message_ptr> &msgvec) try
 {
-	auto info = zs_get_info();
-	sql_meta_result mres;
-	auto tmzone = mysql_adaptor_meta(info->get_username(),
-	              WANTPRIV_METAONLY, mres) == 0 ?
-	              mres.timezone.c_str() : nullptr;
-	if (*znul(tmzone) == '\0')
-		tmzone = common_util_get_default_timezone();
-
 	ical icobj;
 	if (!icobj.load_from_str_move(ical_data))
 		return ecError;
 	common_util_set_dir(store->get_dir());
-	return oxcical_import_multi(tmzone, icobj, common_util_alloc,
+	return oxcical_import_multi(icobj, common_util_alloc,
 	       common_util_get_propids_create,
 	       common_util_username_to_entryid, msgvec);
 } catch (const std::bad_alloc &) {

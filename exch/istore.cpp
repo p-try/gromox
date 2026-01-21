@@ -50,7 +50,7 @@ static constexpr generic_module g_dfl_svc_plugins[] = {
 	{"libgxs_exmdb_provider.so", SVC_exmdb_provider},
 };
 
-static gromox::atomic_bool g_notify_stop, g_hup_signalled;
+static gromox::atomic_bool g_istore_stop, g_hup_signalled;
 static std::shared_ptr<config_file> g_config_file;
 static const char *opt_config_file;
 
@@ -72,7 +72,7 @@ static bool istore_reload_config(std::shared_ptr<config_file> cfg = nullptr)
 
 static void term_handler(int signo)
 {
-	g_notify_stop = true;
+	g_istore_stop = true;
 }
 
 int main(int argc, char **argv)
@@ -110,6 +110,10 @@ int main(int argc, char **argv)
 	if (!istore_reload_config(g_config_file))
 		return EXIT_FAILURE;
 
+	if (cfg->get_ll("istore_standalone") <= 0) {
+		mlog(LV_NOTICE, "istore not enabled (gromox.cfg:istore_standalone). Quitting.");
+		return EXIT_FAILURE;
+	}
 	auto str = cfg->get_value("host_id");
 	if (str == nullptr) {
 		std::string hn;
@@ -135,7 +139,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	retcode = EXIT_SUCCESS;
 	mlog(LV_INFO, "Information Store is running");
-	while (!g_notify_stop) {
+	while (!g_istore_stop) {
 		sleep(86400); /* interrupts on signal */
 		if (g_hup_signalled.exchange(false)) {
 			istore_reload_config();
