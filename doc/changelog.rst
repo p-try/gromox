@@ -1,10 +1,35 @@
-Gromox 3.3.9
-============
+Gromox 3.3.185 (Development)
+===========================
+
+Enhancements:
+
+* mbop: new "zaddrxlat" command
+* delivery: add pre-delivery junk shelving and ``lda_junk_rules``
+  config directive
+exmdb_local: replace direct disk I/O with imapfile_read/write EXRPCs
 
 Fixes:
 
 * mrautoproc: server-side processed meeting requests automatically entered into
   the calendar had lacked the flags asfMeeting+asfReceived, which was fixed.
+* nsp: seeking backwards with the seekEntries routine jumped too far backwards,
+  causing the last screenful of the Outlook GAL to be misrepresented.
+* oxcmail: the "Keywords:" RFC5322 header (Categories) used to get filled with
+  text garbage, which is now fixed.
+* zcore: plug a memory leak occuring when importing vCards
+* Any data, when converted from windows-1255 or 1258 character set to Unicode,
+  sometimes lost the last character in the conversion, which has been fixed.
+* exmdb: abort purge-datafiles if there is a database error midway
+* imap: release potentially-large APPEND buffers much earlier
+
+Changes:
+
+* oxcmail: limit nesting depth of attachments during export to 7
+* oxcmail: RFC 5322 header fields are now treated as US-ASCII as mandated,
+  and no longer magically assumed to be in the same charset as the body.
+* exporter: FAI messages are no longer emitted by default and explicitly need
+  to be requested with the -a option.
+* daemons: deleted the oxcical_allday_ymd config directive
 
 
 Gromox 3.3 (2025-12-27)

@@ -98,9 +98,7 @@ struct instance_node {
 };
 
 struct prepared_statements {
-	~prepared_statements();
 	bool begin(sqlite3 *);
-
 	gromox::xstmt msg_norm, msg_str, rcpt_norm, rcpt_str;
 };
 
@@ -151,16 +149,35 @@ struct db_base {
 	std::vector<db_handle> mx_sqlite, mx_sqlite_eph;
 };
 
-struct db_base_unlock_rd {
-	inline void operator()(const db_base *b) const { b->giant_lock.unlock_shared(); }
+class db_base_rd_ptr {
+	public:
+	constexpr db_base_rd_ptr(db_base *x) : m_base(x) {}
+	~db_base_rd_ptr() { reset(); }
+	NOMOVE(db_base_rd_ptr);
+
+	constexpr db_base *get() { return m_base; }
+	constexpr db_base *operator->() { return m_base; }
+	constexpr db_base &operator*() { return *m_base; }
+	void reset() { if (m_base != nullptr) { m_base->giant_lock.unlock(); m_base = nullptr; } }
+
+	private:
+	db_base *m_base = nullptr;
 };
 
-struct db_base_unlock_wr {
-	inline void operator()(db_base *b) const { b->giant_lock.unlock(); }
-};
+class db_base_wr_ptr {
+	public:
+	constexpr db_base_wr_ptr(db_base *x) : m_base(x) {}
+	~db_base_wr_ptr() { reset(); }
+	NOMOVE(db_base_wr_ptr);
 
-using db_base_rd_ptr = std::unique_ptr<const db_base, db_base_unlock_rd>;
-using db_base_wr_ptr = std::unique_ptr<db_base, db_base_unlock_wr>;
+	constexpr db_base *get() { return m_base; }
+	constexpr db_base *operator->() { return m_base; }
+	constexpr db_base &operator*() { return *m_base; }
+	void reset() { if (m_base != nullptr) { m_base->giant_lock.unlock(); m_base = nullptr; } }
+
+	private:
+	db_base *m_base = nullptr;
+};
 
 class db_item_deleter;
 struct db_conn {
@@ -205,7 +222,8 @@ struct db_conn {
 	/* pdb will also be put */
 	static void commit_batch_mode_release(std::optional<db_conn> &&pdb, db_base_wr_ptr &&base);
 	void cancel_batch_mode(db_base &);
-	std::unique_ptr<prepared_statements> begin_optim();
+	bool begin_optim();
+	void end_optim() { m_prepstm.reset(); }
 
 	gromox::xstmt prep(const char *q) const { return gromox::gx_sql_prep(psqlite, q); }
 	gromox::xstmt prep(const std::string &q) const { return gromox::gx_sql_prep(psqlite, q.c_str()); }
@@ -218,6 +236,7 @@ struct db_conn {
 	inline uint32_t next_table_id() { return ++m_base->tables.last_id; }
 
 	sqlite3 *psqlite = nullptr, *m_sqlite_eph = nullptr;
+	std::unique_ptr<prepared_statements> m_prepstm;
 
 	private:
 	db_base *m_base = nullptr;

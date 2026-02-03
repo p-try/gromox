@@ -80,16 +80,13 @@ struct store_object;
 
 extern void common_util_init(const char *org_name, unsigned int max_rcpt, size_t max_mail_len, unsigned int max_rule_len, std::string &&smtp_url, const char *submit_cmd);
 extern int common_util_run(const char *data_path);
-BOOL common_util_verify_columns_and_sorts(
-	const PROPTAG_ARRAY *pcolumns,
-	const SORTORDER_SET *psort_criteria);
+extern bool cu_verify_columns_and_sorts(proptag_cspan, const SORTORDER_SET *);
 extern bool cu_extract_delegator(message_object *, std::string &);
 extern repr_grant cu_get_delegate_perm_MD(const char *account, const char *maildir);
 extern repr_grant cu_get_delegate_perm_AA(const char *account, const char *account_representing);
 extern ec_error_t cu_set_propval(TPROPVAL_ARRAY *parray, gromox::proptag_t, const void *);
 extern void common_util_remove_propvals(TPROPVAL_ARRAY *, gromox::proptag_t);
-void common_util_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
-	const PROPTAG_ARRAY *pproptags_subtractor);
+extern void cu_reduce_proptags(PROPTAG_ARRAY *, proptag_cspan);
 BOOL common_util_essdn_to_uid(const char *pessdn, int *puid);
 BOOL common_util_essdn_to_ids(const char *pessdn,
 	int *pdomain_id, int *puser_id);
@@ -142,12 +139,12 @@ extern ec_error_t cu_remote_copy_message(store_object *s0, uint64_t message_id, 
 extern ec_error_t cu_remote_copy_folder(store_object *s0, uint64_t folder_id, store_object *s1, uint64_t folder_id1, const char *new_name);
 extern ec_error_t cu_send_message(store_object *, message_object *, const char *ev_from);
 extern BOOL common_util_message_to_rfc822(store_object *, uint64_t inst_id, BINARY *eml);
-extern message_content *cu_rfc822_to_message(store_object *, unsigned int mxf_flags, BINARY *eml);
+extern std::unique_ptr<message_content, gromox::mc_delete> cu_rfc822_to_message(store_object *, unsigned int mxf_flags, BINARY *eml);
 extern BOOL common_util_message_to_ical(store_object *, uint64_t msg_id, BINARY *ical);
 extern std::unique_ptr<message_content, gromox::mc_delete> cu_ical_to_message(store_object *, const BINARY *ical);
 extern ec_error_t cu_ical_to_message2(store_object *, char *ical_data, std::vector<std::unique_ptr<message_content, gromox::mc_delete>> &);
 extern BOOL common_util_message_to_vcf(message_object *, BINARY *vcfout);
-extern message_content *common_util_vcf_to_message(store_object *, const BINARY *vcf);
+extern std::unique_ptr<message_content, gromox::mc_delete> common_util_vcf_to_message(store_object *, const BINARY *vcf);
 extern ec_error_t cu_vcf_to_message2(store_object *, char *vcf_data, std::vector<std::unique_ptr<message_content, gromox::mc_delete>> &);
 extern const char *common_util_get_default_timezone();
 extern const char *common_util_get_submit_command();

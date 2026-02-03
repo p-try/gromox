@@ -31,7 +31,6 @@ namespace gromox::EWS::detail {
  */
 struct Cleaner {
 	void operator()(BINARY*);
-	void operator()(MESSAGE_CONTENT*);
 };
 
 struct AttachmentInstanceKey {
@@ -267,7 +266,7 @@ class EWSPlugin {
  */
 class EWSContext {
 	public:
-	using MCONT_PTR = std::unique_ptr<MESSAGE_CONTENT, detail::Cleaner>; ///< Unique pointer to MESSAGE_CONTENT
+	using MCONT_PTR = std::unique_ptr<message_content, gromox::mc_delete>;
 
 	enum State : uint8_t {S_DEFAULT, S_WRITE, S_DONE, S_STREAM_NOTIFY};
 
@@ -295,7 +294,7 @@ class EWSContext {
 	TPROPVAL_ARRAY getFolderProps(const Structures::sFolderSpec&, const PROPTAG_ARRAY&) const;
 	TAGGED_PROPVAL getItemEntryId(const std::string&, uint64_t) const;
 	template<typename T> const T *getItemProp(const std::string &, uint64_t, proptag_t) const;
-	TPROPVAL_ARRAY getItemProps(const std::string&, uint64_t, const PROPTAG_ARRAY&) const;
+	TPROPVAL_ARRAY getItemProps(const std::string &, uint64_t, proptag_cspan) const;
 	GUID getMailboxGuid(const std::string&) const;
 	Structures::sMailboxInfo getMailboxInfo(const std::string&, bool) const;
 	propid_t getNamedPropId(const std::string &, const PROPERTY_NAME &, bool = false) const;

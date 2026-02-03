@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cassert>
 #include <cerrno>
@@ -117,7 +117,6 @@ static constexpr cfg_directive http_cfg_defaults[] = {
 	{"listen_ssl_port", "http_listen_tls_port", CFG_ALIAS},
 	{"msrpc_debug", "0"},
 	{"ntlmssp_program", "/usr/bin/ntlm_auth --helper-protocol=squid-2.5-ntlmssp"},
-	{"oxcical_allday_ymd", "1", CFG_BOOL},
 	{"request_max_mem", "4M", CFG_SIZE, "1M"},
 	{"running_identity", RUNNING_IDENTITY},
 	{"tcp_max_segment", "0", CFG_SIZE},
@@ -144,7 +143,6 @@ static bool http_reload_config(std::shared_ptr<CONFIG_FILE> xcfg = nullptr,
 	g_http_debug = cfg->get_ll("http_debug");
 	g_enforce_auth = cfg->get_ll("http_enforce_auth");
 	g_msrpc_debug = cfg->get_ll("msrpc_debug");
-	g_oxcical_allday_ymd = cfg->get_ll("oxcical_allday_ymd");
 
 	if (xcfg == nullptr)
 		xcfg = config_file_prg(opt_config_file, "gromox.cfg", gromox_cfg_defaults);
@@ -200,6 +198,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE; /* e.g. permission error */
 	if (!http_reload_config(gxconfig, g_config_file))
 		return EXIT_FAILURE;
+	setup_utf8_locale();
 
 	auto str_val = g_config_file->get_value("host_id");
 	if (str_val == NULL) {

@@ -11,7 +11,7 @@ AM_TESTS_ENVIRONMENT = export TEST_PATH=${top_srcdir}/data;
 # lib_LTL must be dependency-ordered, or make install fails
 lib_LTLIBRARIES = libgromox_common.la libgromox_dbop.la libgromox_epoll.la libgromox_mapi.la libgromox_exrpc.la libgromox_ndr.la libgxs_mysql_adaptor.la libgromox_abtree.la libgromox_auth.la libgromox_authz.la libgxm_alias_resolve.la libgxm_exmdb_local.la libgromox_ews.la libgromox_mh_emsmdb.la libgromox_mh_nsp.la libgromox_oab.la libgromox_oxdisco.la libgromox_emsmdb.la libgromox_nsp.la libgromox_rfr.la libgxs_exmdb_provider.la libgxs_event_proxy.la libgxs_event_stub.la libgxs_midb_agent.la libgxs_timer_agent.la libgxs_ruleproc.la
 
-pkglibexec_PROGRAMS = delivery delivery-queue event gromox-snapshot http imap istore midb pop3 timer zcore tools/authtry tools/ddbg tools/textmapquery
+pkglibexec_PROGRAMS = delivery delivery-queue event gromox-snapshot http imap istore lda midb oab oxdisco pop3 timer zcore tools/authtry tools/ddbg tools/textmapquery
 if WITH_GNU_LD
 version_sc_SYFLAGS = -Wl,--version-script=${srcdir}/default.sym
 endif
@@ -68,7 +68,7 @@ libgromox_authz_la_SOURCES = exch/dnsbl_filter.cpp exch/user_filter.cpp
 libgromox_authz_la_LDFLAGS = ${default_SYFLAGS}
 libgromox_authz_la_LIBADD = -lpthread ${cares_LIBS} ${libHX_LIBS} ${resolv_LIBS} libgromox_common.la
 EXTRA_libgromox_authz_la_DEPENDENCIES = default.sym
-libgromox_common_la_SOURCES = lib/bounce_gen.cpp lib/cookie_parser.cpp lib/cryptoutil.cpp lib/dbhelper.cpp lib/double_list.cpp lib/fopen.cpp lib/guid2.cpp lib/list_file.cpp lib/mail_func.cpp lib/oxoabkt.cpp lib/process.cpp lib/rfbl.cpp lib/simple_tree.cpp lib/stream.cpp lib/svc_loader.cpp lib/textmaps.cpp lib/util.cpp lib/wintz.cpp lib/mapi/ext_buffer.cpp lib/mapi/ext_buffer2.cpp
+libgromox_common_la_SOURCES = lib/bounce_gen.cpp lib/cryptoutil.cpp lib/dbhelper.cpp lib/double_list.cpp lib/fopen.cpp lib/guid2.cpp lib/list_file.cpp lib/mail_func.cpp lib/mail_func2.cpp lib/oxoabkt.cpp lib/process.cpp lib/rfbl.cpp lib/simple_tree.cpp lib/stream.cpp lib/svc_loader.cpp lib/textmaps.cpp lib/util.cpp lib/wintz.cpp lib/mapi/ext_buffer.cpp lib/mapi/ext_buffer2.cpp
 libgromox_common_la_LIBADD = -lpthread ${backtrace_LIBS} ${libcrypto_LIBS} ${fmt_LIBS} ${libHX_LIBS} ${libidn_LIBS} ${iconv_LIBS} ${jsoncpp_LIBS} ${sqlite_LIBS} ${libssl_LIBS} ${tinyxml2_LIBS} ${vmime_LIBS} ${libzstd_LIBS}
 libgromox_dbop_la_SOURCES = lib/dbop_mysql.cpp lib/dbop_sqlite.cpp
 libgromox_dbop_la_LIBADD = ${fmt_LIBS} ${mysql_LIBS} ${sqlite_LIBS} libgromox_common.la
@@ -94,6 +94,8 @@ libgxm_exmdb_local_la_LDFLAGS = ${default_SYFLAGS}
 libgxm_exmdb_local_la_LIBADD = -lpthread ${fmt_LIBS} ${libHX_LIBS} ${jsoncpp_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la
 EXTRA_libgxm_exmdb_local_la_DEPENDENCIES = default.sym
 
+lda_SOURCES = mda/lda.cpp
+lda_LDADD = ${libHX_LIBS} ${vmime_LIBS} libgromox_common.la libgxs_mysql_adaptor.la
 pop3_SOURCES = mra/pop3/cmd.cpp mra/pop3/main.cpp mra/pop3/parser.cpp mra/pop3/pop3.hpp mra/pop3/resource.cpp
 pop3_LDADD = -lpthread ${libcrypto_LIBS} ${libHX_LIBS} ${libssl_LIBS} libgromox_auth.la libgromox_authz.la libgromox_common.la libgromox_epoll.la libgromox_exrpc.la libgxs_event_proxy.la libgxs_midb_agent.la libgxs_mysql_adaptor.la
 imap_SOURCES = mra/imap/cmd.cpp mra/imap/imap.hpp mra/imap/main.cpp mra/imap/parser.cpp mra/imap/resource.cpp
@@ -113,6 +115,12 @@ EXTRA_libgxs_midb_agent_la_DEPENDENCIES = default.sym
 
 http_SOURCES = exch/http/cache.cpp exch/http/cache.hpp exch/http/fastcgi.cpp exch/http/fastcgi.hpp exch/http/hpm_processor.cpp exch/http/hpm_processor.hpp exch/http/http_parser.cpp exch/http/http_parser.hpp exch/http/listener.cpp exch/http/listener.hpp exch/http/main.cpp exch/http/ntlmssp.cpp exch/http/ntlmssp.hpp exch/http/pdu_ndr.cpp exch/http/pdu_ndr.hpp exch/http/pdu_ndr_ids.hpp exch/http/pdu_processor.cpp exch/http/pdu_processor.hpp exch/http/resource.hpp exch/http/rewrite2.cpp exch/http/rewrite.hpp exch/http/system_services.cpp exch/http/system_services.hpp
 http_LDADD = -lpthread ${libcrypto_LIBS} ${fmt_LIBS} ${gss_LIBS} ${iconv_LIBS} ${libHX_LIBS} ${libssl_LIBS} libgromox_auth.la libgromox_authz.la libgromox_common.la libgromox_epoll.la libgromox_ndr.la libgromox_mapi.la libgromox_ews.la libgromox_mh_emsmdb.la libgromox_mh_nsp.la libgromox_oab.la libgromox_oxdisco.la libgromox_emsmdb.la libgromox_nsp.la libgromox_rfr.la libgxs_exmdb_provider.la libgxs_mysql_adaptor.la libgxs_timer_agent.la
+oab_SOURCES = exch/fcgid.cpp
+oab_CPPFLAGS = ${AM_CPPFLAGS} -DENTRYPOINT=HPM_oab
+oab_LDADD = -lpthread ${libHX_LIBS} libgromox_common.la libgromox_mapi.la libgxs_mysql_adaptor.la libgromox_oab.la
+oxdisco_SOURCES = exch/fcgid.cpp
+oxdisco_CPPFLAGS = ${AM_CPPFLAGS} -DENTRYPOINT=HPM_oxdisco
+oxdisco_LDADD = -lpthread ${libHX_LIBS} libgromox_common.la libgromox_mapi.la libgxs_mysql_adaptor.la libgromox_oxdisco.la
 istore_SOURCES = exch/istore.cpp
 istore_LDADD = -lpthread ${libHX_LIBS} libgromox_common.la libgromox_mapi.la libgxs_exmdb_provider.la libgxs_mysql_adaptor.la
 midb_SOURCES = exch/midb/cmd_parser.cpp exch/midb/cmd_parser.hpp exch/midb/common_util.cpp exch/midb/common_util.hpp exch/midb/exmdb_client.hpp exch/midb/mail_engine.cpp exch/midb/mail_engine.hpp exch/midb/main.cpp exch/midb/system_services.hpp
@@ -199,7 +207,7 @@ gromox_mbck_SOURCES = tools/mbck.cpp
 gromox_mbck_LDADD = ${libHX_LIBS} ${fmt_LIBS} ${sqlite_LIBS} libgromox_common.la
 gromox_mbop_SOURCES = tools/genimport.cpp tools/genimport.hpp tools/mbop.hpp tools/mbop.cpp
 EXTRA_DIST += tools/kdbsub.cpp tools/mbop_delmsg.cpp tools/mbop_emptyfld.cpp tools/mbop_foreach.cpp tools/mbop_freebusy.cpp tools/mbop_locale.cpp tools/mbop_main.cpp tools/mbop_purge.cpp tools/mbop_walk.cpp tools/staticnpmap.cpp
-gromox_mbop_LDADD = ${libHX_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la libgxs_midb_agent.la
+gromox_mbop_LDADD = ${libHX_LIBS} ${jsoncpp_LIBS} ${mysql_LIBS} libgromox_common.la libgromox_exrpc.la libgromox_mapi.la libgxs_mysql_adaptor.la libgxs_midb_agent.la
 gromox_mbsize_SOURCES = tools/mbsize.cpp
 gromox_mbsize_LDADD = ${sqlite_LIBS} libgromox_common.la
 gromox_mkmidb_SOURCES = tools/mkmidb.cpp tools/mkshared.cpp tools/mkshared.hpp
@@ -299,7 +307,7 @@ dist_man_MANS = \
 	doc/gromox-mbsize.8 \
 	doc/gromox-mkmidb.8 doc/gromox-mkprivate.8 doc/gromox-mkpublic.8 \
 	doc/gromox-selinux.5 \
-	doc/gromox-snapshot.8 doc/gromox-vcf2mt.8 doc/http.8gx \
+	doc/gromox-snapshot.8 doc/gromox-tnef2mt.8 doc/gromox-vcf2mt.8 doc/http.8gx \
 	doc/imap.8gx doc/istore.8gx \
 	doc/kdb-uidextract.8 doc/kdb-uidextract-limited.8 \
 	doc/ldap_adaptor.4gx \

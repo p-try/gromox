@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdio>
 #include <cstring>
@@ -23,8 +23,6 @@ enum {
 };
 
 static bool mail_retrieve_to_mime(MAIL *, MIME *parent, const char *begin, const char *end);
-static void mail_enum_text_mime_charset(const MIME *, void *);
-static void mail_enum_html_charset(const MIME *, void *);
 
 void MAIL::clear()
 {
@@ -49,12 +47,6 @@ bool MAIL::refonly_parse(const char *in_buff, size_t length)
 {
 	auto pmail = this;
 
-#ifdef _DEBUG_UMTA
-	if (in_buff == nullptr) {
-		mlog(LV_DEBUG, "NULL pointer in %s", __PRETTY_FUNCTION__);
-		return false;
-	}
-#endif
 	clear();
 	auto mime_uq = MIME::create();
 	auto pmime = mime_uq.get();
@@ -196,10 +188,6 @@ static bool mail_retrieve_to_mime(MAIL *pmail, MIME *pmime_parent,
 bool MAIL::serialize(STREAM *pstream) const
 {
 	auto pmail = this;
-#ifdef _DEBUG_UMTA
-	if (pstream == nullptr)
-		return false;
-#endif
 	auto pnode = pmail->tree.get_root();
 	if (pnode == nullptr)
 		return false;
@@ -307,55 +295,6 @@ MIME *MAIL::get_head()
 
 const MIME *MAIL::get_head() const { return deconst(this)->get_head(); }
 
-bool MAIL::get_charset(std::string &charset) const try
-{
-	auto pmail = this;
-	char temp_buff[1024];
-	ENCODE_STRING encode_string;
-	
-#ifdef _DEBUG_UMTA
-	if (charset == nullptr) {
-		mlog(LV_DEBUG, "NULL pointer in %s", __PRETTY_FUNCTION__);
-		return false;
-	}
-#endif
-	charset.clear();
-	auto pnode = pmail->tree.get_root();
-	if (pnode == nullptr)
-		return false;
-	auto pmime = static_cast<const MIME *>(pnode->pdata);
-	if (pmime->get_field("Subject", temp_buff, 512)) {
-		parse_mime_encode_string(temp_buff, strlen(temp_buff),
-			&encode_string);
-		if (0 != strcmp(encode_string.charset, "default")) {
-			charset = encode_string.charset;
-			return true;
-		}
-	}
-	if (pmime->get_field("From", temp_buff, 512)) {
-		parse_mime_encode_string(temp_buff, strlen(temp_buff),
-			&encode_string);
-		if (0 != strcmp(encode_string.charset, "default")) {
-			charset = encode_string.charset;
-			return true;
-		}
-	}
-	pmail->enum_mime(mail_enum_text_mime_charset, &charset);
-	if (!charset.empty())
-		return true;
-	pmail->enum_mime(mail_enum_html_charset, &charset);
-	return !charset.empty();
-} catch (const std::bad_alloc &) {
-	return false;
-}
-
-static void replace_qb(char *s)
-{
-	for (; *s != '\0'; ++s)
-		if (*s == '"' || *s == '\\')
-			*s = ' ';
-}
-
 /*
  *	get the digest string of mail
  *	@return
@@ -365,64 +304,54 @@ static void replace_qb(char *s)
 int MAIL::make_digest(Json::Value &digest) const try
 {
 	auto pmail = this;
-	char *ptr;
 	int priority;
 	BOOL b_tags[TAG_NUM];
-	char temp_buff[1024];
 
-#ifdef _DEBUG_UMTA
-	if (poffset == nullptr) {
-		mlog(LV_DEBUG, "NULL pointer in %s", __PRETTY_FUNCTION__);
-		return -1;
-	}
-#endif
 	auto pnode = pmail->tree.get_root();
 	if (pnode == nullptr)
 		return -1;
 
 	digest = Json::objectValue;
 	auto pmime = static_cast<const MIME *>(pnode->pdata);
-	if (pmime->get_field("Message-ID", temp_buff, 128))
-		digest["msgid"] = base64_encode(temp_buff);
-	if (pmime->get_field("Date", temp_buff, 128))
-		digest["date"] = base64_encode(temp_buff);
-	if (pmime->get_field("From", temp_buff, 512))
-		digest["from"] = base64_encode(temp_buff);
-	if (pmime->get_field("Sender", temp_buff, 512)) {
-		auto s = base64_encode(temp_buff);
+	if (auto hval = pmime->get_field("Message-ID"))
+		digest["msgid"] = base64_encode(*hval);
+	if (auto hval = pmime->get_field("Date"))
+		digest["date"] = base64_encode(*hval);
+	if (auto hval = pmime->get_field("From"))
+		digest["from"] = base64_encode(*hval);
+	if (auto hval = pmime->get_field("Sender")) {
+		auto s = base64_encode(*hval);
 		if (!s.empty())
 			digest["sender"] = std::move(s);
 	}
-	if (pmime->get_field("Reply-To", temp_buff, 512)) {
-		auto s = base64_encode(temp_buff);
+	if (auto hval = pmime->get_field("Reply-To")) {
+		auto s = base64_encode(*hval);
 		if (!s.empty())
 			digest["reply"] = std::move(s);
 	}
-	if (pmime->get_field("To", temp_buff, 1024))
-		digest["to"] = base64_encode(temp_buff);
-	if (pmime->get_field("Cc", temp_buff, 1024))
-		digest["cc"] = base64_encode(temp_buff);
-	if (pmime->get_field("In-Reply-To", temp_buff, 512)) {
-		auto s = base64_encode(temp_buff);
+	if (auto hval = pmime->get_field("To"))
+		digest["to"] = base64_encode(*hval);
+	if (auto hval = pmime->get_field("Cc"))
+		digest["cc"] = base64_encode(*hval);
+	if (auto hval = pmime->get_field("In-Reply-To")) {
+		auto s = base64_encode(*hval);
 		if (!s.empty())
 			digest["inreply"] = std::move(s);
 	}
 
-	if (!pmime->get_field("X-Priority", temp_buff, 32)) {
-		priority = 3;
-	} else {
-		priority = strtol(temp_buff, nullptr, 0);
+	if (auto hval = pmime->get_field("X-Priority")) {
+		priority = strtol(hval->c_str(), nullptr, 0);
 		if (priority <= 0 || priority > 5)
 			priority = 3;
+	} else {
+		priority = 3;
 	}
 
-	if (pmime->get_field("Subject", temp_buff, 512))
-		digest["subject"] = base64_encode(temp_buff);
+	if (auto hval = pmime->get_field("Subject"))
+		digest["subject"] = base64_encode(*hval);
 	
-	if (!pmime->get_field("Received", temp_buff, 256)) {
-		digest["received"] = digest["date"];
-	} else {
-		ptr = strrchr(temp_buff, ';');
+	if (auto hval = pmime->get_field("Received")) {
+		auto ptr = strrchr(hval->c_str(), ';');
 		if (NULL == ptr) {
 			digest["received"] = digest["date"];
 		} else {
@@ -431,10 +360,10 @@ int MAIL::make_digest(Json::Value &digest) const try
 				ptr ++;
 			digest["received"] = base64_encode(ptr);
 		}
+	} else {
+		digest["received"] = digest["date"];
 	}
 
-	std::string email_charset;
-	get_charset(email_charset);
 	digest["uid"]       = 0;
 	digest["recent"]    = 1;
 	digest["read"]      = 0;
@@ -443,14 +372,10 @@ int MAIL::make_digest(Json::Value &digest) const try
 	digest["forwarded"] = 0;
 	digest["flag"]      = 0;
 	digest["priority"]  = Json::Value::UInt64(priority);
-	if (!email_charset.empty() && str_isasciipr(email_charset.c_str())) {
-		replace_qb(email_charset.data());
-		digest["charset"] = std::move(email_charset);
-	}
-	if (pmime->get_field("Disposition-Notification-To", temp_buff, 1024))
-		digest["notification"] = base64_encode(temp_buff);
-	if (pmime->get_field("References", temp_buff, 1024))
-		digest["ref"] = base64_encode(temp_buff);
+	if (auto hval = pmime->get_field("Disposition-Notification-To"))
+		digest["notification"] = base64_encode(*hval);
+	if (auto hval = pmime->get_field("References"))
+		digest["ref"] = base64_encode(*hval);
 
 	b_tags[TAG_SIGNED] = FALSE;
 	b_tags[TAG_ENCRYPT] = FALSE;
@@ -484,57 +409,6 @@ int MAIL::make_digest(Json::Value &digest) const try
 	return -1;
 }
 
-static void mail_enum_text_mime_charset(const MIME *pmime, void *param)
-{
-	auto &cset = *static_cast<std::string *>(param);
-	
-	if (!cset.empty())
-		return; /* already found something earlier */
-	if (0 == strncasecmp(pmime->content_type, "text/", 5) &&
-	    pmime->get_content_param("charset", cset)) {
-		replace_qb(cset.data());
-		HX_strrtrim(cset.data());
-		HX_strltrim(cset.data());
-		cset.resize(strlen(cset.c_str()));
-	}
-}
-
-static void mail_enum_html_charset(const MIME *pmime, void *param) try
-{
-	auto &cset = *static_cast<std::string *>(param);
-	int i;
-	/* read_content won't do partial reads, so this buf is kinda large. yuck. */
-	auto buff = std::make_unique<char[]>(128*1024);
-	
-	if (!cset.empty())
-		return; /* already found something earlier */
-	if (strcasecmp(pmime->content_type, "text/html") != 0)
-		return;
-	size_t length = 128 * 1024 - 1;
-	if (!pmime->read_content(buff.get(), &length))
-		return;
-	if (length > 4096)
-		length = 4096;
-	buff[length] = '\0';
-	const char *ptr = strcasestr(buff.get(), "charset=");
-	if (ptr == nullptr)
-		return;
-	ptr += 8;
-	if (*ptr == '"' || *ptr == '\'')
-		ptr ++;
-	auto start = ptr, stop = ptr;
-	for (i=0; i<32; i++) {
-		if ('"' == ptr[i] || '\'' == ptr[i] || ' ' == ptr[i] ||
-			',' == ptr[i] || ';' == ptr[i] || '>' == ptr[i]) {
-			break;
-		} else {
-			++stop;
-		}
-	}
-	cset.assign(start, stop - start);
-} catch (const std::bad_alloc &) {
-}
-
 /*
  *  add a child mime to pbase_mime
  *  @param
@@ -549,12 +423,6 @@ MIME *MAIL::add_child(MIME *pmime_base, int opt)
 {
 	auto pmail = this;
 
-#ifdef _DEBUG_UMTA
-	if (pmime_base == nullptr) {
-	        mlog(LV_DEBUG, "NULL pointer in %s", __PRETTY_FUNCTION__);
-        return NULL;
-    }
-#endif
 	if (pmime_base->mime_type != mime_type::multiple)
 		return NULL;
 	auto mime_uq = MIME::create();
@@ -571,12 +439,6 @@ MIME *MAIL::add_child(MIME *pmime_base, int opt)
 void MAIL::enum_mime(MAIL_MIME_ENUM enum_func, void *param) const
 {
 	auto pmail = this;
-#ifdef _DEBUG_UMTA
-	if (enum_func == nullptr) {
-	        mlog(LV_DEBUG, "NULL pointer in %s", __PRETTY_FUNCTION__);
-        return;
-    }
-#endif
 	simple_tree_enum_from_node(pmail->tree.get_root(), [&](const tree_node *stn, unsigned int) {
 		auto m = containerof(stn, const MIME, stree);
 		enum_func(m, param);
@@ -595,12 +457,6 @@ bool MAIL::dup(MAIL *pmail_dst)
 	unsigned int size;
 	void *ptr;
 	
-#ifdef _DEBUG_UMTA
-	if (pmail_dst == nullptr) {
-		mlog(LV_DEBUG, "NULL pointer in %s", __PRETTY_FUNCTION__);
-		return false;
-	}
-#endif
 	pmail_dst->clear();
 	auto mail_len = get_length();
 	if (mail_len < 0)

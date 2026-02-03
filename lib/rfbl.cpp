@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #	include "config.h"
@@ -56,6 +56,7 @@
 #include <gromox/atomic.hpp>
 #include <gromox/clock.hpp>
 #include <gromox/config_file.hpp>
+#include <gromox/cookie_parser.hpp>
 #include <gromox/fileio.h>
 #include <gromox/generic_connection.hpp>
 #include <gromox/json.hpp>
@@ -533,7 +534,16 @@ static int utf8_writeout(FILE *fp, const void *vsrc, size_t src_size, const char
 		if (fwrite(buffer, sizeof(buffer) - dst_size, 1, fp) != 1)
 			return -1;
 	}
-	errno = 0;
+
+	/* Flush pending shift and/or state */
+	auto dst = buffer;
+	size_t dst_size = sizeof(buffer);
+	auto ret = iconv(cd, nullptr, 0, &dst, &dst_size);
+	if (ret == static_cast<size_t>(-1))
+		/* ignore */;
+	if (dst_size != sizeof(buffer) &&
+	    fwrite(buffer, sizeof(buffer) - dst_size, 1, fp) != 1)
+		return -1;
 	return 0;
 }
 
@@ -596,10 +606,7 @@ int feed_w3m(std::string_view inbuf, const char *cset, std::string &final_buf) t
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return -1;
 	final_buf = std::move(outbuf);
-	if (outbuf.empty())
-		return 0;
-	/* The caller can just look at outbuf.size() */
-	return 1;
+	return 0;
 } catch (...) {
 	return -1;
 }
@@ -953,17 +960,19 @@ bool cset_cstr_compatible(const char *s)
 	return true;
 }
 
-static void init_locale()
+bool setup_utf8_locale()
 {
-	setlocale(LC_ALL, "C.UTF-8");
-	if (iswalnum(0x79C1))
-		return;
-	setlocale(LC_ALL, "en_US.UTF-8");
+	if (setlocale(LC_ALL, "C.UTF-8") != nullptr && iswalnum(0x79C1))
+		return true;
+	if (setlocale(LC_ALL, "en_US.UTF-8") != nullptr)
+		return true;
+	mlog(LV_INFO, "Could not set the program to UTF-8 locale. "
+		"Text operations, e.g. PR_SUBJECT_PREFIX extraction, may fail to produce results.");
+	return false;
 }
 
 int iconv_validate()
 {
-	init_locale();
 	for (const auto s : {"UTF-16LE", "windows-1252",
 	     "iso-8859-1", "iso-2022-jp"}) {
 		auto k = iconv_open("UTF-8", s);
@@ -1598,38 +1607,57 @@ std::string iconvtext(std::string_view sv,
 		errno = EINVAL;
 		return {};
 	}
-	auto cleanup = HX::make_scope_exit([&]() { iconv_close(cd); });
-	char buffer[4096];
-	std::string out;
-	bool last_bad = false;
-	auto src = deconst(sv.data());
-	size_t src_size = sv.size();
+	try {
+		char buffer[4096];
+		std::string out;
+		bool last_bad = false;
+		auto src = deconst(sv.data());
+		size_t src_size = sv.size();
 
-	while (src_size > 0) {
+		while (src_size > 0) {
+			auto dst = buffer;
+			size_t dst_size = sizeof(buffer);
+			errno = 0;
+			auto ret = iconv(cd, &src, &src_size, &dst, &dst_size);
+			if (dst_size != sizeof(buffer)) {
+				last_bad = false;
+				out.append(buffer, sizeof(buffer) - dst_size);
+			}
+			if (ret != (size_t)-1 || src_size == 0) {
+				last_bad = false;
+				continue;
+			}
+			if (errno == EILSEQ || errno == EINVAL) {
+				--src_size;
+				++src;
+				if (flags & ICONVTEXT_TRANSLIT) {
+					if (!last_bad)
+						out += '?';
+					last_bad = true;
+				}
+			}
+		}
+
+		/* Flush pending shift and/or state */
 		auto dst = buffer;
 		size_t dst_size = sizeof(buffer);
 		errno = 0;
-		auto ret = iconv(cd, &src, &src_size, &dst, &dst_size);
-		if (dst_size != sizeof(buffer)) {
-			last_bad = false;
+		auto ret = iconv(cd, nullptr, 0, &dst, &dst_size);
+		if (dst_size != sizeof(buffer))
 			out.append(buffer, sizeof(buffer) - dst_size);
-		}
 		if (ret != (size_t)-1 || src_size == 0) {
-			last_bad = false;
-			continue;
+		} else if (errno == EILSEQ || errno == EINVAL) {
+			if (flags & ICONVTEXT_TRANSLIT)
+				out += '?';
 		}
-		if (errno == EILSEQ || errno == EINVAL) {
-			--src_size;
-			++src;
-			if (flags & ICONVTEXT_TRANSLIT) {
-				if (!last_bad)
-					out += '?';
-				last_bad = true;
-			}
-		}
+		errno = 0;
+		iconv_close(cd);
+		return out;
+	} catch (const std::bad_alloc &) {
+		iconv_close(cd);
+		errno = ENOMEM;
+		return {};
 	}
-	errno = 0;
-	return out;
 } catch (const std::bad_alloc &) {
 	errno = ENOMEM;
 	return {};
@@ -1876,6 +1904,79 @@ int gx_mkbasedir(const char *file, unsigned int mode)
 	return HX_mkdir(base.get(), mode);
 }
 
+static std::string cookie_rmeta(std::string_view sv)
+{
+	std::string s{sv};
+	auto o = s.begin();
+	for (auto i = s.begin(); i < s.end(); ++i) {
+		if (*i != '%') {
+			*o++ = *i;
+			continue;
+		}
+		if (i + 1 == s.end() || i + 2 == s.end())
+			break;
+		char tb[3] = {i[1], i[2], '\0'};
+		char *end = nullptr;
+		uint8_t c = strtoul(tb, &end, 16);
+		if (end == &tb[2])
+			*o++ = c;
+		i += 2;
+	}
+	s.erase(o, s.end());
+	return s;
+}
+
+static inline size_t sv_cspn(std::string_view sv, char c)
+{
+	auto p = sv.find(c);
+	return p != sv.npos ? p : sv.size();
+}
+
+ec_error_t cookie_jar::add(std::string_view sv) try
+{
+	while (sv.size() > 0) {
+		while (sv.size() > 0 && HX_isspace(sv[0]))
+			sv.remove_prefix(1);
+		auto klen = sv.find_first_of(";=");
+		if (klen == sv.npos)
+			klen = sv.size();
+		auto &value = emplace(sv.substr(0, klen), std::string()).first->second;
+		sv.remove_prefix(klen);
+		if (sv.size() == 0)
+			break; /* attribute without cookie-value */
+		if (sv[0] != '=') {
+			sv.remove_prefix(1); /* ; */
+			continue;
+		}
+		sv.remove_prefix(1); /* = */
+		if (sv.size() == 0)
+			break;
+		size_t vlen;
+		if (sv[0] == '"') {
+			sv.remove_prefix(1);
+			vlen  = sv_cspn(sv, '\"');
+			value = cookie_rmeta(sv.substr(0, vlen));
+			sv.remove_prefix(vlen);
+			vlen  = sv_cspn(sv, ';');
+		} else {
+			vlen  = sv_cspn(sv, ';');
+			value = cookie_rmeta(sv.substr(0, vlen));
+		}
+		sv.remove_prefix(vlen);
+		if (sv.size() > 0)
+			sv.remove_prefix(1); /* ; */
+	}
+	return ecSuccess;
+} catch (const std::bad_alloc &) {
+	return ecServerOOM;
+}
+
+const char *cookie_jar::operator[](const char *name) const
+{
+	auto i = map::find(name);
+	return i != cend() ? i->second.c_str() : nullptr;
+}
+
 }
 
 int XARRAY::append(MITEM &&ptr, unsigned int tag) try
@@ -2095,12 +2196,6 @@ std::shared_ptr<CONFIG_FILE> config_file_initd(const char *fb,
 	return nullptr;
 }
 
-static const char *default_searchpath()
-{
-	const char *ed = getenv("GROMOX_CONFIG_PATH");
-	return ed != nullptr ? ed : PKGSYSCONFDIR;
-}
-
 /**
  * Routine intended for programs:
  *
@@ -2111,7 +2206,7 @@ std::shared_ptr<CONFIG_FILE> config_file_prg(const char *ov, const char *fb,
     const cfg_directive *key_desc)
 {
 	if (ov == nullptr)
-		return config_file_initd(fb, default_searchpath(), key_desc);
+		return config_file_initd(fb, PKGSYSCONFDIR, key_desc);
 	auto cfg = config_file_init(ov, key_desc);
 	if (cfg == nullptr)
 		mlog(LV_ERR, "config_file_init %s: %s", ov, strerror(errno));

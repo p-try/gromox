@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <memory>
 #include <new>
+#include <optional>
 #include <pthread.h>
 #include <string>
 #include <string_view>
@@ -81,7 +82,6 @@ enum GP_RESULT { GP_ADV, GP_UNHANDLED, GP_SKIP, GP_ERR };
 static constexpr uint8_t empty_entryid[20]{};
 
 static unsigned int g_max_msg, g_cid_use_xxhash = 1;
-static thread_local prepared_statements *g_opt_key;
 
 namespace exmdb {
 
@@ -94,10 +94,10 @@ unsigned int g_cid_compression = 0; /* disabled(0), specific_level(n) */
 
 decltype(common_util_get_handle) common_util_get_handle;
 
-static bool cu_eval_subobj_restriction(sqlite3 *, cpid_t, uint64_t msgid, gromox::proptag_t, const RESTRICTION *);
-static bool gp_prepare_anystr(sqlite3 *, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
-static bool gp_prepare_mvstr(sqlite3 *, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
-static bool gp_prepare_default(sqlite3 *, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
+static bool cu_eval_subobj_restriction(const db_conn &, cpid_t, uint64_t msgid, gromox::proptag_t, const RESTRICTION *);
+static bool gp_prepare_anystr(const db_conn &, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
+static bool gp_prepare_mvstr(const db_conn &, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
+static bool gp_prepare_default(const db_conn &, mapi_object_type, uint64_t, proptag_t, xstmt &, sqlite3_stmt *&);
 static void *gp_fetch(sqlite3 *, sqlite3_stmt *, uint16_t, cpid_t, GP_RESULT &);
 
 ec_error_t cu_set_propval(TPROPVAL_ARRAY *parray, proptag_t tag, const void *data)
@@ -418,36 +418,28 @@ bool prepared_statements::begin(sqlite3 *psqlite)
 	return true;
 }
 
-prepared_statements::~prepared_statements()
-{
-	if (g_opt_key == this)
-		g_opt_key = nullptr;
-}
-
-std::unique_ptr<prepared_statements> db_conn::begin_optim() try
+bool db_conn::begin_optim() try
 {
 	auto op = std::make_unique<prepared_statements>();
 	if (!op->begin(psqlite))
-		return nullptr;
-	if (g_opt_key != nullptr)
-		mlog(LV_ERR, "E-2359: overlapping optimize_statements");
-	g_opt_key = op.get();
-	return op;
+		return false;
+	m_prepstm = std::move(op);
+	return true;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
-	return nullptr;
+	return false;
 }
 
 namespace exmdb {
 
 static sqlite3_stmt *
-cu_get_optimize_stmt(mapi_object_type table_type, bool b_normal)
+cu_get_optimize_stmt(const db_conn &db, mapi_object_type table_type, bool b_normal)
 {
 	if (table_type != MAPI_MESSAGE && table_type != MAPI_MAILUSER)
 		return NULL;	
-	auto op = g_opt_key;
-	if (op == nullptr)
-		return NULL;
+	if (db.m_prepstm == nullptr)
+		return nullptr;
+	auto op = db.m_prepstm.get();
 	if (table_type == MAPI_MESSAGE)
 		return b_normal ? op->msg_norm : op->msg_str;
 	return b_normal ? op->rcpt_norm : op->rcpt_str;
@@ -570,7 +562,7 @@ bool cu_get_proptags(mapi_object_type table_type, uint64_t id, sqlite3 *psqlite,
 	return false;
 }
 
-static BINARY* common_util_get_mailbox_guid(sqlite3 *psqlite)
+static std::optional<GUID> common_util_get_mailbox_guid(sqlite3 *psqlite)
 {
 	GUID tmp_guid;
 	char sql_string[128];
@@ -580,20 +572,10 @@ static BINARY* common_util_get_mailbox_guid(sqlite3 *psqlite)
 				CONFIG_ID_MAILBOX_GUID);
 	auto pstmt = gx_sql_prep(psqlite, sql_string);
 	if (pstmt == nullptr || pstmt.step() != SQLITE_ROW)
-		return NULL;
+		return {};
 	if (!tmp_guid.from_str(pstmt.col_text(0)))
-		return NULL;
-	pstmt.finalize();
-	auto ptmp_bin = cu_alloc<BINARY>();
-	if (ptmp_bin == nullptr)
-		return NULL;
-	ptmp_bin->pv = common_util_alloc(16);
-	if (ptmp_bin->pv == nullptr)
-		return NULL;
-	ptmp_bin->cb = 16;
-	FLATUID f = tmp_guid;
-	memcpy(ptmp_bin->pv, &f, sizeof(f));
-	return ptmp_bin;
+		return {};
+	return {std::move(tmp_guid)};
 }
 
 static BINARY *cu_get_mapping_sig(sqlite3 *db)
@@ -758,7 +740,7 @@ BOOL common_util_check_msgcnt_overflow(sqlite3 *psqlite)
 	return c >= g_max_msg ? TRUE : false;
 }
 
-bool cu_check_msgsize_overflow(sqlite3 *psqlite, proptag_t qtag)
+bool cu_check_msgsize_overflow(const db_conn &psqlite, proptag_t qtag)
 {
 	const proptag_t tags[] = {qtag, PR_MESSAGE_SIZE_EXTENDED};
 	TPROPVAL_ARRAY propvals;
@@ -1085,9 +1067,9 @@ static BINARY *cu_fid_to_entryid(sqlite3 *psqlite, uint64_t folder_id)
 	tmp_entryid.flags = 0;
 	if (exmdb_server::is_private()) {
 		auto pbin = common_util_get_mailbox_guid(psqlite);
-		if (pbin == nullptr)
+		if (!pbin)
 			return NULL;
-		memcpy(&tmp_entryid.provider_uid, pbin->pb, 16);
+		tmp_entryid.provider_uid  = *pbin;
 		tmp_entryid.folder_dbguid = rop_util_make_user_guid(account_id);
 		tmp_entryid.eid_type      = EITLT_PRIVATE_FOLDER;
 	} else {
@@ -1126,9 +1108,9 @@ static BINARY *cu_mid_to_entryid(sqlite3 *psqlite, uint64_t message_id)
 	tmp_entryid.flags = 0;
 	if (exmdb_server::is_private()) {
 		auto pbin = common_util_get_mailbox_guid(psqlite);
-		if (pbin == nullptr)
+		if (!pbin)
 			return NULL;
-		memcpy(&tmp_entryid.provider_uid, pbin->pb, 16);
+		tmp_entryid.provider_uid  = *pbin;
 		tmp_entryid.folder_dbguid = rop_util_make_user_guid(account_id);
 		tmp_entryid.eid_type      = EITLT_PRIVATE_MESSAGE;
 	} else {
@@ -1235,12 +1217,12 @@ static uint64_t common_util_get_message_changenum(
 	return rop_util_make_eid_ex(1, change_num);
 }
 
-BOOL common_util_get_message_flags(sqlite3 *psqlite,
-	uint64_t message_id, BOOL b_native,
+bool cu_get_msg_flags(const db_conn &db, uint64_t message_id, bool b_native,
 	uint32_t **ppmessage_flags)
 {
-	auto pstmt = cu_get_optimize_stmt(MAPI_MESSAGE, true);
+	auto pstmt = cu_get_optimize_stmt(db, MAPI_MESSAGE, true);
 	xstmt own_stmt;
+	auto &psqlite = db.psqlite;
 	if (NULL != pstmt) {
 		sqlite3_reset(pstmt);
 	} else {
@@ -1285,18 +1267,17 @@ BOOL common_util_get_message_flags(sqlite3 *psqlite,
 	return TRUE;
 }
 
-static void* common_util_get_message_parent_display(
-	sqlite3 *psqlite, uint64_t message_id)
+static char *cu_get_msg_parent_display(const db_conn &psqlite, uint64_t message_id)
 {
 	void *pvalue;
 	uint64_t folder_id;
 	
-	if (!common_util_get_message_parent_folder(psqlite, message_id, &folder_id))
+	if (!common_util_get_message_parent_folder(psqlite.psqlite, message_id, &folder_id))
 		return NULL;	
 	if (!cu_get_property(MAPI_FOLDER, folder_id, CP_ACP,
 	    psqlite, PR_DISPLAY_NAME, &pvalue))
 		return NULL;	
-	return pvalue;
+	return static_cast<char *>(pvalue);
 }
 
 /**
@@ -1304,15 +1285,16 @@ static void* common_util_get_message_parent_display(
  * from its constituent parts (PR_SUBJECT_PREFIX, PR_NORMALIZED_SUBJECT).
  * Conversely, writes to PR_SUBJECT are intercepted and split up.
  */
-static BOOL common_util_get_message_subject(sqlite3 *psqlite, cpid_t cpid,
+static bool common_util_get_message_subject(const db_conn &db, cpid_t cpid,
     uint64_t message_id, proptag_t proptag, void **ppvalue)
 {
 	const char *psubject_prefix, *pnormalized_subject;
 	
 	psubject_prefix = NULL;
 	pnormalized_subject = NULL;
-	auto pstmt = cu_get_optimize_stmt(MAPI_MESSAGE, true);
+	auto pstmt = cu_get_optimize_stmt(db, MAPI_MESSAGE, true);
 	xstmt own_stmt;
+	auto &psqlite = db.psqlite;
 	if (NULL != pstmt) {
 		sqlite3_reset(pstmt);
 	} else {
@@ -1369,7 +1351,7 @@ static BOOL common_util_get_message_subject(sqlite3 *psqlite, cpid_t cpid,
 	return TRUE;
 }
 	
-static BOOL common_util_get_message_display_recipients(sqlite3 *psqlite,
+static bool cu_get_msg_display_recipients(const db_conn &psqlite,
     cpid_t cpid, uint64_t message_id, proptag_t proptag, void **ppvalue) try
 {
 	void *pvalue;
@@ -1395,7 +1377,7 @@ static BOOL common_util_get_message_display_recipients(sqlite3 *psqlite,
 	}
 	snprintf(sql_string, std::size(sql_string), "SELECT recipient_id FROM"
 	          " recipients WHERE message_id=%llu", LLU{message_id});
-	auto pstmt = gx_sql_prep(psqlite, sql_string);
+	auto pstmt = gx_sql_prep(psqlite.psqlite, sql_string);
 	if (pstmt == nullptr)
 		return FALSE;
 	while (pstmt.step() == SQLITE_ROW) {
@@ -1424,7 +1406,7 @@ static BOOL common_util_get_message_display_recipients(sqlite3 *psqlite,
 	}
 	*ppvalue = PROP_TYPE(proptag) == PT_UNICODE ? common_util_dup(dr) :
 	           cu_utf8_to_mb_dup(cpid, dr.c_str());
-	return *ppvalue != nullptr ? TRUE : false;
+	return *ppvalue != nullptr;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return false;
@@ -1593,8 +1575,8 @@ static void *cu_get_object_text_v0(const char *dir, const char *cid,
 	return cu_cvt_str_dup(pbuff, cpid, PROP_TYPE(proptag) == PT_STRING8);
 }
 
-BOOL cu_get_property(mapi_object_type table_type, uint64_t id,
-    cpid_t cpid, sqlite3 *psqlite, proptag_t proptag, void **ppvalue)
+bool cu_get_property(mapi_object_type table_type, uint64_t id,
+    cpid_t cpid, const db_conn &psqlite, proptag_t proptag, void **ppvalue)
 {
 	const proptag_t tags[] = {proptag};
 	TPROPVAL_ARRAY propvals;
@@ -1762,11 +1744,11 @@ static GP_RESULT gp_folderprop(proptag_t tag, TAGGED_PROPVAL &pv,
 		return pv.pvalue != nullptr ? GP_ADV : GP_ERR;
 	}
 	case PR_CI_SEARCH_ENABLED: {
-		auto v = cu_alloc<uint8_t>();
-		pv.pvalue = v;
-		if (v == nullptr)
+		auto u = cu_alloc<uint8_t>();
+		pv.pvalue = u;
+		if (u == nullptr)
 			return GP_ERR;
-		*v = false;
+		*u = false;
 		return GP_ADV;
 	}
 	case PR_SUBFOLDERS: {
@@ -1817,9 +1799,10 @@ static GP_RESULT gp_folderprop(proptag_t tag, TAGGED_PROPVAL &pv,
 	return GP_ADV;
 }
 
-static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
-    uint64_t id, cpid_t cpid)
+static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv,
+    const db_conn &db_conn, uint64_t id, cpid_t cpid)
 {
+	auto &db = db_conn.psqlite;
 	switch (tag) {
 	case PR_ENTRYID:
 		pv.pvalue = cu_mid_to_entryid(db, id);
@@ -1858,10 +1841,10 @@ static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
 		return GP_ADV;
 	}
 	case PR_PARENT_DISPLAY:
-		pv.pvalue = common_util_get_message_parent_display(db, id);
+		pv.pvalue = cu_get_msg_parent_display(db_conn, id);
 		return pv.pvalue != nullptr ? GP_ADV : GP_ERR;
 	case PR_PARENT_DISPLAY_A: {
-		auto pstring = static_cast<char *>(common_util_get_message_parent_display(db, id));
+		auto pstring = cu_get_msg_parent_display(db_conn, id);
 		if (pstring == nullptr)
 			return GP_ERR;
 		pv.pvalue = cu_utf8_to_mb_dup(cpid, pstring);
@@ -1925,7 +1908,7 @@ static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
 		return GP_ADV;
 	}
 	case PR_MESSAGE_FLAGS:
-		if (!common_util_get_message_flags(db, id, false,
+		if (!cu_get_msg_flags(db_conn, id, false,
 		    reinterpret_cast<uint32_t **>(&pv.pvalue)))
 			return GP_ERR;
 		if (pv.pvalue == nullptr)
@@ -1935,7 +1918,7 @@ static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
 		return GP_ADV;
 	case PR_SUBJECT:
 	case PR_SUBJECT_A:
-		if (!common_util_get_message_subject(db, cpid, id, tag, &pv.pvalue))
+		if (!common_util_get_message_subject(db_conn, cpid, id, tag, &pv.pvalue))
 			return GP_ERR;
 		return pv.pvalue != nullptr ? GP_ADV : GP_SKIP;
 	case PR_DISPLAY_TO:
@@ -1944,7 +1927,7 @@ static GP_RESULT gp_msgprop(proptag_t tag, TAGGED_PROPVAL &pv, sqlite3 *db,
 	case PR_DISPLAY_TO_A:
 	case PR_DISPLAY_CC_A:
 	case PR_DISPLAY_BCC_A:
-		if (!common_util_get_message_display_recipients(db, cpid, id, tag, &pv.pvalue))
+		if (!cu_get_msg_display_recipients(db_conn, cpid, id, tag, &pv.pvalue))
 			return GP_ERR;
 		return pv.pvalue != nullptr ? GP_ADV : GP_SKIP;
 	case PR_BODY:
@@ -1990,13 +1973,27 @@ static GP_RESULT gp_atxprop(proptag_t tag, TAGGED_PROPVAL &pv,
 }
 
 static GP_RESULT gp_spectableprop(mapi_object_type table_type, proptag_t tag,
-    TAGGED_PROPVAL &pv, sqlite3 *db, uint64_t id, cpid_t cpid)
+    TAGGED_PROPVAL &pv, const db_conn &db_conn, uint64_t id, cpid_t cpid)
 {
+	auto &db = db_conn.psqlite;
 	pv.proptag = tag;
 	switch (tag) {
-	case PR_STORE_RECORD_KEY:
-		pv.pvalue = common_util_get_mailbox_guid(db);
-		return pv.pvalue != nullptr ? GP_ADV : GP_ERR;
+	case PR_STORE_RECORD_KEY: {
+		auto guid = common_util_get_mailbox_guid(db);
+		if (!guid.has_value())
+			return GP_ERR;
+		auto bin = cu_alloc<BINARY>();
+		if (bin == nullptr)
+			return GP_ERR;
+		FLATUID *f = cu_alloc<FLATUID>();
+		if (f == nullptr)
+			return GP_ERR;
+		*f = *guid;
+		bin->pv = f;
+		bin->cb = sizeof(*f);
+		pv.pvalue = bin;
+		return GP_ADV;
+	}
 	case PR_MAPPING_SIGNATURE:
 		pv.pvalue = cu_get_mapping_sig(db);
 		return pv.pvalue != nullptr ? GP_ADV : GP_ERR;
@@ -2004,7 +2001,7 @@ static GP_RESULT gp_spectableprop(mapi_object_type table_type, proptag_t tag,
 	switch (table_type) {
 	case MAPI_STORE:    return gp_storeprop(tag, pv, db);
 	case MAPI_FOLDER:   return gp_folderprop(tag, pv, db, id);
-	case MAPI_MESSAGE:  return gp_msgprop(tag, pv, db, id, cpid);
+	case MAPI_MESSAGE:  return gp_msgprop(tag, pv, db_conn, id, cpid);
 	case MAPI_MAILUSER: return GP_UNHANDLED;
 	case MAPI_ATTACH:   return gp_atxprop(tag, pv, db, id);
 	default:
@@ -2132,34 +2129,37 @@ static GP_RESULT gp_fallbackprop(mapi_object_type table_type, uint64_t objid,
 	return GP_UNHANDLED;
 }
 
+/**
+ * @pv: caller-determined target slot where to write propval
+ */
 static GP_RESULT cu_get_properties1(mapi_object_type table_type, uint64_t id,
-    cpid_t cpid, sqlite3 *psqlite, proptag_t tag, TPROPVAL_ARRAY *ppropvals)
+    cpid_t cpid, const db_conn &db, proptag_t tag, TAGGED_PROPVAL &pv)
 {
 	if (PROP_TYPE(tag) == PT_OBJECT &&
 	    (table_type != MAPI_ATTACH || tag != PR_ATTACH_DATA_OBJ))
 		return GP_SKIP;
 
 	/* Computed property (if): generate value */
-	auto &pv = ppropvals->ppropval[ppropvals->count];
-	auto ret = gp_spectableprop(table_type, tag, pv, psqlite, id, cpid);
+	auto ret = gp_spectableprop(table_type, tag, pv, db, id, cpid);
 	if (ret != GP_UNHANDLED)
 		return ret;
 
 	/* Normal stored property from sqlite */
+	auto &psqlite = db.psqlite;
 	xstmt own_stmt;
 	sqlite3_stmt *pstmt = nullptr;
 	auto proptype = PROP_TYPE(tag);
 	if (proptype == PT_UNSPECIFIED || proptype == PT_STRING8 ||
 	    proptype == PT_UNICODE) {
-		auto bret = gp_prepare_anystr(psqlite, table_type, id, tag, own_stmt, pstmt);
+		auto bret = gp_prepare_anystr(db, table_type, id, tag, own_stmt, pstmt);
 		if (!bret)
 			return GP_ERR;
 	} else if (proptype == PT_MV_STRING8) {
-		auto bret = gp_prepare_mvstr(psqlite, table_type, id, tag, own_stmt, pstmt);
+		auto bret = gp_prepare_mvstr(db, table_type, id, tag, own_stmt, pstmt);
 		if (!bret)
 			return GP_ERR;
 	} else {
-		auto bret = gp_prepare_default(psqlite, table_type, id, tag, own_stmt, pstmt);
+		auto bret = gp_prepare_default(db, table_type, id, tag, own_stmt, pstmt);
 		if (!bret)
 			return GP_ERR;
 	}
@@ -2169,22 +2169,21 @@ static GP_RESULT cu_get_properties1(mapi_object_type table_type, uint64_t id,
 
 	/* Transfer from sqlite to memory */
 	ret = GP_ERR;
-	auto pvalue = gp_fetch(psqlite, pstmt, proptype, cpid, ret);
-	if (pvalue == nullptr)
+	pv.pvalue = gp_fetch(psqlite, pstmt, proptype, cpid, ret);
+	if (pv.pvalue == nullptr)
 		return ret;
 
 	/* Fix up property values */
-	auto bin = static_cast<BINARY *>(pvalue);
+	auto bin = static_cast<BINARY *>(pv.pvalue);
 	if (tag == PR_ENTRYID && bin->cb == 0) {
 		bin->cb = std::size(empty_entryid);
 		bin->pv = deconst(empty_entryid);
 	}
-	ppropvals->emplace_back(tag, pvalue);
-	return GP_SKIP; /* emplace_back already did the GP_ADV part */
+	return GP_ADV;
 }
 
 bool cu_get_properties(mapi_object_type table_type, uint64_t objid, cpid_t cpid,
-    sqlite3 *psqlite, proptag_cspan pproptags, TPROPVAL_ARRAY *ppropvals)
+    const db_conn &psqlite, proptag_cspan pproptags, TPROPVAL_ARRAY *ppropvals)
 {
 	ppropvals->count = 0;
 	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags.size());
@@ -2192,7 +2191,7 @@ bool cu_get_properties(mapi_object_type table_type, uint64_t objid, cpid_t cpid,
 		return FALSE;
 	for (size_t i = 0; i < pproptags.size(); ++i) {
 		auto ret = cu_get_properties1(table_type, objid, cpid, psqlite,
-		           pproptags[i], ppropvals);
+		           pproptags[i], ppropvals->ppropval[ppropvals->count]);
 		if (ret == GP_ADV)
 			++ppropvals->count;
 		else if (ret == GP_ERR)
@@ -2201,9 +2200,10 @@ bool cu_get_properties(mapi_object_type table_type, uint64_t objid, cpid_t cpid,
 	return TRUE;
 }
 
-static bool gp_prepare_anystr(sqlite3 *psqlite, mapi_object_type table_type,
+static bool gp_prepare_anystr(const db_conn &db, mapi_object_type table_type,
     uint64_t id, proptag_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
 {
+	auto &psqlite = db.psqlite;
 	switch (table_type) {
 	case MAPI_STORE:
 		own_stmt = gx_sql_prep(psqlite, "SELECT proptag, propval"
@@ -2224,7 +2224,7 @@ static bool gp_prepare_anystr(sqlite3 *psqlite, mapi_object_type table_type,
 		sqlite3_bind_int64(pstmt, 2, CHANGE_PROP_TYPE(tag, PT_UNICODE));
 		break;
 	case MAPI_MESSAGE:
-		pstmt = cu_get_optimize_stmt(table_type, false);
+		pstmt = cu_get_optimize_stmt(db, table_type, false);
 		if (NULL != pstmt) {
 			sqlite3_reset(pstmt);
 		} else {
@@ -2240,7 +2240,7 @@ static bool gp_prepare_anystr(sqlite3 *psqlite, mapi_object_type table_type,
 		sqlite3_bind_int64(pstmt, 3, CHANGE_PROP_TYPE(tag, PT_STRING8));
 		break;
 	case MAPI_MAILUSER:
-		pstmt = cu_get_optimize_stmt(table_type, false);
+		pstmt = cu_get_optimize_stmt(db, table_type, false);
 		if (NULL != pstmt) {
 			sqlite3_reset(pstmt);
 		} else {
@@ -2273,9 +2273,10 @@ static bool gp_prepare_anystr(sqlite3 *psqlite, mapi_object_type table_type,
 	return true;
 }
 
-static bool gp_prepare_mvstr(sqlite3 *psqlite, mapi_object_type table_type,
+static bool gp_prepare_mvstr(const db_conn &db, mapi_object_type table_type,
     uint64_t id, proptag_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
 {
+	auto &psqlite = db.psqlite;
 	switch (table_type) {
 	case MAPI_STORE:
 		own_stmt = gx_sql_prep(psqlite, "SELECT propval"
@@ -2296,7 +2297,7 @@ static bool gp_prepare_mvstr(sqlite3 *psqlite, mapi_object_type table_type,
 		sqlite3_bind_int64(pstmt, 2, CHANGE_PROP_TYPE(tag, PT_MV_UNICODE));
 		break;
 	case MAPI_MESSAGE:
-		pstmt = cu_get_optimize_stmt(table_type, true);
+		pstmt = cu_get_optimize_stmt(db, table_type, true);
 		if (NULL != pstmt) {
 			sqlite3_reset(pstmt);
 		} else {
@@ -2311,7 +2312,7 @@ static bool gp_prepare_mvstr(sqlite3 *psqlite, mapi_object_type table_type,
 		sqlite3_bind_int64(pstmt, 2, CHANGE_PROP_TYPE(tag, PT_MV_UNICODE));
 		break;
 	case MAPI_MAILUSER:
-		pstmt = cu_get_optimize_stmt(table_type, true);
+		pstmt = cu_get_optimize_stmt(db, table_type, true);
 		if (NULL != pstmt) {
 			sqlite3_reset(pstmt);
 		} else {
@@ -2342,9 +2343,10 @@ static bool gp_prepare_mvstr(sqlite3 *psqlite, mapi_object_type table_type,
 	return true;
 }
 
-static bool gp_prepare_default(sqlite3 *psqlite, mapi_object_type table_type,
+static bool gp_prepare_default(const db_conn &db, mapi_object_type table_type,
     uint64_t id, proptag_t tag, xstmt &own_stmt, sqlite3_stmt *&pstmt)
 {
+	auto &psqlite = db.psqlite;
 	switch (table_type) {
 	case MAPI_STORE:
 		own_stmt = gx_sql_prep(psqlite, "SELECT propval "
@@ -2366,7 +2368,7 @@ static bool gp_prepare_default(sqlite3 *psqlite, mapi_object_type table_type,
 		sqlite3_bind_int64(pstmt, 2, tag);
 		break;
 	case MAPI_MESSAGE:
-		pstmt = cu_get_optimize_stmt(table_type, true);
+		pstmt = cu_get_optimize_stmt(db, table_type, true);
 		if (NULL != pstmt) {
 			sqlite3_reset(pstmt);
 		} else {
@@ -2381,7 +2383,7 @@ static bool gp_prepare_default(sqlite3 *psqlite, mapi_object_type table_type,
 		sqlite3_bind_int64(pstmt, 2, tag);
 		break;
 	case MAPI_MAILUSER:
-		pstmt = cu_get_optimize_stmt(table_type, true);
+		pstmt = cu_get_optimize_stmt(db, table_type, true);
 		if (NULL != pstmt) {
 			sqlite3_reset(pstmt);
 		} else {
@@ -3920,19 +3922,19 @@ BINARY* common_util_to_private_folder_entryid(
 	FOLDER_ENTRYID tmp_entryid;
 	
 	tmp_entryid.flags = 0;
-	auto pbin = common_util_get_mailbox_guid(psqlite);
-	if (pbin == nullptr)
+	auto guid = common_util_get_mailbox_guid(psqlite);
+	if (!guid)
 		return nullptr;
-	memcpy(&tmp_entryid.provider_uid, pbin->pb, 16);
 	unsigned int user_id = 0;
 	if (!mysql_adaptor_get_user_ids(username, &user_id, nullptr, nullptr))
 		return nullptr;
+	tmp_entryid.provider_uid  = *guid;
 	tmp_entryid.folder_dbguid = rop_util_make_user_guid(user_id);
 	tmp_entryid.eid_type      = EITLT_PRIVATE_FOLDER;
 	tmp_entryid.folder_gc     = rop_util_get_gc_array(folder_id);
 	tmp_entryid.pad1[0] = 0;
 	tmp_entryid.pad1[1] = 0;
-	pbin = cu_alloc<BINARY>();
+	auto pbin = cu_alloc<BINARY>();
 	if (pbin == nullptr)
 		return NULL;
 	pbin->pv = common_util_alloc(46); /* MS-OXCDATA v19 §2.2.4.1 */
@@ -3951,13 +3953,13 @@ BINARY* common_util_to_private_message_entryid(
 	MESSAGE_ENTRYID tmp_entryid;
 	
 	tmp_entryid.flags = 0;
-	auto pbin = common_util_get_mailbox_guid(psqlite);
-	if (pbin == nullptr)
+	auto guid = common_util_get_mailbox_guid(psqlite);
+	if (!guid)
 		return nullptr;
-	memcpy(&tmp_entryid.provider_uid, pbin->pb, 16);
 	unsigned int user_id = 0;
 	if (!mysql_adaptor_get_user_ids(username, &user_id, nullptr, nullptr))
 		return nullptr;
+	tmp_entryid.provider_uid   = *guid;
 	tmp_entryid.folder_dbguid  = rop_util_make_user_guid(user_id);
 	tmp_entryid.eid_type       = EITLT_PRIVATE_MESSAGE;
 	tmp_entryid.message_dbguid = tmp_entryid.folder_dbguid;
@@ -3967,7 +3969,7 @@ BINARY* common_util_to_private_message_entryid(
 	tmp_entryid.pad1[1] = 0;
 	tmp_entryid.pad2[0] = 0;
 	tmp_entryid.pad2[1] = 0;
-	pbin = cu_alloc<BINARY>();
+	auto pbin = cu_alloc<BINARY>();
 	if (pbin == nullptr)
 		return NULL;
 	pbin->pv = common_util_alloc(70); /* MS-OXCDATA v19 §2.2.4.2 */
@@ -4158,7 +4160,7 @@ bool cu_load_search_scopes(sqlite3 *psqlite, uint64_t folder_id,
 	return false;
 }
 
-static bool cu_eval_subitem_restriction(sqlite3 *psqlite, cpid_t cpid,
+static bool cu_eval_subitem_restriction(const db_conn &psqlite, cpid_t cpid,
     mapi_object_type table_type, uint64_t id, const RESTRICTION *pres)
 {
 	void *pvalue;
@@ -4238,7 +4240,7 @@ static bool cu_eval_subitem_restriction(sqlite3 *psqlite, cpid_t cpid,
 	return FALSE;
 }
 
-static bool cu_eval_msgsubs_restriction(sqlite3 *psqlite, cpid_t cpid,
+static bool cu_eval_msgsubs_restriction(const db_conn &psqlite, cpid_t cpid,
     uint64_t message_id, proptag_t proptag, const RESTRICTION *pres)
 {
 	uint64_t id;
@@ -4255,7 +4257,7 @@ static bool cu_eval_msgsubs_restriction(sqlite3 *psqlite, cpid_t cpid,
 		snprintf(sql_string, std::size(sql_string), "SELECT attachment_id FROM"
 				" attachments WHERE message_id=%llu", LLU{message_id});
 	}
-	auto pstmt = gx_sql_prep(psqlite, sql_string);
+	auto pstmt = gx_sql_prep(psqlite.psqlite, sql_string);
 	if (pstmt == nullptr)
 		return FALSE;
 	count = 0;
@@ -4275,7 +4277,7 @@ static bool cu_eval_msgsubs_restriction(sqlite3 *psqlite, cpid_t cpid,
 	return pres->rt == RES_COUNT && pres->count->count == count;
 }
 
-static bool cu_eval_subobj_restriction(sqlite3 *psqlite, cpid_t cpid,
+static bool cu_eval_subobj_restriction(const db_conn &psqlite, cpid_t cpid,
     uint64_t message_id, proptag_t proptag, const RESTRICTION *pres)
 {
 	switch (pres->rt) {
@@ -4313,7 +4315,7 @@ static bool cu_eval_subobj_restriction(sqlite3 *psqlite, cpid_t cpid,
 	return FALSE;
 }
 
-bool cu_eval_folder_restriction(sqlite3 *psqlite,
+bool cu_eval_folder_restriction(const db_conn &psqlite,
 	uint64_t folder_id, const RESTRICTION *pres)
 {
 	void *pvalue;
@@ -4404,7 +4406,7 @@ bool cu_eval_folder_restriction(sqlite3 *psqlite,
 	return FALSE;
 }
 
-bool cu_eval_msg_restriction(sqlite3 *psqlite,
+bool cu_eval_msg_restriction(const db_conn &psqlite,
     cpid_t cpid, uint64_t message_id, const RESTRICTION *pres)
 {
 	void *pvalue;
@@ -4441,10 +4443,10 @@ bool cu_eval_msg_restriction(sqlite3 *psqlite,
 			return false;
 		switch (rprop->proptag) {
 		case PR_PARENT_SVREID:
-			pvalue = cu_get_msg_parent_svreid(psqlite, message_id);
+			pvalue = cu_get_msg_parent_svreid(psqlite.psqlite, message_id);
 			break;
 		case PR_PARENT_ENTRYID:
-			pvalue = cu_get_msg_parent_entryid(psqlite, message_id);
+			pvalue = cu_get_msg_parent_entryid(psqlite.psqlite, message_id);
 			break;
 		case PR_ANR: {
 			if (!cu_get_property(MAPI_MESSAGE,
@@ -4580,7 +4582,7 @@ BOOL common_util_set_mid_string(sqlite3 *psqlite,
 	return pstmt.step() == SQLITE_DONE ? TRUE : false;
 }
 
-BOOL common_util_check_message_owner(sqlite3 *psqlite,
+bool cu_msg_test_owner(const db_conn &psqlite,
 	uint64_t message_id, const char *username, BOOL *pb_owner)
 {
 	BINARY *pbin;
@@ -4863,7 +4865,7 @@ static BOOL common_util_copy_message_internal(sqlite3 *psqlite,
 	return TRUE;
 }
 
-BOOL cu_copy_message(sqlite3 *psqlite, uint64_t message_id, uint64_t folder_id,
+bool cu_copy_message(const db_conn &db, uint64_t message_id, uint64_t folder_id,
     uint64_t *pdst_mid, BOOL *pb_result, uint32_t *pmessage_size)
 {
 	void *pvalue;
@@ -4874,6 +4876,7 @@ BOOL cu_copy_message(sqlite3 *psqlite, uint64_t message_id, uint64_t folder_id,
 	PROBLEM_ARRAY tmp_problems;
 	static const uint32_t fake_uid = 1;
 	TAGGED_PROPVAL propval_buff[4];
+	auto &psqlite = db.psqlite;
 	
 	if (!common_util_copy_message_internal(psqlite,
 	    FALSE, message_id, folder_id, pdst_mid, pb_result,
@@ -4881,7 +4884,7 @@ BOOL cu_copy_message(sqlite3 *psqlite, uint64_t message_id, uint64_t folder_id,
 		return FALSE;
 	if (!*pb_result)
 		return TRUE;
-	if (!cu_get_property(MAPI_FOLDER, folder_id, CP_ACP, psqlite,
+	if (!cu_get_property(MAPI_FOLDER, folder_id, CP_ACP, db,
 	    PR_INTERNET_ARTICLE_NUMBER_NEXT, &pvalue))
 		return FALSE;
 	if (pvalue == nullptr)

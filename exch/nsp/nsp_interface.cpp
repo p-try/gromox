@@ -95,9 +95,8 @@ static const BINARY *nsp_photo_rpc(const char *dir)
 	    name_rsp.size() != name_req.size() || name_rsp[0] == 0)
 		return nullptr;
 	auto proptag = PROP_TAG(PT_BINARY, name_rsp[0]);
-	const PROPTAG_ARRAY tags = {1, deconst(&proptag)};
 	TPROPVAL_ARRAY values{};
-	if (!get_store_properties(dir, CP_ACP, &tags, &values))
+	if (!get_store_properties(dir, CP_ACP, {&proptag, 1}, &values))
 		return nullptr;
 	return values.get<const BINARY>(proptag);
 }
@@ -538,7 +537,7 @@ ec_error_t nsp_interface_bind(uint64_t hrpc, uint32_t flags, const STAT &xstat,
 		return ecNotSupported;
 	}
 	/* check if valid cpid has been supplied */
-	if (!verify_cpid(pstat->codepage)) {
+	if (!acceptable_cpid_for_mapi(pstat->codepage)) {
 		memset(phandle, 0, sizeof(NSPI_HANDLE));
 		return MAPI_E_UNKNOWN_CPID;
 	}
@@ -674,7 +673,7 @@ ec_error_t nsp_interface_update_stat(NSPI_HANDLE handle, STAT &xstat, int32_t *p
 		row = total;
 		pstat->cur_rec = ab_tree::minid::END_OF_TABLE;
 	} else {
-		pstat->cur_rec = pstat->container_id == 0 ? pbase->at(row) : node[row];
+		pstat->cur_rec = pstat->container_id == 0 ? pbase->at_filtered(row) : node[row];
 		if (0 == pstat->cur_rec) {
 			row = total;
 			pstat->cur_rec = ab_tree::minid::END_OF_TABLE;
@@ -2069,7 +2068,7 @@ ec_error_t nsp_interface_get_templateinfo(NSPI_HANDLE handle, uint32_t flags,
 	*ppdata = nullptr;
 	if ((flags & (TI_TEMPLATE | TI_SCRIPT)) != TI_TEMPLATE)
 		return ecNotSupported;
-	if (!verify_cpid(codepage))
+	if (!acceptable_cpid_for_mapi(codepage))
 		return MAPI_E_UNKNOWN_CPID;
 	if (dn != nullptr) {
 		mlog(LV_WARN, "nsp: unimplemented templateinfo dn=%s", dn);

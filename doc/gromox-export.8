@@ -20,13 +20,12 @@ gromox\-export \(em Utility to export Gromox messages to various formats
 \fBgromox\-exm2tnef \-u\fP \fIuser@domain.example\fP
 [\fIfolder_id\fP\fB:\fP]\fImessage_id\fP >file.tnef
 .SH Description
-gromox-export reads folders or messages from an exmdb information store and exports it
-as Gromox Mailbox Transfer (GXMT) datastream, Internet Mail (RFC 5322),
-iCalendar (RFC 5545), vCard (RFC 6350), or TNEF, depending on which name it was
-invoked under. ("exm" is short for exmdb and refers to the network protocol
-used to talk to the message store.) Multiple messages may only be exported to
-GXMT. ACLs are not extracted yet. Export to PST is not possible: the external
-library libpff has only implemented reading.
+gromox-export reads folders or messages from an exmdb information store and
+exports it in various formats. depending on which name it was invoked with.
+("exm" is short for exmdb and refers to the network protocol used to talk to
+the message store.) Multiple messages may only be exported to GXMT. ACLs are
+not extracted yet. Export to PST is not possible: the external library libpff
+has only implemented reading.
 .PP
 Folders can be selected by symbolic name or by folder path
 (see gromox\-mbop(8) section "Folder specification" for that).
@@ -41,11 +40,25 @@ An alternate way to get an EML representation is using grommunio-web's "Export
 as > EML file(s)" function from the context menu of a mail item.
 .SH Options
 .TP
-\fB\-Y\fP \fIvalue\fP
-If set to 1, allday events are emitted as so-called floating dates.
-If set to 0 however, allday events are emitted as precise-time events.
-.br
-Default: 1
+\fB\-\-ical\fP
+Selects iCalendar (RFC 5545) as the output format. This is the default if the
+program was invoked as gromox\-exm2ical.
+.TP
+\fB\-\-mail\fP
+Selects Internet Mail (RFC 5322) as the output format. This is the default if
+the program was invoked as gromox\-exm2eml.
+.TP
+\fB\-\-mt\fP
+Selects Gromox Mailbox Transfer (GXMT) as the output format. This is the
+default if the program was invoked as gromox\-export or gromox\-exm2mt.
+.TP
+\fB\-\-tnef\fP
+Selects Transport Neutral Encapsulation Format (TNEF) as the output format.
+This is the default if the program was invoked as gromox\-exm2tnef.
+.TP
+\fB\-\-vcard\fP
+Selects vCard (RFC 6350) as the output format. This is the default if the
+program was invoked as gromox\-exm2vcf.
 .TP
 \fB\-a\fP
 Include Folder Associated Information (FAI), a.k.a. MAPI_ASSOCIATED messages in
@@ -78,12 +91,12 @@ to \fB\-p\fP, \fB\-t\fP or \fB\-v\fP). 1=crit, 2=error, 3=warn, 4=notice,
 Default: \fI4\fP (notice)
 .SH Examples
 .IP \(bu 4
-Export entire mailbox: gromox\-export \-u user@example.com \-ar / >dump.mt
+Export entire mailbox: gromox\-exm2mt \-u user@example.com \-ar / >dump.mt
 .IP \(bu 4
-Export most of the mailbox (as Outlook would): gromox\-export \-u u@e.xz \-r
+Export most of the mailbox (as Outlook would): gromox\-exm2mt \-u u@e.xz \-r
 IPM_SUBTREE >dump.mt
 .IP \(bu 4
-Export two folders without subordinates: gromox\-export \-u u@e.xz
+Export two folders without subordinates: gromox\-exm2mt \-u u@e.xz
 IPM_SUBTREE/Foo IPM_SUBTREE/Bar >dump.mt
 .IP \(bu 4
 Export a single message as RFC5322: gromox\-exm2eml \-u u@e.xz 0x10001

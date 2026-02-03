@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <climits>
 #include <cstdint>
@@ -185,11 +185,6 @@ bool TNEF_PROPLIST::emplace_back(uint32_t tag, const void *d, GET_PROPNAME gpn)
 	return true;
 }
 
-void tnef_init_library()
-{
-	textmaps_init();
-}
-	
 static BOOL tnef_username_to_oneoff(const char *username,
 	const char *pdisplay_name, BINARY *pbin)
 {
@@ -919,12 +914,6 @@ pack_result tnef_pull::g_attr(TNEF_ATTRIBUTE *r)
 	}
 	ext.m_offset = offset + len;
 	TRY(pext->g_uint16(&checksum));
-#ifdef _DEBUG_UMTA
-	if (checksum != tnef_generate_checksum(
-		pext->data + offset, len)) {
-		mlog(LV_DEBUG, "tnef: invalid checksum");
-	}
-#endif
 	return pack_result::ok;
 }
 

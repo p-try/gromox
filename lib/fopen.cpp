@@ -14,15 +14,27 @@
 
 namespace gromox {
 
-std::vector<std::string> gx_split(const std::string_view &sv, char sep)
+std::vector<std::string> gx_split(std::string_view sv, char sep)
 {
 	size_t start = 0, pos;
 	std::vector<std::string> out;
 	while ((pos = sv.find(sep, start)) != sv.npos) {
-		out.push_back(std::string(sv.substr(start, pos - start)));
+		out.emplace_back(sv.substr(start, pos - start));
 		start = pos + 1;
 	}
-	out.push_back(std::string(sv.substr(start)));
+	out.emplace_back(sv.substr(start));
+	return out;
+}
+
+std::vector<std::string> gx_split_ws(std::string_view sv, char sep)
+{
+	size_t start = 0, pos;
+	std::vector<std::string> out;
+	while ((pos = sv.find(sep, start)) != sv.npos) {
+		out.emplace_back(sv.substr(start, pos - start));
+		start = sv.find_first_not_of(sep, pos + 1);
+	}
+	out.emplace_back(sv.substr(start));
 	return out;
 }
 

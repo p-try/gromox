@@ -3,6 +3,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <vmime/generationContext.hpp>
 #include <vmime/mailbox.hpp>
 #include <vmime/message.hpp>
 #include <gromox/mapi_types.hpp>
@@ -50,14 +51,13 @@ extern GX_EXPORT int mutf7_to_utf8(const char *u7, size_t u7len, char *u8, size_
 extern GX_EXPORT int utf8_to_mutf7(const char *u8, size_t u8len, char *u7, size_t u7len);
 extern GX_EXPORT int parse_imap_args(char *cmdline, int cmdlen, char **argv, int argmax);
 extern GX_EXPORT BOOL parse_rfc822_timestamp(const char *str_time, time_t *ptime);
-extern GX_EXPORT BOOL mime_string_to_utf8(const char *charset, const char *mime_string, char *out_string, size_t out_len);
+extern GX_EXPORT bool mime_string_to_utf8(std::string_view in, std::string &out);
 extern GX_EXPORT void enriched_to_html(const char *enriched_txt,
 	char *html, int max_len);
 extern GX_EXPORT int html_to_plain(std::string_view in, cpid_t, std::string &out);
+extern /*noexport*/ int html_to_plain_boring(std::string_view inbuf, std::string &outbuf);
 extern GX_EXPORT ec_error_t plain_to_html(const char *in, std::string &out);
-extern GX_EXPORT ec_error_t html_init_library();
 extern GX_EXPORT ec_error_t html_to_rtf(std::string_view in, cpid_t, std::string &out);
-extern GX_EXPORT bool rtf_init_library();
 extern GX_EXPORT ec_error_t rtf_to_html(std::string_view in, const char *charset, std::string &out, attachment_list *);
 extern GX_EXPORT ec_error_t rtfcp_uncompress(std::string_view in, std::string &out);
 extern GX_EXPORT ec_error_t rtfcp_encode(std::string_view in, std::string &out);
@@ -67,5 +67,8 @@ namespace gromox {
 extern GX_EXPORT ec_error_t cu_rcpt_to_list(const TPROPVAL_ARRAY &, const char *org, std::vector<std::string> &outlist, GET_USERNAME, bool resend);
 extern GX_EXPORT ec_error_t cu_send_mail(const MAIL &, const char *smtp_url, const char *sender, const std::vector<std::string> &rcpt);
 extern GX_EXPORT ec_error_t cu_send_vmail(vmime::shared_ptr<vmime::message>, const char *smtp_url, const char *sender, const std::vector<std::string> &rcpt);
+extern GX_EXPORT vmime::parsingContext vmail_default_parsectx();
+extern GX_EXPORT vmime::generationContext vmail_default_genctx();
+extern GX_EXPORT std::string vmail_to_string(const vmime::message &);
 
 }

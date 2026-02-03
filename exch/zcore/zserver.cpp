@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cassert>
 #include <climits>
@@ -309,9 +309,8 @@ void zs_notification_proc(const char *dir, BOOL b_table, uint32_t notify_id,
 		if (pnew_mail->pparentid->empty())
 			return;
 		static constexpr proptag_t proptag_buff[] = {PR_MESSAGE_CLASS, PR_MESSAGE_FLAGS};
-		static constexpr PROPTAG_ARRAY proptags = {std::size(proptag_buff), deconst(proptag_buff)};
 		if (!exmdb_client->get_message_properties(dir, nullptr, CP_ACP,
-		    message_id, &proptags, &propvals))
+		    message_id, proptag_buff, &propvals))
 			return;
 		auto str = propvals.get<char>(PR_MESSAGE_CLASS);
 		if (str == nullptr)
@@ -1224,7 +1223,7 @@ ec_error_t zs_resolvename(GUID hsession,
 		if (presult_set->pparray[presult_set->count] == nullptr)
 			return ecServerOOM;
 		if (!ab_tree_fetch_node_properties({pbase, mid},
-		    &proptags, presult_set->pparray[presult_set->count]))
+		    proptags, presult_set->pparray[presult_set->count]))
 			return ecError;
 		presult_set->count ++;
 	}
@@ -1558,8 +1557,7 @@ ec_error_t zs_createmessage(GUID hsession,
 	static constexpr proptag_t proptag_buff[] =
 		{PR_MESSAGE_SIZE_EXTENDED, PR_STORAGE_QUOTA_LIMIT,
 		PR_ASSOC_CONTENT_COUNT, PR_CONTENT_COUNT};
-	static constexpr PROPTAG_ARRAY tmp_proptags = {std::size(proptag_buff), deconst(proptag_buff)};
-	if (!pstore->get_properties(&tmp_proptags, &tmp_propvals))
+	if (!pstore->get_properties(proptag_buff, &tmp_propvals))
 		return ecError;
 	auto num = tmp_propvals.get<const uint32_t>(PR_STORAGE_QUOTA_LIMIT);
 	int64_t max_quota = num == nullptr ? -1 : static_cast<int64_t>(*num) * 1024;
@@ -1658,10 +1656,8 @@ ec_error_t zs_deletemessages(GUID hsession, uint32_t hfolder,
 		}
 		static constexpr proptag_t proptag_buff[] =
 			{PR_NON_RECEIPT_NOTIFICATION_REQUESTED, PR_READ};
-		static constexpr PROPTAG_ARRAY tmp_proptags =
-			{std::size(proptag_buff), deconst(proptag_buff)};
 		if (!exmdb_client->get_message_properties(pstore->get_dir(),
-		    nullptr, CP_ACP, i_eid, &tmp_proptags, &tmp_propvals))
+		    nullptr, CP_ACP, i_eid, proptag_buff, &tmp_propvals))
 			return ecError;
 		pbrief = NULL;
 		auto flag = tmp_propvals.get<const uint8_t>(PR_NON_RECEIPT_NOTIFICATION_REQUESTED);
@@ -1686,7 +1682,6 @@ ec_error_t zs_copymessages(GUID hsession, uint32_t hsrcfolder,
     uint32_t hdstfolder, const BINARY_ARRAY *pentryids, uint32_t flags)
 {
 	BOOL b_guest = TRUE, b_owner;
-	BOOL b_partial;
 	BOOL b_private;
 	int account_id;
 	zs_objtype mapi_type;
@@ -1790,6 +1785,7 @@ ec_error_t zs_copymessages(GUID hsession, uint32_t hsrcfolder,
 	} else {
 		b_guest = FALSE;
 	}
+	BOOL b_partial = false;
 	return exmdb_client->movecopy_messages(src_store->get_dir(),
 	       pinfo->cpid, b_guest, pinfo->get_username(),
 	       psrc_folder->folder_id, pdst_folder->folder_id, b_copy, &ids,
@@ -1842,9 +1838,8 @@ ec_error_t zs_setreadflags(GUID hsession, uint32_t hfolder,
 			return ecError;
 
 		static constexpr proptag_t tmp_proptag[] = {PR_ENTRYID};
-		static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
 		if (!exmdb_client->query_table(pstore->get_dir(), username,
-		    CP_ACP, table_id, &proptags, 0, row_count, &tmp_set)) {
+		    CP_ACP, table_id, tmp_proptag, 0, row_count, &tmp_set)) {
 			exmdb_client->unload_table(pstore->get_dir(), table_id);
 			return ecError;
 		}
@@ -2382,7 +2377,6 @@ ec_error_t zs_storeadvise(GUID hsession, uint32_t hstore,
 		return ecNotSupported;
 	eid_t folder_id{}, message_id{};
 	if (NULL != pentryid) {
-		eid_t eid{};
 		auto type = common_util_get_messaging_entryid_type(*pentryid);
 		switch (type) {
 		case EITLT_PRIVATE_FOLDER:
@@ -2517,7 +2511,7 @@ ec_error_t zs_notifdequeue(const NOTIF_SINK *psink, uint32_t timeval,
 
 ec_error_t zs_queryrows(GUID hsession, uint32_t htable, uint32_t start,
 	uint32_t count, const RESTRICTION *prestriction,
-	const PROPTAG_ARRAY *pproptags, TARRAY_SET *prowset)
+    const std::vector<proptag_t> *itags, TARRAY_SET *prowset)
 {
 	uint32_t row_num;
 	int32_t position;
@@ -2541,6 +2535,12 @@ ec_error_t zs_queryrows(GUID hsession, uint32_t htable, uint32_t start,
 	auto table_type = ptable->table_type;
 	if (start != UINT32_MAX)
 		ptable->set_position(start);
+
+	proptag_cspan wtags, *pproptags = nullptr;
+	if (itags != nullptr) {
+		wtags = *itags;
+		pproptags = &wtags;
+	}
 	if (NULL != prestriction) {
 		switch (ptable->table_type) {
 		case zcore_tbltype::hierarchy:
@@ -2625,7 +2625,7 @@ ec_error_t zs_queryrows(GUID hsession, uint32_t htable, uint32_t start,
 }
 	
 ec_error_t zs_setcolumns(GUID hsession, uint32_t htable,
-	const PROPTAG_ARRAY *pproptags, uint32_t flags)
+    proptag_cspan pproptags, uint32_t flags)
 {
 	zs_objtype mapi_type;
 	auto pinfo = zs_query_session(hsession);
@@ -2794,7 +2794,7 @@ ec_error_t zs_sorttable(GUID hsession,
 	}
 	auto pcolumns = ptable->get_columns();
 	if (b_multi_inst && pcolumns != nullptr &&
-	    !common_util_verify_columns_and_sorts(pcolumns, psortset))
+	    !cu_verify_columns_and_sorts(*pcolumns, psortset))
 		return ecNotSupported;
 	if (!ptable->set_sorts(psortset))
 		return ecError;
@@ -2989,7 +2989,6 @@ ec_error_t zs_modifyrecipients(GUID hsession,
 	static constexpr uint8_t persist_true = true, persist_false = false;
 	BOOL b_found;
 	zs_objtype mapi_type;
-	EXT_PULL ext_pull;
 	uint32_t tmp_flags;
 	char tmp_buff[256];
 	uint32_t last_rowid;
@@ -3061,6 +3060,8 @@ ec_error_t zs_modifyrecipients(GUID hsession,
 		    (prcpt->has(PR_EMAIL_ADDRESS) &&
 		    prcpt->has(PR_ADDRTYPE) && prcpt->has(PR_DISPLAY_NAME)))
 			continue;
+
+		EXT_PULL ext_pull;
 		ext_pull.init(pbin->pb, pbin->cb, common_util_alloc, 0);
 		if (ext_pull.g_uint32(&tmp_flags) != pack_result::ok ||
 		    tmp_flags != 0)
@@ -3069,7 +3070,6 @@ ec_error_t zs_modifyrecipients(GUID hsession,
 			continue;
 		if (provider_uid == muidEMSAB) {
 			EMSAB_ENTRYID ab_entryid;
-			EXT_PULL ext_pull;
 
 			ext_pull.init(pbin->pb, pbin->cb, common_util_alloc, EXT_FLAG_UTF16);
 			if (ext_pull.g_abk_eid(&ab_entryid) != pack_result::ok ||
@@ -3106,7 +3106,6 @@ ec_error_t zs_modifyrecipients(GUID hsession,
 			cu_set_propval(prcpt, PR_DISPLAY_NAME, dupval);
 		} else if (provider_uid == muidOOP) {
 			ONEOFF_ENTRYID oneoff_entry;
-			EXT_PULL ext_pull;
 
 			ext_pull.init(pbin->pb, pbin->cb, common_util_alloc, EXT_FLAG_UTF16);
 			if (ext_pull.g_oneoff_eid(&oneoff_entry) != pack_result::ok ||
@@ -3248,8 +3247,7 @@ ec_error_t zs_submitmessage(GUID hsession, uint32_t hmessage) try
 		return ecTooManyRecips;
 
 	static constexpr proptag_t proptag_buff1[] = {PR_ASSOCIATED};
-	static constexpr PROPTAG_ARRAY tmp_proptags1 = {std::size(proptag_buff1), deconst(proptag_buff1)};
-	if (!pmessage->get_properties(&tmp_proptags1, &tmp_propvals))
+	if (!pmessage->get_properties(proptag_buff1, &tmp_propvals))
 		return ecError;
 	auto flag = tmp_propvals.get<const uint8_t>(PR_ASSOCIATED);
 	/* FAI message cannot be sent */
@@ -3277,9 +3275,7 @@ ec_error_t zs_submitmessage(GUID hsession, uint32_t hmessage) try
 		return err;
 	static constexpr proptag_t proptag_buff2[] =
 		{PR_MAX_SUBMIT_MESSAGE_SIZE, PR_PROHIBIT_SEND_QUOTA, PR_MESSAGE_SIZE_EXTENDED};
-	static const PROPTAG_ARRAY tmp_proptags2 =
-		{std::size(proptag_buff2), deconst(proptag_buff2)};
-	if (!pstore->get_properties(&tmp_proptags2, &tmp_propvals))
+	if (!pstore->get_properties(proptag_buff2, &tmp_propvals))
 		return ecError;
 
 	auto sendquota = tmp_propvals.get<uint32_t>(PR_PROHIBIT_SEND_QUOTA);
@@ -3298,9 +3294,7 @@ ec_error_t zs_submitmessage(GUID hsession, uint32_t hmessage) try
 		{PR_MESSAGE_SIZE, PR_MESSAGE_FLAGS, PR_DEFERRED_SEND_TIME,
 		PR_DEFERRED_SEND_NUMBER, PR_DEFERRED_SEND_UNITS,
 		PR_DELETE_AFTER_SUBMIT};
-	static constexpr PROPTAG_ARRAY tmp_proptags3 =
-		{std::size(proptag_buff3), deconst(proptag_buff3)};
-	if (!pmessage->get_properties(&tmp_proptags3, &tmp_propvals))
+	if (!pmessage->get_properties(proptag_buff3, &tmp_propvals))
 		return ecError;
 	num = tmp_propvals.get<uint32_t>(PR_MESSAGE_SIZE);
 	if (num == nullptr)
@@ -3508,7 +3502,7 @@ ec_error_t zs_setpropvals(GUID hsession, uint32_t hobject,
 }
 
 ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
-    const PROPTAG_ARRAY *pproptags, TPROPVAL_ARRAY *ppropvals)
+    const proptag_vector *pproptags, TPROPVAL_ARRAY *ppropvals)
 {
 	zs_objtype mapi_type;
 	PROPTAG_ARRAY proptags;
@@ -3519,6 +3513,10 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 	auto pobject = pinfo->ptree->get_object<void>(hobject, &mapi_type);
 	if (pobject == nullptr)
 		return ecNullObject;
+
+	proptag_cspan wtags;
+	if (pproptags != nullptr)
+		wtags = *pproptags;
 	switch (mapi_type) {
 	case zs_objtype::profproperty:
 		if (NULL == pproptags) {
@@ -3526,11 +3524,10 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 			return ecSuccess;
 		}
 		ppropvals->count = 0;
-		ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
+		ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->size());
 		if (ppropvals->ppropval == nullptr)
 			return ecServerOOM;
-		for (unsigned int i = 0; i < pproptags->count; ++i) {
-			const auto tag = pproptags->pproptag[i];
+		for (const auto tag : wtags) {
 			auto v = static_cast<TPROPVAL_ARRAY *>(pobject)->getval(tag);
 			if (v != nullptr)
 				ppropvals->emplace_back(tag, v);
@@ -3541,9 +3538,9 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 		if (NULL == pproptags) {
 			if (!store->get_all_proptags(&proptags))
 				return ecError;
-			pproptags = &proptags;
+			wtags = proptags;
 		}
-		if (!store->get_properties(pproptags, ppropvals))
+		if (!store->get_properties(wtags, ppropvals))
 			return ecError;
 		return ecSuccess;
 	}
@@ -3552,9 +3549,9 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 		if (NULL == pproptags) {
 			if (!folder->get_all_proptags(&proptags))
 				return ecError;
-			pproptags = &proptags;
+			wtags = proptags;
 		}
-		if (!folder->get_properties(pproptags, ppropvals))
+		if (!folder->get_properties(wtags, ppropvals))
 			return ecError;
 		return ecSuccess;
 	}
@@ -3563,9 +3560,9 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 		if (NULL == pproptags) {
 			if (!msg->get_all_proptags(&proptags))
 				return ecError;
-			pproptags = &proptags;
+			wtags = proptags;
 		}
-		if (!msg->get_properties(pproptags, ppropvals))
+		if (!msg->get_properties(wtags, ppropvals))
 			return ecError;
 		return ecSuccess;
 	}
@@ -3574,9 +3571,9 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 		if (NULL == pproptags) {
 			if (!atx->get_all_proptags(&proptags))
 				return ecError;
-			pproptags = &proptags;
+			wtags = proptags;
 		}
-		if (!atx->get_properties(pproptags, ppropvals))
+		if (!atx->get_properties(wtags, ppropvals))
 			return ecError;
 		return ecSuccess;
 	}
@@ -3584,31 +3581,31 @@ ec_error_t zs_getpropvals(GUID hsession, uint32_t hobject,
 		if (NULL == pproptags) {
 			container_object_get_container_table_all_proptags(
 				&proptags);
-			pproptags = &proptags;
+			wtags = proptags;
 		}
-		if (!static_cast<container_object *>(pobject)->get_properties(pproptags, ppropvals))
+		if (!static_cast<container_object *>(pobject)->get_properties(wtags, ppropvals))
 			return ecError;
 		return ecSuccess;
 	case zs_objtype::mailuser:
 	case zs_objtype::distlist:
 		if (NULL == pproptags) {
 			container_object_get_user_table_all_proptags(&proptags);
-			pproptags = &proptags;
+			wtags = proptags;
 		}
-		if (!static_cast<user_object *>(pobject)->get_properties(pproptags, ppropvals))
+		if (!static_cast<user_object *>(pobject)->get_properties(wtags, ppropvals))
 			return ecError;
 		return ecSuccess;
 	case zs_objtype::oneoff:
 		if (pproptags == nullptr)
-			pproptags = &oneoff_object::all_tags;
-		return static_cast<oneoff_object *>(pobject)->get_props(pproptags, ppropvals);
+			wtags = oneoff_object::all_tags;
+		return static_cast<oneoff_object *>(pobject)->get_props(wtags, ppropvals);
 	default:
 		return ecNotSupported;
 	}
 }
 
 ec_error_t zs_deletepropvals(GUID hsession,
-	uint32_t hobject, const PROPTAG_ARRAY *pproptags)
+    uint32_t hobject, proptag_cspan pproptags)
 {
 	zs_objtype mapi_type;
 	uint32_t permission;
@@ -3621,8 +3618,8 @@ ec_error_t zs_deletepropvals(GUID hsession,
 		return ecNullObject;
 	switch (mapi_type) {
 	case zs_objtype::profproperty:
-		for (size_t i = 0; i < pproptags->count; ++i)
-			static_cast<TPROPVAL_ARRAY *>(pobject)->erase(pproptags->pproptag[i]);
+		for (const auto tag : pproptags)
+			static_cast<TPROPVAL_ARRAY *>(pobject)->erase(tag);
 		pinfo->ptree->touch_profile_sec();
 		return ecSuccess;
 	case zs_objtype::store: {
@@ -3787,7 +3784,7 @@ ec_error_t zs_getpropnames(GUID hsession, uint32_t hstore,
 }
 
 ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
-    const PROPTAG_ARRAY *pexclude_proptags, uint32_t hdstobject, uint32_t flags)
+    proptag_cspan pexclude_proptags, uint32_t hdstobject, uint32_t flags)
 {
 	BOOL b_cycle;
 	BOOL b_collid;
@@ -3841,7 +3838,7 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 				return ecAccessDenied;
 		}
 		BOOL b_sub;
-		if (!pexclude_proptags->has(PR_CONTAINER_HIERARCHY)) {
+		if (!pexclude_proptags.has(PR_CONTAINER_HIERARCHY)) {
 			if (!exmdb_client->is_descendant_folder(pstore->get_dir(),
 			    folder->folder_id, fdst->folder_id, &b_cycle))
 				return ecError;
@@ -3851,11 +3848,11 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 		} else {
 			b_sub = FALSE;
 		}
-		BOOL b_normal = !pexclude_proptags->has(PR_CONTAINER_CONTENTS) ? TRUE : false;
-		BOOL b_fai    = !pexclude_proptags->has(PR_FOLDER_ASSOCIATED_CONTENTS) ? TRUE : false;
+		BOOL b_normal = !pexclude_proptags.has(PR_CONTAINER_CONTENTS) ? TRUE : false;
+		BOOL b_fai    = !pexclude_proptags.has(PR_FOLDER_ASSOCIATED_CONTENTS) ? TRUE : false;
 		if (!static_cast<folder_object *>(pobject)->get_all_proptags(&proptags))
 			return ecError;
-		common_util_reduce_proptags(&proptags, pexclude_proptags);
+		cu_reduce_proptags(&proptags, pexclude_proptags);
 		tmp_proptags.count = 0;
 		tmp_proptags.pproptag = cu_alloc<proptag_t>(proptags.count);
 		if (tmp_proptags.pproptag == nullptr)
@@ -3870,7 +3867,7 @@ ec_error_t zs_copyto(GUID hsession, uint32_t hsrcobject,
 				continue;
 			tmp_proptags.emplace_back(tag);
 		}
-		if (!folder->get_properties(&tmp_proptags, &propvals))
+		if (!folder->get_properties(tmp_proptags, &propvals))
 			return ecError;
 		if (b_sub || b_normal || b_fai) {
 			BOOL b_guest = username == STORE_OWNER_GRANTED ? false : TRUE;
@@ -4692,9 +4689,8 @@ ec_error_t zs_importreadstates(GUID hsession,
 				continue;
 		}
 		static constexpr proptag_t proptag_buff[] = {PR_ASSOCIATED, PR_READ};
-		static constexpr PROPTAG_ARRAY tmp_proptags = {std::size(proptag_buff), deconst(proptag_buff)};
 		if (!exmdb_client->get_message_properties(pstore->get_dir(),
-		    nullptr, CP_ACP, message_id, &tmp_proptags, &tmp_propvals))
+		    nullptr, CP_ACP, message_id, proptag_buff, &tmp_propvals))
 			return ecError;
 		auto flag = tmp_propvals.get<const uint8_t>(PR_ASSOCIATED);
 		if (flag != nullptr && *flag != 0)
@@ -4846,10 +4842,10 @@ ec_error_t zs_rfc822tomessage(GUID hsession, uint32_t hmessage,
 		return ecNullObject;
 	if (mapi_type != zs_objtype::message)
 		return ecNotSupported;
-	std::unique_ptr<MESSAGE_CONTENT, mc_delete> pmsgctnt(cu_rfc822_to_message(pmessage->get_store(), mxf_flags, peml_bin));
+	auto pmsgctnt = cu_rfc822_to_message(pmessage->get_store(), mxf_flags, peml_bin);
 	if (pmsgctnt == nullptr)
 		return ecError;
-	return pmessage->write_message(pmsgctnt.get()) ? ecSuccess : ecError;
+	return pmessage->write_message(*pmsgctnt) ? ecSuccess : ecError;
 }
 
 ec_error_t zs_messagetoical(GUID hsession, uint32_t hmessage, BINARY *pical_bin)
@@ -4882,7 +4878,7 @@ ec_error_t zs_icaltomessage(GUID hsession,
 	auto pmsgctnt = cu_ical_to_message(pmessage->get_store(), pical_bin);
 	if (pmsgctnt == nullptr)
 		return ecError;
-	return pmessage->write_message(pmsgctnt.get()) ? ecSuccess : ecError;
+	return pmessage->write_message(*pmsgctnt) ? ecSuccess : ecError;
 }
 
 ec_error_t zs_imtomessage2(GUID session, uint32_t fld_handle,
@@ -4922,7 +4918,7 @@ ec_error_t zs_imtomessage2(GUID session, uint32_t fld_handle,
 			return rt2;
 		auto zmo = info->ptree->get_object<message_object>(msg_handle, &mapi_type);
 		if (zmo == nullptr || mapi_type != zs_objtype::message ||
-		    !zmo->write_message(msgctnt.get()))
+		    !zmo->write_message(*msgctnt))
 			return ecError;
 		outhandles->pl[outhandles->count++] = msg_handle;
 	}
@@ -4959,7 +4955,7 @@ ec_error_t zs_vcftomessage(GUID hsession,
 	auto pmsgctnt = common_util_vcf_to_message(pmessage->get_store(), pvcf_bin);
 	if (pmsgctnt == nullptr)
 		return ecError;
-	return pmessage->write_message(pmsgctnt) ? ecSuccess : ecError;
+	return pmessage->write_message(*pmsgctnt) ? ecSuccess : ecError;
 }
 
 ec_error_t zs_getuserfreebusy(GUID hsession, BINARY entryid,

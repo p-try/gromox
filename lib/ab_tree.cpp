@@ -197,13 +197,13 @@ bool ab_base::load()
 		dmemb.resize(minid::MAXVAL);
 
 	std::unordered_map<unsigned int, unsigned int> domid_to_listidx;
-	domains.reserve(dmemb.size());
+	m_domains.reserve(dmemb.size());
 	for (unsigned int domid : dmemb) try {
 		/* appends to m_users */
 		if (!mysql_adaptor_get_domain_users(domid, m_users))
 			return false;
-		domid_to_listidx[domid] = uint32_t(domains.size());
-		ab_domain &domain = domains.emplace_back();
+		domid_to_listidx[domid] = static_cast<uint32_t>(m_domains.size());
+		ab_domain &domain = m_domains.emplace_back();
 		domain.id = domid;
 		mysql_adaptor_get_domain_info(domid, domain.info);
 	} catch (std::exception &) {
@@ -218,12 +218,12 @@ bool ab_base::load()
 		minid mid(minid::address, u.id);
 		if (!(u.cloak_bits & AB_HIDE_FROM_GAL)) {
 			filtered_gal.emplace_back(mid);
-			domains[domid_to_listidx[u.domain_id]].userref.emplace_back(mid);
+			m_domains[domid_to_listidx[u.domain_id]].userref.emplace_back(mid);
 		}
 		minid_idx_map.emplace(mid, i);
 	}
-	for (size_t i = 0; i < domains.size(); ++i)
-		minid_idx_map.emplace(minid(minid::domain, domains[i].id), i);
+	for (size_t i = 0; i < m_domains.size(); ++i)
+		minid_idx_map.emplace(minid(minid::domain, m_domains[i].id), i);
 	m_status = Status::LIVING;
 	return true;
 }
@@ -253,13 +253,15 @@ const std::vector<std::string> &ab_base::aliases(minid mid) const
  */
 minid ab_base::at(uint32_t idx) const
 {
-	return idx < domains.size() ? minid(minid::domain, domains[idx].id) :
-	       idx - domains.size() < m_users.size() ? minid(minid::address, m_users[idx-domains.size()].id) : minid();
+	if (idx < m_domains.size())
+		return minid(minid::domain, m_domains[idx].id);
+	idx -= m_domains.size();
+	return idx < m_users.size() ? minid(minid::address, m_users[idx].id) : minid();
 }
 
 minid ab_base::at_filtered(uint32_t idx) const
 {
-	return idx < filtered_gal.size() ? minid(minid::address, filtered_gal[idx]) : minid();
+	return idx < filtered_gal.size() ? filtered_gal[idx] : minid();
 }
 
 /**
@@ -378,7 +380,7 @@ std::optional<uint32_t> ab_base::dtypx(minid mid) const
 void ab_base::dump() const
 {
 	fmt::print(stderr, "AB Base {}#{}\n", m_base_id < 0? "D" : "O", abs(m_base_id));
-	fmt::print(stderr, "  Domains ({}):\n", domains.size());
+	fmt::print(stderr, "  Domains ({}):\n", m_domains.size());
 	for (auto it = dbegin(); it != dend(); ++it) {
 		const ab_domain *domain = fetch_domain(*it);
 		if (domain == nullptr) {
@@ -488,12 +490,13 @@ ec_error_t ab_base::fetch_prop(minid mid, proptag_t tag, std::string &prop) cons
  *
  * @return     true if user object was found, false otherwise
  */
-bool ab_base::fetch_props(minid mid, const PROPTAG_ARRAY &tags, std::unordered_map<proptag_t, std::string> &props) const
+bool ab_base::fetch_props(minid mid, proptag_cspan tags,
+    std::unordered_map<proptag_t, std::string> &props) const
 {
 	const sql_user *user = fetch_user(mid);
 	if (!user)
 		return false;
-	for (auto tag  : tags) {
+	for (auto tag : tags) {
 		auto it = user->propvals.find(tag);
 		if (it == user->propvals.end())
 			continue;
@@ -714,7 +717,7 @@ const ab_domain *ab_base::fetch_domain(minid mid) const
 	if (it == minid_idx_map.end())
 		return nullptr;
 	size_t idx = it->second;
-	return idx >= domains.size() ? nullptr : &domains[idx];
+	return idx >= m_domains.size() ? nullptr : &m_domains[idx];
 }
 
 /**
@@ -747,7 +750,7 @@ ab_base::iterator ab_base::find(minid mid) const
 	auto it = minid_idx_map.find(mid);
 	if (it == minid_idx_map.end())
 		return end();
-	return mid.type() == minid::domain ? iterator(this, domains.begin() + it->second) :
+	return mid.type() == minid::domain ? iterator(this, m_domains.begin() + it->second) :
 	       iterator(this, m_users.begin() + it->second);
 }
 
@@ -766,7 +769,7 @@ uint32_t ab_base::pos_in_filtered_users(minid mid) const
  */
 const ab_domain *ab_base::find_domain(uint32_t id) const
 {
-	for (auto &domain : domains)
+	for (auto &domain : m_domains)
 		if (domain.id == id)
 			return &domain;
 	return nullptr;
@@ -789,7 +792,7 @@ ab_base::iterator &ab_base::iterator::operator+=(difference_type offset)
 
 	if (it.index() == 0) {
 		auto &i = std::get<0>(it);
-		ssize_t dist = std::distance(i, m_base->domains.cend());
+		ssize_t dist = std::distance(i, m_base->m_domains.cend());
 		if (offset < 0 || offset < dist) {
 			i += offset;
 			mid = minid(minid::domain, i->id);
@@ -815,9 +818,9 @@ ab_base::iterator &ab_base::iterator::operator+=(difference_type offset)
 			return *this;
 		}
 		/* Wrap backwards over to domains */
-		auto i2 = m_base->domains.cend() + (dist + offset);
+		auto i2 = m_base->m_domains.cend() + (dist + offset);
 		it = i2;
-		if (i2 != m_base->domains.cend())
+		if (i2 != m_base->m_domains.cend())
 			mid = minid(minid::domain, i2->id);
 		else
 			mid = 0;
@@ -833,8 +836,8 @@ ab_base::iterator &ab_base::iterator::operator+=(difference_type offset)
  */
 size_t ab_base::iterator::pos() const
 {
-	return it.index() == 0 ? std::distance(m_base->domains.cbegin(), std::get<0>(it)) :
-	                         std::distance(m_base->m_users.cbegin(), std::get<1>(it)) + m_base->domains.size();
+	return it.index() == 0 ? std::distance(m_base->m_domains.cbegin(), std::get<0>(it)) :
+	                         std::distance(m_base->m_users.cbegin(), std::get<1>(it)) + m_base->m_domains.size();
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <array>
 #include <cstdint>
@@ -22,10 +22,6 @@ using namespace std::string_literals;
 using namespace gromox;
 
 namespace {
-
-struct vc_delete {
-	inline void operator()(MESSAGE_CONTENT *x) const { message_content_free(x); }
-};
 
 struct unrecog {
 	unrecog(const vcard_line &l) :
@@ -226,8 +222,10 @@ static std::nullptr_t xlog_null(const char *func, unsigned int line)
 }
 
 #define imp_null xlog_null(__func__, __LINE__)
-message_content *oxvcard_import(const vcard *pvcard, GET_PROPIDS get_propids) try
+std::unique_ptr<message_content, mc_delete>
+oxvcard_converter::vcard_to_mapi(const vcard &vcard) try
 {
+	auto pvcard = &vcard;
 	int i;
 	int count;
 	int ufld_count;
@@ -247,7 +245,7 @@ message_content *oxvcard_import(const vcard *pvcard, GET_PROPIDS get_propids) tr
 	ufld_count = 0;
 	if (!oxvcard_check_compatible(pvcard))
 		return imp_null;
-	std::unique_ptr<MESSAGE_CONTENT, vc_delete> pmsg(message_content_init());
+	std::unique_ptr<message_content, mc_delete> pmsg(message_content_init());
 	if (pmsg == nullptr)
 		return imp_null;
 	if (pmsg->proplist.set(PR_MESSAGE_CLASS, "IPM.Contact") != ecSuccess)
@@ -726,7 +724,7 @@ message_content *oxvcard_import(const vcard *pvcard, GET_PROPIDS get_propids) tr
 	}
 	if (i >= pmsg->proplist.count)
 		/* If no namedprops were set, we can exit early */
-		return pmsg.release();
+		return pmsg;
 
 	/* Remap our "bf" propids to the caller's space */
 	if (!oxvcard_get_propids(&propids, std::move(get_propids)))
@@ -743,16 +741,16 @@ message_content *oxvcard_import(const vcard *pvcard, GET_PROPIDS get_propids) tr
 		pmsg->proplist.ppropval[i].proptag =
 			PROP_TAG(PROP_TYPE(pmsg->proplist.ppropval[i].proptag), proptag);
 	}
-	return pmsg.release();
+	return pmsg;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return nullptr;
 }
 #undef imp_null
 
-BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
-    vcard &vcard, GET_PROPIDS get_propids) try
+bool oxvcard_converter::mapi_to_vcard(const message_content &msg, vcard &vcard) try
 {
+	auto pmsg = &msg;
 	const char *pvalue;
 	struct tm tmp_tm;
 	PROPID_ARRAY propids{};
@@ -778,7 +776,7 @@ BOOL oxvcard_export(const MESSAGE_CONTENT *pmsg, const char *log_id,
 		PR_COMPANY_MAIN_PHONE_NUMBER, PR_RADIO_TELEPHONE_NUMBER,
 		PR_TTYTDD_PHONE_NUMBER};
 	
-	if (!oxvcard_get_propids(&propids, std::move(get_propids)))
+	if (!oxvcard_get_propids(&propids, get_propids))
 		return FALSE;
 	vcard.clear();
 	vcard.append_line("VERSION", "4.0");

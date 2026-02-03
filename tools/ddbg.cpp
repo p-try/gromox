@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2024–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2024–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdlib>
 #include <cstring>
@@ -15,7 +15,6 @@
 #include <gromox/mail_func.hpp>
 #include <gromox/mapidefs.h>
 #include <gromox/mapi_types.hpp>
-#include <gromox/paths.h>
 #include <gromox/rop_util.hpp>
 #include <gromox/textmaps.hpp>
 #include <gromox/tie.hpp>
@@ -616,9 +615,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "No command selected\n");
 		return EXIT_FAILURE;
 	}
+	setup_utf8_locale();
 	if (iconv_validate() != 0)
 		return EXIT_FAILURE;
-	textmaps_init(PKGDATADIR);
+	textmaps_init();
 	if (argp.nargs == 0) {
 		size_t slurp_len = 0;
 		std::unique_ptr<char[], stdlib_delete> slurp_data(HX_slurp_fd(STDIN_FILENO, &slurp_len));

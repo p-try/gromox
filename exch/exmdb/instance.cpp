@@ -189,7 +189,7 @@ instance_node &instance_node::operator=(instance_node &&o) noexcept
 	return *this;
 }
 
-static BOOL instance_load_message(sqlite3 *psqlite,
+static bool instance_load_message(db_conn &db,
 	uint64_t message_id, uint32_t *plast_id,
 	MESSAGE_CONTENT **ppmsgctnt)
 {
@@ -197,6 +197,7 @@ static BOOL instance_load_message(sqlite3 *psqlite,
 	
 	snprintf(sql_string, std::size(sql_string), "SELECT message_id FROM"
 	          " messages WHERE message_id=%llu", LLU{message_id});
+	auto &psqlite = db.psqlite;
 	auto pstmt = gx_sql_prep(psqlite, sql_string);
 	if (pstmt == nullptr)
 		return FALSE;
@@ -293,7 +294,7 @@ static BOOL instance_load_message(sqlite3 *psqlite,
 		default: {
 			void *newval = nullptr;
 			if (!cu_get_property(MAPI_MESSAGE, message_id, CP_ACP,
-			    psqlite, tag, &newval))
+			    db, tag, &newval))
 				return false;
 			if (newval == nullptr)
 				continue;
@@ -326,7 +327,7 @@ static BOOL instance_load_message(sqlite3 *psqlite,
 		for (auto tag : rcpt_tags) {
 			void *newval = nullptr;
 			if (!cu_get_property(MAPI_MAILUSER, rcpt_id, CP_ACP,
-			    psqlite, tag, &newval))
+			    db, tag, &newval))
 				return false;
 			if (newval == nullptr)
 				continue;
@@ -384,7 +385,7 @@ static BOOL instance_load_message(sqlite3 *psqlite,
 			default: {
 				void *newval = nullptr;
 				if (!cu_get_property(MAPI_ATTACH, attachment_id,
-				    CP_ACP, psqlite, tag, &newval))
+				    CP_ACP, db, tag, &newval))
 					return false;
 				if (newval == nullptr)
 					continue;
@@ -399,7 +400,7 @@ static BOOL instance_load_message(sqlite3 *psqlite,
 			uint64_t message_id1 = pstmt1.col_uint64(0);
 			uint32_t last_id = 0;
 			message_content *pmsgctnt1 = nullptr;
-			if (!instance_load_message(psqlite, message_id1,
+			if (!instance_load_message(db, message_id1,
 			    &last_id, &pmsgctnt1))
 				return FALSE;
 			pattachment->set_embedded_internal(pmsgctnt1);
@@ -468,10 +469,10 @@ BOOL exmdb_server::load_message_instance(const char *dir, const char *username,
 	auto sql_transact = gx_sql_begin(pdb->psqlite, txn_mode::read);
 	if (!sql_transact)
 		return false;
-	auto optim = pdb->begin_optim();
-	if (optim == nullptr)
+	if (!pdb->begin_optim())
 		return FALSE;
-	auto ret = instance_load_message(pdb->psqlite, mid_val, &pinstance->last_id,
+	auto cl_1 = HX::make_scope_exit([&]() { pdb->end_optim(); });
+	auto ret = instance_load_message(*pdb, mid_val, &pinstance->last_id,
 	           reinterpret_cast<MESSAGE_CONTENT **>(&pinstance->pcontent));
 	if (!ret)
 		return FALSE;
@@ -625,7 +626,7 @@ BOOL exmdb_server::reload_message_instance(const char *dir,
 		if (lnum == nullptr)
 			return FALSE;
 		last_id = 0;
-		if (!instance_load_message(pdb->psqlite, *lnum, &last_id, &pmsgctnt))
+		if (!instance_load_message(*pdb, *lnum, &last_id, &pmsgctnt))
 			return FALSE;	
 		if (NULL == pmsgctnt) {
 			*pb_result = FALSE;
@@ -1802,16 +1803,15 @@ static BOOL instance_get_message_subject(TPROPVAL_ARRAY *pproplist,
 
 static BOOL instance_get_attachment_properties(cpid_t cpid,
 	const uint64_t *pmessage_id, ATTACHMENT_CONTENT *pattachment,
-	const PROPTAG_ARRAY *pproptags, TPROPVAL_ARRAY *ppropvals)
+    proptag_cspan pproptags, TPROPVAL_ARRAY *ppropvals)
 {
 	uint32_t length;
 	
 	ppropvals->count = 0;
-	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
+	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags.size());
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
-		const auto tag = pproptags->pproptag[i];
+	for (const auto tag : pproptags) {
 		auto pvalue = pattachment->proplist.getval(tag);
 		if (NULL != pvalue) {
 			ppropvals->emplace_back(tag, pvalue);
@@ -1965,7 +1965,7 @@ static BOOL instance_get_attachment_properties(cpid_t cpid,
 }	
 
 BOOL exmdb_server::get_instance_properties(const char *dir,
-    uint32_t size_limit, uint32_t instance_id, const PROPTAG_ARRAY *pproptags,
+    uint32_t size_limit, uint32_t instance_id, proptag_cspan pproptags,
     TPROPVAL_ARRAY *ppropvals)
 {
 	uint32_t length;
@@ -1992,12 +1992,11 @@ BOOL exmdb_server::get_instance_properties(const char *dir,
 	}
 	pmsgctnt = static_cast<MESSAGE_CONTENT *>(pinstance->pcontent);
 	ppropvals->count = 0;
-	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
+	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags.size());
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
+	for (const auto tag : pproptags) {
 		auto &vc = ppropvals->ppropval[ppropvals->count];
-		const auto tag = pproptags->pproptag[i];
 		if (tag == PR_MESSAGE_FLAGS) {
 			vc.proptag = tag;
 			auto uv = cu_alloc<uint32_t>();
@@ -2526,11 +2525,10 @@ BOOL exmdb_server::set_instance_properties(const char *dir,
 	return set_xns_props_atx(ins, props, prob);
 }
 
-static BOOL rip_message(MESSAGE_CONTENT *pmsgctnt,
-    const PROPTAG_ARRAY *pproptags, PROBLEM_ARRAY *pproblems)
+static bool rip_message(MESSAGE_CONTENT *pmsgctnt,
+    proptag_cspan pproptags, PROBLEM_ARRAY *pproblems)
 {
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
-		const auto tag = pproptags->pproptag[i];
+	for (const auto tag : pproptags) {
 		switch (tag) {
 		case PR_BODY:
 		case PR_BODY_A:
@@ -2581,11 +2579,10 @@ static BOOL rip_message(MESSAGE_CONTENT *pmsgctnt,
 	return TRUE;
 }
 
-static BOOL rip_attachment(ATTACHMENT_CONTENT *pattachment,
-    const PROPTAG_ARRAY *pproptags, PROBLEM_ARRAY *pproblems)
+static bool rip_attachment(ATTACHMENT_CONTENT *pattachment,
+    proptag_cspan pproptags, PROBLEM_ARRAY *pproblems)
 {
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
-		const auto tag = pproptags->pproptag[i];
+	for (const auto tag : pproptags) {
 		switch (tag) {
 		case PR_ATTACH_DATA_BIN:
 			pattachment->proplist.erase(ID_TAG_ATTACHDATABINARY);
@@ -2614,7 +2611,7 @@ static BOOL rip_attachment(ATTACHMENT_CONTENT *pattachment,
 }
 
 BOOL exmdb_server::remove_instance_properties(const char *dir,
-    uint32_t instance_id, const PROPTAG_ARRAY *pproptags,
+    uint32_t instance_id, proptag_cspan pproptags,
     PROBLEM_ARRAY *pproblems)
 {
 	auto pdb = db_engine_get_db(dir);
@@ -2626,9 +2623,10 @@ BOOL exmdb_server::remove_instance_properties(const char *dir,
 	if (pinstance == nullptr)
 		return FALSE;
 	pproblems->count = 0;
-	return pinstance->type == instance_type::message ?
-	       rip_message(static_cast<MESSAGE_CONTENT *>(pinstance->pcontent), pproptags, pproblems) :
-	       rip_attachment(static_cast<ATTACHMENT_CONTENT *>(pinstance->pcontent), pproptags, pproblems);
+	auto ret = pinstance->type == instance_type::message ?
+	           rip_message(static_cast<MESSAGE_CONTENT *>(pinstance->pcontent), pproptags, pproblems) :
+	           rip_attachment(static_cast<ATTACHMENT_CONTENT *>(pinstance->pcontent), pproptags, pproblems);
+	return ret ? TRUE : false;
 }
 
 BOOL exmdb_server::is_descendant_instance(const char *dir,
@@ -3000,7 +2998,7 @@ BOOL exmdb_server::copy_instance_attachments(const char *dir, BOOL b_force,
 }
 
 BOOL exmdb_server::query_message_instance_attachment_table(const char *dir,
-    uint32_t instance_id, const PROPTAG_ARRAY *pproptags, uint32_t start_pos,
+    uint32_t instance_id, proptag_cspan pproptags, uint32_t start_pos,
     int32_t row_needed, TARRAY_SET *pset)
 {
 	int i;

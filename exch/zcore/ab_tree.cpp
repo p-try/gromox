@@ -340,7 +340,7 @@ static BOOL ab_tree_fetch_node_property(const ab_tree::ab_node &pnode,
 		snprintf(sa->ppstr[0], tgs, "SMTP:%s", dn.c_str());
 		size_t i = 1;
 		for (const auto &a : alias_list) {
-			size_t tgs = a.size() + 6;
+			tgs = a.size() + 6;
 			sa->ppstr[i] = cu_alloc<char>(tgs);
 			if (sa->ppstr[i] == nullptr)
 				return false;
@@ -397,16 +397,15 @@ static BOOL ab_tree_fetch_node_property(const ab_tree::ab_node &pnode,
 	return TRUE;
 }
 
-BOOL ab_tree_fetch_node_properties(const ab_tree::ab_node& pnode,
-                                    const PROPTAG_ARRAY *pproptags, TPROPVAL_ARRAY *ppropvals)
+bool ab_tree_fetch_node_properties(const ab_tree::ab_node &pnode,
+    proptag_cspan tags, TPROPVAL_ARRAY *ppropvals)
 {
-	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
+	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(tags.size());
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
 	ppropvals->count = 0;
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
+	for (const auto tag : tags) {
 		void *pvalue = nullptr;
-		const auto tag = pproptags->pproptag[i];
 		if (!ab_tree_fetch_node_property(pnode, tag, &pvalue))
 			return FALSE;	
 		if (pvalue == nullptr)

@@ -21,6 +21,7 @@
 #include <gromox/freebusy.hpp>
 #include <gromox/ical.hpp>
 #include <gromox/mapi_types.hpp>
+#include <gromox/oxcmail.hpp>
 #include <gromox/rop_util.hpp>
 #include <gromox/textmaps.hpp>
 #include "ews.hpp"
@@ -1581,6 +1582,7 @@ void tCalendarItem::update(const sShape& shape)
 	tItem::update(shape);
 	fromProp(shape.get(PR_RESPONSE_REQUESTED), IsResponseRequested);
 	const TAGGED_PROPVAL* prop;
+	Enum::CalendarItemTypeType calendarItemType = Enum::Single;
 	if ((prop = shape.get(PR_SENDER_ADDRTYPE)))
 		fromProp(prop, defaulted(Organizer).Mailbox.RoutingType);
 	if ((prop = shape.get(PR_SENDER_EMAIL_ADDRESS)))
@@ -1592,7 +1594,7 @@ void tCalendarItem::update(const sShape& shape)
 		AllowNewTimeProposal.emplace(!*static_cast<const uint8_t*>(prop->pvalue));
 
 	if ((prop = shape.get(NtAppointmentRecur))) {
-		CalendarItemType.emplace(Enum::RecurringMaster);
+		calendarItemType = Enum::RecurringMaster;
 		const BINARY* recurData = static_cast<BINARY*>(prop->pvalue);
 		if (recurData->cb > 0) {
 			APPOINTMENT_RECUR_PAT apprecurr = getAppointmentRecurPattern(recurData);
@@ -1614,8 +1616,6 @@ void tCalendarItem::update(const sShape& shape)
 					DeletedOccurrences.emplace(delOccs);
 			}
 		}
-	} else {
-		CalendarItemType.emplace(Enum::Single); // TODO correct type
 	}
 
 	if ((prop = shape.get(NtAppointmentReplyTime)))
@@ -1655,8 +1655,18 @@ void tCalendarItem::update(const sShape& shape)
 	if ((prop = shape.get(NtCommonStart)))
 		Start.emplace(rop_util_nttime_to_unix2(*static_cast<const uint64_t*>(prop->pvalue)));
 
+	fromProp(shape.get(NtRecurring), IsRecurring);
 	fromProp(shape.get(NtFInvited), MeetingRequestWasSent);
 	fromProp(shape.get(NtLocation), Location);
+
+	if ((prop = shape.get(NtCalendarTimeZone))) {
+		std::optional<std::string> tzid;
+		fromProp(prop, tzid);
+		if (tzid) {
+			StartTimeZoneId = *tzid;
+			EndTimeZoneId = *tzid;
+		}
+	}
 
 	if ((prop = shape.get(NtResponseStatus))) {
 		const uint8_t* responseStatus = static_cast<const uint8_t*>(prop->pvalue);
@@ -1683,9 +1693,32 @@ void tCalendarItem::update(const sShape& shape)
 		}
 	}
 
-	// TODO: check if we should use some other property for RecurrenceId
-	if ((prop = shape.get(NtExceptionReplaceTime)))
+	bool hasExceptionReplaceTime = false;
+	if ((prop = shape.get(NtExceptionReplaceTime))) {
 		RecurrenceId.emplace(rop_util_nttime_to_unix2(*static_cast<const uint64_t*>(prop->pvalue)));
+		hasExceptionReplaceTime = true;
+	}
+
+	if (calendarItemType != Enum::RecurringMaster) {
+		bool isSeriesMember = (IsRecurring && *IsRecurring);
+		if (!isSeriesMember) {
+			const TAGGED_PROPVAL* recurFlag = shape.get(NtRecurring);
+			if (recurFlag) {
+				if (PROP_TYPE(recurFlag->proptag) == PT_BOOLEAN)
+					isSeriesMember = *static_cast<const uint8_t*>(recurFlag->pvalue) != 0;
+				else if (PROP_TYPE(recurFlag->proptag) == PT_LONG)
+					isSeriesMember = *static_cast<const uint32_t*>(recurFlag->pvalue) != 0;
+			}
+		}
+		if (hasExceptionReplaceTime)
+			calendarItemType = Enum::Exception;
+		else if (isSeriesMember)
+			calendarItemType = Enum::Occurrence;
+		else
+			calendarItemType = Enum::Single;
+	}
+
+	CalendarItemType.emplace(calendarItemType);
 
 	if ((prop = shape.get(PR_CREATION_TIME)))
 		fromProp(prop, DateTimeStamp);
@@ -1711,6 +1744,8 @@ void tCalendarItem::setDatetimeFields(sShape& shape)
 		fromProp(shape.writes(NtCalendarTimeZone), calTimezone);
 		if (calTimezone.has_value()) {
 			auto buf = ianatz_to_tzdef(calTimezone.value().c_str());
+			if (buf == nullptr)
+				buf = wintz_to_tzdef(calTimezone.value().c_str());
 			if (buf != nullptr) {
 				size_t len = buf->size();
 				if (len > UINT32_MAX)
@@ -1902,6 +1937,7 @@ decltype(tChangeDescription::fields) tChangeDescription::fields = {{
 	{"Department", {[](auto&&... args){convText(PR_DEPARTMENT_NAME, args...);}}},
 	{"DisplayName", {[](auto&&... args){convText(PR_DISPLAY_NAME, args...);}}},
 	{"End", {[](auto&&... args){convDate(NtCommonEnd, args...);}}},
+	{"EndTimeZoneId", {[](auto&&... args){convText(NtCalendarTimeZone, args...);}}},
 	{"FileAs", {[](auto&&... args){convText(NtFileAs, args...);}}},
 	{"Generation", {[](auto&&... args){convText(PR_GENERATION, args...);}}},
 	{"GivenName", {[](auto&&... args){convText(PR_GIVEN_NAME, args...);}}},
@@ -1924,6 +1960,7 @@ decltype(tChangeDescription::fields) tChangeDescription::fields = {{
 	{"Surname", {[](auto&&... args){convText(PR_SURNAME, args...);}}},
 	{"SpouseName", {[](auto&&... args){convText(PR_SPOUSE_NAME, args...);}}},
 	{"Start", {[](auto&&... args){convDate(NtCommonStart, args...);}}},
+	{"StartTimeZoneId", {[](auto&&... args){convText(NtCalendarTimeZone, args...);}}},
 	{"WeddingAnniversary", {[](auto&&... args){convDate(PR_WEDDING_ANNIVERSARY, args...);}}},
 }};
 
@@ -2090,7 +2127,7 @@ void tChangeDescription::convDate(const PROPERTY_NAME& name, const XMLElement* v
 template<typename ET, typename PT>
 void tChangeDescription::convEnumIndex(proptag_t tag, const XMLElement *v, sShape &shape)
 {
-	shape.write(mkProp(tag, PT{ET{v->GetText()}.index()}));
+	shape.write(mkProp(tag, PT{ET{znul(v->GetText())}.index()}));
 }
 
 /**
@@ -2108,7 +2145,7 @@ void tChangeDescription::convEnumIndex(proptag_t tag, const XMLElement *v, sShap
 template<typename ET, typename PT>
 void tChangeDescription::convEnumIndex(const PROPERTY_NAME& name, const XMLElement* v, sShape& shape)
 {
-	shape.write(mkProp(shape.tag(name), PT(ET(v->GetText()).index())));
+	shape.write(mkProp(shape.tag(name), PT(ET(znul(v->GetText())).index())));
 }
 
 /**
@@ -3234,6 +3271,7 @@ decltype(tFieldURI::nameMap) tFieldURI::nameMap = {
 	{"calendar:AppointmentSequenceNumber", {NtAppointmentSequence, PT_LONG}},
 	{"calendar:End", {NtAppointmentEndWhole, PT_SYSTIME}},
 	{"calendar:End", {NtCommonEnd, PT_SYSTIME}},
+	{"calendar:EndTimeZoneId", {NtCalendarTimeZone, PT_UNICODE}},
 	{"calendar:IsAllDayEvent", {NtAppointmentSubType, PT_BOOLEAN}},
 	{"calendar:IsCancelled", {NtAppointmentStateFlags, PT_LONG}},
 	{"calendar:IsMeeting", {NtAppointmentStateFlags, PT_LONG}},
@@ -3246,6 +3284,7 @@ decltype(tFieldURI::nameMap) tFieldURI::nameMap = {
 	{"calendar:DeletedOccurrences", {NtAppointmentRecur, PT_BINARY}},
 	{"calendar:Start", {NtAppointmentStartWhole, PT_SYSTIME}},
 	{"calendar:Start", {NtCommonStart, PT_SYSTIME}},
+	{"calendar:StartTimeZoneId", {NtCalendarTimeZone, PT_UNICODE}},
 	{"calendar:UID", {NtGlobalObjectId, PT_BINARY}},
 	{"calendar:RecurrenceId", {NtExceptionReplaceTime, PT_SYSTIME}},
 	{"contacts:DisplayName", {NtFileAs, PT_UNICODE}},
@@ -3586,7 +3625,7 @@ tInternetMessageHeader::tInternetMessageHeader(const std::string_view& hn, const
 std::vector<tInternetMessageHeader> tInternetMessageHeader::parse(const char *content)
 {
 	std::vector<tInternetMessageHeader> result;
-	vmime::parsingContext vpctx;
+	auto vpctx = vmail_default_parsectx();
 	vpctx.setInternationalizedEmailSupport(true); /* RFC 6532 */
 	vmime::header hdr;
 	hdr.parse(vpctx, content);
@@ -3687,7 +3726,7 @@ void tItem::update(const sShape& shape)
 			defaulted(Flag).DueDate.emplace(rop_util_nttime_to_unix2(*static_cast<const uint64_t*>(prop->pvalue)));
 		if ((prop = shape.get(NtTaskStartDate)))
 			defaulted(Flag).StartDate.emplace(rop_util_nttime_to_unix2(*static_cast<const uint64_t*>(prop->pvalue)));
-	} else {
+	} else if(shape.requested(PR_FLAG_STATUS)) {
 		defaulted(Flag).FlagStatus = Enum::NotFlagged;
 	}
 
@@ -3723,6 +3762,7 @@ sItem tItem::create(const sShape& shape)
 decltype(tItemResponseShape::namedTagsDefault) tItemResponseShape::namedTagsDefault = {{
 	{&NtCommonStart, PT_SYSTIME},
 	{&NtCommonEnd, PT_SYSTIME},
+	{&NtCalendarTimeZone, PT_UNICODE},
 	{&NtEmailAddress1, PT_UNICODE},
 	{&NtEmailAddress2, PT_UNICODE},
 	{&NtEmailAddress3, PT_UNICODE},

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #	include "config.h"
@@ -92,9 +92,7 @@ static thread_local std::unique_ptr<env_context> g_env_key;
 static char g_submit_command[1024];
 static constexpr char ZCORE_UA[] = PACKAGE_NAME "-zcore " PACKAGE_VERSION;
 
-BOOL common_util_verify_columns_and_sorts(
-	const PROPTAG_ARRAY *pcolumns,
-	const SORTORDER_SET *psort_criteria)
+bool cu_verify_columns_and_sorts(proptag_cspan cols, const SORTORDER_SET *psort_criteria)
 {
 	proptag_t proptag = 0;
 	for (size_t i = 0; i < psort_criteria->count; ++i) {
@@ -105,9 +103,8 @@ BOOL common_util_verify_columns_and_sorts(
 		proptag = PROP_TAG(psort_criteria->psort[i].type, psort_criteria->psort[i].propid);
 		break;
 	}
-	for (size_t i = 0; i < pcolumns->count; ++i)
-		if (pcolumns->pproptag[i] & MV_INSTANCE &&
-		    proptag != pcolumns->pproptag[i])
+	for (const auto t : cols)
+		if (t & MV_INSTANCE && proptag != t)
 			return FALSE;
 	return TRUE;
 }
@@ -119,8 +116,7 @@ bool cu_extract_delegator(message_object *pmessage, std::string &username)
 	static constexpr proptag_t proptag_buff[] =
 		{PR_SENT_REPRESENTING_ADDRTYPE, PR_SENT_REPRESENTING_EMAIL_ADDRESS,
 		PR_SENT_REPRESENTING_SMTP_ADDRESS, PR_SENT_REPRESENTING_ENTRYID};
-	static constexpr PROPTAG_ARRAY tmp_proptags = {std::size(proptag_buff), deconst(proptag_buff)};
-	if (!pmessage->get_properties(&tmp_proptags, &tmp_propvals))
+	if (!pmessage->get_properties(proptag_buff, &tmp_propvals))
 		return FALSE;	
 	if (0 == tmp_propvals.count) {
 		username.clear();
@@ -244,12 +240,12 @@ void common_util_remove_propvals(TPROPVAL_ARRAY *parray, proptag_t proptag)
 	}
 }
 
-void common_util_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
-	const PROPTAG_ARRAY *pproptags_subtractor)
+void cu_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
+    proptag_cspan pproptags_subtractor)
 {
-	for (unsigned int j = 0; j < pproptags_subtractor->count; ++j) {
+	for (const auto t : pproptags_subtractor) {
 		for (unsigned int i = 0; i < pproptags_minuend->count; ++i) {
-			if (pproptags_subtractor->pproptag[j] != pproptags_minuend->pproptag[i])
+			if (t != pproptags_minuend->pproptag[i])
 				continue;
 			pproptags_minuend->count--;
 			if (i < pproptags_minuend->count)
@@ -265,7 +261,7 @@ void common_util_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
 BOOL common_util_essdn_to_uid(const char *pessdn, int *puid)
 {
 	char tmp_essdn[1024];
-	auto tmp_len = snprintf(tmp_essdn, std::size(tmp_essdn),
+	auto tmp_len = gx_snprintf(tmp_essdn, std::size(tmp_essdn),
 	               "/o=%s/" EAG_RCPTS "/cn=", g_org_name);
 	if (strncasecmp(pessdn, tmp_essdn, tmp_len) != 0 ||
 	    pessdn[tmp_len+16] != '-')
@@ -278,7 +274,7 @@ BOOL common_util_essdn_to_ids(const char *pessdn,
 	int *pdomain_id, int *puser_id)
 {
 	char tmp_essdn[1024];
-	auto tmp_len = snprintf(tmp_essdn, std::size(tmp_essdn),
+	auto tmp_len = gx_snprintf(tmp_essdn, std::size(tmp_essdn),
 	               "/o=%s/" EAG_RCPTS "/cn=", g_org_name);
 	if (strncasecmp(pessdn, tmp_essdn, tmp_len) != 0 ||
 	    pessdn[tmp_len+16] != '-')
@@ -1104,19 +1100,20 @@ ec_error_t cu_send_message(store_object *pstore, message_object *msg,
 		return MAPI_E_NO_RECIPIENTS;
 	}
 
-	auto body_type = get_override_format(*pmsgctnt);
 	common_util_set_dir(pstore->get_dir());
-	/* try to avoid TNEF message */
 	MAIL imail;
-	if (!oxcmail_export(pmsgctnt, log_id.c_str(), false, body_type,
-	    &imail, common_util_alloc, common_util_get_propids,
-	    common_util_get_propname))
+	oxcmail_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids;
+	cvt.get_propname = common_util_get_propname;
+	cvt.use_format_override(*pmsgctnt);
+	if (!cvt.mapi_to_inet(*pmsgctnt, imail))
 		return ecError;
 
 	imail.set_header("X-Mailer", ZCORE_UA);
 	if (zcore_backfill_transporthdr) {
-		std::unique_ptr<MESSAGE_CONTENT, mc_delete> rmsg(oxcmail_import(
-			&imail, common_util_alloc, common_util_get_propids));
+		auto rmsg = cvt.inet_to_mapi(imail);
 		if (rmsg != nullptr) {
 			for (auto tag : {PR_TRANSPORT_MESSAGE_HEADERS, PR_TRANSPORT_MESSAGE_HEADERS_A}) {
 				auto th = rmsg->proplist.get<const char>(tag);
@@ -1589,9 +1586,8 @@ static EID_ARRAY *common_util_load_folder_messages(store_object *pstore,
 	    nullptr, nullptr, &table_id, &row_count))
 		return NULL;	
 	static constexpr proptag_t tmp_proptag[] = {PidTagMid};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
 	if (!exmdb_client->query_table(pstore->get_dir(), nullptr, CP_ACP,
-	    table_id, &proptags, 0, row_count, &tmp_set))
+	    table_id, tmp_proptag, 0, row_count, &tmp_set))
 		return NULL;	
 	exmdb_client->unload_table(pstore->get_dir(), table_id);
 	pmessage_ids = cu_alloc<EID_ARRAY>();
@@ -1626,7 +1622,7 @@ ec_error_t cu_remote_copy_folder(store_object *src_store, uint64_t folder_id,
 	    folder_id, &tmp_proptags))
 		return ecError;
 	if (!exmdb_client->get_folder_properties(src_store->get_dir(), CP_ACP,
-	    folder_id, &tmp_proptags, &tmp_propvals))
+	    folder_id, tmp_proptags, &tmp_propvals))
 		return ecError;
 	if (new_name != nullptr) {
 		auto err = cu_set_propval(&tmp_propvals, PR_DISPLAY_NAME, new_name);
@@ -1662,9 +1658,8 @@ ec_error_t cu_remote_copy_folder(store_object *src_store, uint64_t folder_id,
 		return ecError;
 
 	static constexpr proptag_t xb_proptag[] = {PidTagFolderId};
-	static constexpr PROPTAG_ARRAY xb_proptags = {std::size(xb_proptag), deconst(xb_proptag)};
 	if (!exmdb_client->query_table(src_store->get_dir(), nullptr, CP_ACP,
-	    table_id, &xb_proptags, 0, row_count, &tmp_set))
+	    table_id, xb_proptag, 0, row_count, &tmp_set))
 		return ecError;
 	exmdb_client->unload_table(src_store->get_dir(), table_id);
 	for (size_t i = 0; i < tmp_set.count; ++i) {
@@ -1702,13 +1697,16 @@ BOOL common_util_message_to_rfc822(store_object *pstore, uint64_t inst_id,
 		ppropval[pmsgctnt->proplist.count++].pvalue = &cpid;
 		pmsgctnt->proplist.ppropval = ppropval;
 	}
-	auto body_type = get_override_format(*pmsgctnt);
 	common_util_set_dir(pstore->get_dir());
-	/* try to avoid TNEF message */
 	auto log_id = pstore->get_dir() + ":i"s + std::to_string(inst_id);
 	MAIL imail;
-	if (!oxcmail_export(pmsgctnt, log_id.c_str(), false, body_type, &imail,
-	    common_util_alloc, common_util_get_propids, common_util_get_propname))
+	oxcmail_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids;
+	cvt.get_propname = common_util_get_propname;
+	cvt.use_format_override(*pmsgctnt);
+	if (!cvt.mapi_to_inet(*pmsgctnt, imail))
 		return FALSE;	
 	auto mail_len = imail.get_length();
 	if (mail_len < 0)
@@ -1752,7 +1750,7 @@ static void zc_unwrap_clearsigned(MAIL &ma) try
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 }
 
-MESSAGE_CONTENT *cu_rfc822_to_message(store_object *pstore,
+std::unique_ptr<message_content, mc_delete> cu_rfc822_to_message(store_object *pstore,
     unsigned int mxf_flags, /* effective-moved-from */ BINARY *peml_bin)
 {
 	MAIL imail;
@@ -1761,9 +1759,12 @@ MESSAGE_CONTENT *cu_rfc822_to_message(store_object *pstore,
 	if (mxf_flags & MXF_UNWRAP_SMIME_CLEARSIGNED)
 		zc_unwrap_clearsigned(imail);
 	common_util_set_dir(pstore->get_dir());
-	auto pmsgctnt = oxcmail_import(&imail,
-	                common_util_alloc, common_util_get_propids_create);
-	return pmsgctnt;
+	oxcmail_converter cvt;
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids_create;
+	if (mxf_flags & MXF_ADD_RCVD_TIMESTAMP)
+		cvt.add_rcvd_timestamp = true;
+	return cvt.inet_to_mapi(imail);
 }
 
 BOOL common_util_message_to_ical(store_object *pstore, uint64_t message_id,
@@ -1780,8 +1781,13 @@ BOOL common_util_message_to_ical(store_object *pstore, uint64_t message_id,
 		return FALSE;
 	common_util_set_dir(dir);
 	auto log_id = dir + ":m"s + std::to_string(message_id);
-	if (!oxcical_export(pmsgctnt, log_id.c_str(), ical, g_org_name,
-	    common_util_alloc, common_util_get_propids, mysql_adaptor_userid_to_name)) {
+	oxcical_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.org_name = g_org_name;
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids;
+	cvt.id2user = mysql_adaptor_userid_to_name;
+	if (!cvt.mapi_to_ical(*pmsgctnt, ical)) {
 		mlog(LV_ERR, "E-2202: oxcical_export %s failed", log_id.c_str());
 		return FALSE;
 	}
@@ -1809,8 +1815,12 @@ message_ptr cu_ical_to_message(store_object *pstore, const BINARY *pical_bin) tr
 	if (!ical.load_from_str_move(pbuff))
 		return NULL;
 	common_util_set_dir(pstore->get_dir());
-	return oxcical_import_single(ical, common_util_alloc,
-	       common_util_get_propids_create, common_util_username_to_entryid);
+
+	oxcical_converter cvt;
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids_create;
+	cvt.username_to_entryid = common_util_username_to_entryid;
+	return cvt.ical_to_mapi_single(ical);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return nullptr;
@@ -1823,9 +1833,12 @@ ec_error_t cu_ical_to_message2(store_object *store, char *ical_data,
 	if (!icobj.load_from_str_move(ical_data))
 		return ecError;
 	common_util_set_dir(store->get_dir());
-	return oxcical_import_multi(icobj, common_util_alloc,
-	       common_util_get_propids_create,
-	       common_util_username_to_entryid, msgvec);
+
+	oxcical_converter cvt;
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids_create;
+	cvt.username_to_entryid = common_util_username_to_entryid;
+	return cvt.ical_to_mapi_multi(icobj, msgvec);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecServerOOM;
@@ -1843,9 +1856,13 @@ BOOL common_util_message_to_vcf(message_object *pmessage, BINARY *pvcf_bin)
 	    message_id, &pmsgctnt) || pmsgctnt == nullptr)
 		return FALSE;
 	common_util_set_dir(pstore->get_dir());
-	auto log_id = pstore->get_dir() + ":m"s + std::to_string(rop_util_get_gc_value(message_id));
+
+	std::string cvt_log_id = pstore->get_dir() + ":m"s + std::to_string(rop_util_get_gc_value(message_id));
+	oxvcard_converter cvt;
+	cvt.log_id = cvt_log_id.c_str();
+	cvt.get_propids = common_util_get_propids;
 	vcard vcard;
-	if (!oxvcard_export(pmsgctnt, log_id.c_str(), vcard, common_util_get_propids))
+	if (!cvt.mapi_to_vcard(*pmsgctnt, vcard))
 		return FALSE;
 	std::string vcf_out;
 	if (!vcard.serialize(vcf_out))
@@ -1855,16 +1872,13 @@ BOOL common_util_message_to_vcf(message_object *pmessage, BINARY *pvcf_bin)
 	if (pvcf_bin->pv == nullptr)
 		return FALSE;
 	memcpy(pvcf_bin->pv, vcf_out.c_str(), vcf_out.size());
-	if (!pmessage->write_message(pmsgctnt))
+	if (!pmessage->write_message(*pmsgctnt))
 		/* ignore */;
 	return TRUE;
 }
 	
-MESSAGE_CONTENT *common_util_vcf_to_message(store_object *pstore,
-    const BINARY *pvcf_bin)
+message_ptr common_util_vcf_to_message(store_object *pstore, const BINARY *pvcf_bin)
 {
-	MESSAGE_CONTENT *pmsgctnt;
-	
 	auto pbuff = cu_alloc<char>(pvcf_bin->cb + 1);
 	if (pbuff == nullptr)
 		return nullptr;
@@ -1875,8 +1889,10 @@ MESSAGE_CONTENT *common_util_vcf_to_message(store_object *pstore,
 	if (ret != ecSuccess)
 		return nullptr;
 	common_util_set_dir(pstore->get_dir());
-	pmsgctnt = oxvcard_import(&vcard, common_util_get_propids_create);
-	return pmsgctnt;
+
+	oxvcard_converter cvt;
+	cvt.get_propids = common_util_get_propids_create;
+	return cvt.vcard_to_mapi(vcard);
 }
 
 ec_error_t cu_vcf_to_message2(store_object *store, char *vcf_data,
@@ -1887,8 +1903,11 @@ ec_error_t cu_vcf_to_message2(store_object *store, char *vcf_data,
 	if (ret != ecSuccess)
 		return ret;
 	common_util_set_dir(store->get_dir());
+
+	oxvcard_converter cvt;
+	cvt.get_propids = common_util_get_propids_create;
 	for (const auto &vcard : cardvec) {
-		message_ptr mc(oxvcard_import(&vcard, common_util_get_propids_create));
+		auto mc = cvt.vcard_to_mapi(vcard);
 		if (mc == nullptr)
 			return ecError;
 		msgvec.push_back(std::move(mc));
@@ -1921,9 +1940,9 @@ void *cu_read_storenamedprop(const char *dir, const GUID &guid,
 	    name_rsp.size() != name_req.size() || name_rsp[0] == 0)
 		return nullptr;
 	auto proptag = PROP_TAG(proptype, name_rsp[0]);
-	const PROPTAG_ARRAY tags = {1, deconst(&proptag)};
 	TPROPVAL_ARRAY values{};
-	if (!exmdb_client->get_store_properties(dir, CP_ACP, &tags, &values))
+	if (!exmdb_client->get_store_properties(dir, CP_ACP,
+	    {&proptag, 1}, &values))
 		return nullptr;
 	return values.getval(proptag);
 }

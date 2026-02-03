@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2023–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2023–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cstdint>
@@ -104,7 +104,10 @@ static message_ptr do_mail(const char *file, const char *data, size_t dsize)
 		fprintf(stderr, "Unable to parse %s\n", file);
 		return nullptr;
 	}
-	message_ptr msg(oxcmail_import(&imail, gi_alloc, ee_get_propids));
+	oxcmail_converter cvt;
+	cvt.alloc = gi_alloc;
+	cvt.get_propids = ee_get_propids;
+	auto msg = cvt.inet_to_mapi(imail);
 	if (msg == nullptr)
 		fprintf(stderr, "Failed to convert IM %s to MAPI\n", file);
 	return msg;
@@ -239,8 +242,12 @@ static errno_t do_ical(const char *file, std::vector<message_ptr> &mv)
 		fprintf(stderr, "ical_parse %s unsuccessful\n", file);
 		return EIO;
 	}
-	auto err = oxcical_import_multi(ical, zalloc, ee_get_propids,
-	           oxcmail_username_to_entryid, mv);
+
+	oxcical_converter cvt;
+	cvt.alloc = zalloc;
+	cvt.get_propids = ee_get_propids;
+	cvt.username_to_entryid = oxcmail_username_to_entryid;
+	auto err = cvt.ical_to_mapi_multi(ical, mv);
 	if (err == ecNotFound) {
 		fprintf(stderr, "%s: Not an iCalendar object, or an incomplete one.\n", file);
 		return EIO;
@@ -267,8 +274,10 @@ static errno_t do_vcard(const char *file, std::vector<message_ptr> &mv)
 			file, static_cast<unsigned int>(ret));
 		return EIO;
 	}
+	oxvcard_converter cvt;
+	cvt.get_propids = ee_get_propids;
 	for (const auto &card : cardvec) {
-		message_ptr mc(oxvcard_import(&card, ee_get_propids));
+		auto mc = cvt.vcard_to_mapi(card);
 		if (mc == nullptr) {
 			fprintf(stderr, "Failed to convert IM %s to MAPI\n", file);
 			return EIO;
@@ -327,9 +336,10 @@ int main(int argc, char **argv) try
 		return EXIT_FAILURE;
 	}
 	mlog_init(nullptr, nullptr, g_mlog_level, nullptr);
+	setup_utf8_locale();
 	if (iconv_validate() != 0)
 		return EXIT_FAILURE;
-	textmaps_init(PKGDATADIR);
+	textmaps_init();
 	g_config_file = config_file_prg(nullptr, "midb.cfg", eml2mt_cfg_defaults);
 	if (g_config_file == nullptr) {
 		fprintf(stderr, "Something went wrong with config files (e.g. permission denied)\n");

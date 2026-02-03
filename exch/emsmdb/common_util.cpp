@@ -717,10 +717,9 @@ BOOL common_util_retag_propvals(TPROPVAL_ARRAY *parray,
 	return FALSE;
 }
 
-void common_util_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
-	const PROPTAG_ARRAY *pproptags_subtractor)
+void cu_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend, proptag_cspan pproptags_subtractor)
 {
-	for (const auto subtag : *pproptags_subtractor) {
+	for (const auto subtag : pproptags_subtractor) {
 		for (unsigned int i = 0; i < pproptags_minuend->count; ++i) {
 			if (subtag != pproptags_minuend->pproptag[i])
 				continue;
@@ -735,17 +734,17 @@ void common_util_reduce_proptags(PROPTAG_ARRAY *pproptags_minuend,
 	}
 }
 
-PROPTAG_ARRAY* common_util_trim_proptags(const PROPTAG_ARRAY *pproptags)
+PROPTAG_ARRAY *cu_trim_proptags(proptag_cspan pproptags)
 {
 	auto ptmp_proptags = cu_alloc<PROPTAG_ARRAY>();
 	if (ptmp_proptags == nullptr)
 		return NULL;
-	ptmp_proptags->pproptag = cu_alloc<proptag_t>(pproptags->count);
+	ptmp_proptags->pproptag = cu_alloc<proptag_t>(pproptags.size());
 	if (ptmp_proptags->pproptag == nullptr)
 		return NULL;
 	ptmp_proptags->count = 0;
-	for (unsigned int i = 0; i < pproptags->count; ++i) {
-		const auto tag = pproptags->pproptag[i];
+	for (unsigned int i = 0; i < pproptags.size(); ++i) {
+		const auto tag = pproptags[i];
 		if (PROP_TYPE(tag) == PT_OBJECT)
 			continue;
 		ptmp_proptags->emplace_back(tag);
@@ -753,18 +752,17 @@ PROPTAG_ARRAY* common_util_trim_proptags(const PROPTAG_ARRAY *pproptags)
 	return ptmp_proptags;
 }
 
-BOOL common_util_propvals_to_row(
-	const TPROPVAL_ARRAY *ppropvals,
-	const PROPTAG_ARRAY *pcolumns, PROPERTY_ROW *prow)
+bool cu_propvals_to_row(const TPROPVAL_ARRAY *ppropvals, proptag_cspan pcolumns,
+    PROPERTY_ROW *prow)
 {
 	unsigned int i;
 	static constexpr uint32_t errcode = ecNotFound;
 	
-	for (i = 0; i < pcolumns->count; ++i)
-		if (!ppropvals->has(pcolumns->pproptag[i]))
+	for (i = 0; i < pcolumns.size(); ++i)
+		if (!ppropvals->has(pcolumns[i]))
 			break;	
-	prow->flag = i < pcolumns->count ? PROPERTY_ROW_FLAG_FLAGGED : PROPERTY_ROW_FLAG_NONE;
-	prow->pppropval = cu_alloc<void *>(pcolumns->count);
+	prow->flag = i < pcolumns.size() ? PROPERTY_ROW_FLAG_FLAGGED : PROPERTY_ROW_FLAG_NONE;
+	prow->pppropval = cu_alloc<void *>(pcolumns.size());
 	if (prow->pppropval == nullptr)
 		return FALSE;
 	/*
@@ -790,8 +788,8 @@ BOOL common_util_propvals_to_row(
 	 *   QueryRows throws MAPI_E_NO_SUPPORT
 	 *   [Gromox: this is where W-2270 would be logged]
 	 */
-	for (i=0; i<pcolumns->count; i++) {
-		const auto tag = pcolumns->pproptag[i];
+	for (i = 0; i < pcolumns.size(); i++) {
+		const auto tag = pcolumns[i];
 		auto val = ppropvals->getval(tag);
 		prow->pppropval[i] = deconst(val);
 		if (prow->flag != PROPERTY_ROW_FLAG_FLAGGED)
@@ -851,24 +849,23 @@ BOOL common_util_convert_unspecified(cpid_t cpid,
 	return TRUE;
 }
 
-BOOL common_util_propvals_to_row_ex(cpid_t cpid,
-	BOOL b_unicode, const TPROPVAL_ARRAY *ppropvals,
-	const PROPTAG_ARRAY *pcolumns, PROPERTY_ROW *prow)
+bool cu_propvals_to_row_ex(cpid_t cpid, bool b_unicode,
+    const TPROPVAL_ARRAY *ppropvals, proptag_cspan pcolumns, PROPERTY_ROW *prow)
 {
 	static const uint32_t errcode = ecNotFound;
 	unsigned int i;
 	
-	for (i = 0; i < pcolumns->count; ++i)
-		if (!ppropvals->has(pcolumns->pproptag[i]))
+	for (i = 0; i < pcolumns.size(); ++i)
+		if (!ppropvals->has(pcolumns[i]))
 			break;	
-	prow->flag = i < pcolumns->count ? PROPERTY_ROW_FLAG_FLAGGED : PROPERTY_ROW_FLAG_NONE;
-	prow->pppropval = cu_alloc<void *>(pcolumns->count);
+	prow->flag = i < pcolumns.size() ? PROPERTY_ROW_FLAG_FLAGGED : PROPERTY_ROW_FLAG_NONE;
+	prow->pppropval = cu_alloc<void *>(pcolumns.size());
 	if (prow->pppropval == nullptr)
 		return FALSE;
-	for (i=0; i<pcolumns->count; i++) {
-		prow->pppropval[i] = deconst(ppropvals->getval(pcolumns->pproptag[i]));
+	for (i = 0; i < pcolumns.size(); ++i) {
+		prow->pppropval[i] = deconst(ppropvals->getval(pcolumns[i]));
 		if (prow->pppropval[i] != nullptr &&
-		    PROP_TYPE(pcolumns->pproptag[i]) == PT_UNSPECIFIED &&
+		    PROP_TYPE(pcolumns[i]) == PT_UNSPECIFIED &&
 		    !common_util_convert_unspecified(cpid, b_unicode,
 		    static_cast<TYPED_PROPVAL *>(prow->pppropval[i])))
 			return FALSE;
@@ -879,7 +876,7 @@ BOOL common_util_propvals_to_row_ex(cpid_t cpid,
 			return FALSE;
 		if (NULL == prow->pppropval[i]) {
 			pflagged_val->flag = FLAGGED_PROPVAL_FLAG_ERROR;
-			pflagged_val->pvalue = deconst(ppropvals->getval(CHANGE_PROP_TYPE(pcolumns->pproptag[i], PT_ERROR)));
+			pflagged_val->pvalue = deconst(ppropvals->getval(CHANGE_PROP_TYPE(pcolumns[i], PT_ERROR)));
 			if (pflagged_val->pvalue == nullptr)
 				pflagged_val->pvalue = deconst(&errcode);
 		} else {
@@ -891,11 +888,10 @@ BOOL common_util_propvals_to_row_ex(cpid_t cpid,
 	return TRUE;
 }
 
-BOOL common_util_row_to_propvals(
-	const PROPERTY_ROW *prow, const PROPTAG_ARRAY *pcolumns,
+static bool cu_row_to_propvals(const PROPERTY_ROW *prow, proptag_cspan pcolumns,
 	TPROPVAL_ARRAY *ppropvals)
 {
-	for (unsigned int i = 0; i < pcolumns->count; ++i) {
+	for (unsigned int i = 0; i < pcolumns.size(); ++i) {
 		void *pvalue;
 		if (PROPERTY_ROW_FLAG_NONE == prow->flag) {
 			pvalue = prow->pppropval[i];
@@ -905,15 +901,14 @@ BOOL common_util_row_to_propvals(
 				continue;	
 			pvalue = p->pvalue;
 		}
-		if (cu_set_propval(ppropvals, pcolumns->pproptag[i], pvalue) != ecSuccess)
+		if (cu_set_propval(ppropvals, pcolumns[i], pvalue) != ecSuccess)
 			return false;
 	}
 	return TRUE;
 }
 
-static BOOL common_util_propvals_to_recipient(cpid_t cpid,
-	TPROPVAL_ARRAY *ppropvals, const PROPTAG_ARRAY *pcolumns,
-	RECIPIENT_ROW *prow)
+static bool cu_propvals_to_recipient(cpid_t cpid, TPROPVAL_ARRAY *ppropvals,
+    proptag_cspan pcolumns, RECIPIENT_ROW *prow)
 {
 	memset(prow, 0, sizeof(RECIPIENT_ROW));
 	prow->flags |= RECIPIENT_ROW_FLAG_UNICODE;
@@ -988,13 +983,12 @@ static BOOL common_util_propvals_to_recipient(cpid_t cpid,
 				return FALSE;
 		}
 	}
-	prow->count = pcolumns->count;
-	return common_util_propvals_to_row(ppropvals, pcolumns, &prow->properties);
+	prow->count = pcolumns.size();
+	return cu_propvals_to_row(ppropvals, pcolumns, &prow->properties);
 }
 
-static BOOL common_util_recipient_to_propvals(cpid_t cpid,
-	RECIPIENT_ROW *prow, const PROPTAG_ARRAY *pcolumns,
-	TPROPVAL_ARRAY *ppropvals)
+static bool cu_recipient_to_propvals(cpid_t cpid, RECIPIENT_ROW *prow,
+    proptag_cspan pcolumns, TPROPVAL_ARRAY *ppropvals)
 {
 	static constexpr uint8_t persist_true = true, persist_false = false;
 	BOOL b_unicode = (prow->flags & RECIPIENT_ROW_FLAG_UNICODE) ? TRUE : false;
@@ -1059,8 +1053,8 @@ static BOOL common_util_recipient_to_propvals(cpid_t cpid,
 		return FALSE;
 	}
 
-	const PROPTAG_ARRAY tmp_columns = {prow->count, pcolumns->pproptag};
-	if (!common_util_row_to_propvals(&prow->properties, &tmp_columns, ppropvals))
+	const PROPTAG_ARRAY tmp_columns = {prow->count, deconst(pcolumns.data())};
+	if (!cu_row_to_propvals(&prow->properties, tmp_columns, ppropvals))
 		return FALSE;	
 	auto str = ppropvals->get<const char>(PR_DISPLAY_NAME);
 	if (str != nullptr && *str != '\0' && strcmp(str, "''") != 0 &&
@@ -1076,21 +1070,18 @@ static BOOL common_util_recipient_to_propvals(cpid_t cpid,
 	return TRUE;
 }
 
-BOOL common_util_propvals_to_openrecipient(cpid_t cpid,
-	TPROPVAL_ARRAY *ppropvals, const PROPTAG_ARRAY *pcolumns,
-	OPENRECIPIENT_ROW *prow)
+bool cu_propvals_to_openrecipient(cpid_t cpid, TPROPVAL_ARRAY *ppropvals,
+    proptag_cspan pcolumns, OPENRECIPIENT_ROW *prow)
 {
 	auto pvalue = ppropvals->get<uint32_t>(PR_RECIPIENT_TYPE);
 	prow->recipient_type = pvalue == nullptr ? MAPI_ORIG : *pvalue;
 	prow->reserved = 0;
 	prow->cpid = cpid;
-	return common_util_propvals_to_recipient(cpid,
-		ppropvals, pcolumns, &prow->recipient_row);
+	return cu_propvals_to_recipient(cpid, ppropvals, pcolumns, &prow->recipient_row);
 }
 
-BOOL common_util_propvals_to_readrecipient(cpid_t cpid,
-	TPROPVAL_ARRAY *ppropvals, const PROPTAG_ARRAY *pcolumns,
-	READRECIPIENT_ROW *prow)
+bool cu_propvals_to_readrecipient(cpid_t cpid, TPROPVAL_ARRAY *ppropvals,
+    proptag_cspan cols, READRECIPIENT_ROW *prow)
 {
 	auto pvalue = ppropvals->get<uint32_t>(PR_ROWID);
 	if (pvalue == nullptr)
@@ -1100,16 +1091,14 @@ BOOL common_util_propvals_to_readrecipient(cpid_t cpid,
 	prow->recipient_type = pvalue == nullptr ? MAPI_ORIG : *pvalue;
 	prow->reserved = 0;
 	prow->cpid = cpid;
-	return common_util_propvals_to_recipient(cpid,
-		ppropvals, pcolumns, &prow->recipient_row);
+	return cu_propvals_to_recipient(cpid, ppropvals, cols, &prow->recipient_row);
 }
 
-BOOL common_util_modifyrecipient_to_propvals(cpid_t cpid,
-    const MODIFYRECIPIENT_ROW *prow, const PROPTAG_ARRAY *pcolumns,
-    TPROPVAL_ARRAY *ppropvals)
+bool cu_modifyrecipient_to_propvals(cpid_t cpid, const MODIFYRECIPIENT_ROW *prow,
+    proptag_cspan pcolumns, TPROPVAL_ARRAY *ppropvals)
 {
 	ppropvals->count = 0;
-	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(16 + pcolumns->count);
+	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(16 + pcolumns.size());
 	if (ppropvals->ppropval == nullptr)
 		return FALSE;
 	if (cu_set_propval(ppropvals, PR_ROWID, deconst(&prow->row_id)) != ecSuccess)
@@ -1122,8 +1111,7 @@ BOOL common_util_modifyrecipient_to_propvals(cpid_t cpid,
 		return false;
 	if (prow->precipient_row == nullptr)
 		return TRUE;
-	return common_util_recipient_to_propvals(cpid,
-			prow->precipient_row, pcolumns, ppropvals);
+	return cu_recipient_to_propvals(cpid, prow->precipient_row, pcolumns, ppropvals);
 }
 
 static void common_util_convert_proptag(BOOL to_unicode, proptag_t *pproptag)
@@ -1455,22 +1443,25 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 	}
 	if (rcpt_list.size() == 0) {
 		/* What would EXC do? */
-		mlog2(LV_ERR, "E-1282: Empty converted recipients list attempting to send %s", log_id.c_str());
+		mlog2(LV_ERR, "E-1282: Empty converted recipients list attempting to send %s",
+			log_id.c_str());
 		return MAPI_E_NO_RECIPIENTS;
 	}
-	auto body_type = get_override_format(*pmsgctnt);
 	common_util_set_dir(dir);
-	/* try to avoid TNEF message */
-	if (!oxcmail_export(pmsgctnt, log_id.c_str(), false, body_type, &imail,
-	    common_util_alloc, common_util_get_propids, common_util_get_propname)) {
+	oxcmail_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.alloc = common_util_alloc;
+	cvt.get_propids = common_util_get_propids;
+	cvt.get_propname = common_util_get_propname;
+	cvt.use_format_override(*pmsgctnt);
+	if (!cvt.mapi_to_inet(*pmsgctnt, imail)) {
 		mlog2(LV_ERR, "E-1281: oxcmail_export %s failed", log_id.c_str());
 		return ecError;	
 	}
 
 	imail.set_header("X-Mailer", EMSMDB_UA);
 	if (emsmdb_backfill_transporthdr) {
-		std::unique_ptr<MESSAGE_CONTENT, mc_delete> rmsg(oxcmail_import(
-			&imail, common_util_alloc, common_util_get_propids));
+		auto rmsg = cvt.inet_to_mapi(imail);
 		if (rmsg != nullptr) {
 			for (auto tag : {PR_TRANSPORT_MESSAGE_HEADERS, PR_TRANSPORT_MESSAGE_HEADERS_A}) {
 				auto th = rmsg->proplist.get<const char>(tag);
@@ -1507,16 +1498,19 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 	auto ptarget = pmsgctnt->proplist.get<BINARY>(PR_TARGET_ENTRYID);
 	if (NULL != ptarget) {
 		if (!cu_entryid_to_mid(*plogon, ptarget, &folder_id, &new_id)) {
-			mlog2(LV_WARN, "W-1279: PR_TARGET_ENTRYID inconvertible in %s", log_id.c_str());
+			mlog2(LV_WARN, "W-1279: PR_TARGET_ENTRYID inconvertible in %s",
+				log_id.c_str());
 			return ecWarnWithErrors;	
 		}
 		if (!exmdb_client->clear_submit(dir, message_id, false)) {
-			mlog2(LV_WARN, "W-1278: exrpc clear_submit %s failed", log_id.c_str());
+			mlog2(LV_WARN, "W-1278: exrpc clear_submit %s failed",
+				log_id.c_str());
 			return ecWarnWithErrors;
 		}
 		if (!exmdb_client->movecopy_message(dir, cpid, message_id,
 		    folder_id, new_id, TRUE, &b_result)) {
-			mlog2(LV_WARN, "W-1277: exrpc movecopy_message %s failed", log_id.c_str());
+			mlog2(LV_WARN, "W-1277: exrpc movecopy_message %s failed",
+				log_id.c_str());
 			return ecWarnWithErrors;
 		}
 		return ecSuccess;
@@ -1526,7 +1520,8 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 		return ecSuccess;
 	}
 	if (!exmdb_client->clear_submit(dir, message_id, false)) {
-		mlog2(LV_WARN, "W-1276: exrpc clear_submit %s failed", log_id.c_str());
+		mlog2(LV_WARN, "W-1276: exrpc clear_submit %s failed",
+			log_id.c_str());
 		return ecWarnWithErrors;
 	}
 
@@ -1539,7 +1534,8 @@ ec_error_t cu_send_message(logon_object *plogon, message_object *msg,
 	if (!exmdb_client->movecopy_messages(dir, cpid,
 	    false, STORE_OWNER_GRANTED, parent_id, folder_id, false,
 	    &ids, &b_partial)) {
-		mlog2(LV_WARN, "W-1275: exrpc movecopy_message %s failed", log_id.c_str());
+		mlog2(LV_WARN, "W-1275: exrpc movecopy_message %s failed",
+			log_id.c_str());
 		return ecWarnWithErrors;
 	}
 	return ecSuccess;

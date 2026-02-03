@@ -56,7 +56,10 @@ Makefile.in
 /http
 /imap
 /istore
+/lda
 /midb
+/oab
+/oxdisco
 /pop3
 /timer
 /zcore

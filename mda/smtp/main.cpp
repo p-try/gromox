@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cerrno>
 #include <chrono>
@@ -150,7 +150,7 @@ static void *smls_thrwork(void *arg)
 			auto str2 = resource_get_smtp_code(401, 2, &sl);
 			auto host_ID = znul(g_config_file->get_value("host_id"));
 			char buff[1024];
-			auto len = snprintf(buff, std::size(buff), "%s%s%s",
+			auto len = gx_snprintf(buff, std::size(buff), "%s%s%s",
 			           str, host_ID, str2);
 			if (HXio_fullwrite(conn.sockd, buff, len) < 0)
 				/* ignore */;
@@ -164,7 +164,7 @@ static void *smls_thrwork(void *arg)
 			auto str2 = resource_get_smtp_code(202, 2, &sl);
 			auto host_ID = znul(g_config_file->get_value("host_id"));
 			char buff[1024];
-			auto len = snprintf(buff, std::size(buff), "%s%s%s",
+			auto len = gx_snprintf(buff, std::size(buff), "%s%s%s",
 			           str, host_ID, str2);
 			if (HXio_fullwrite(conn.sockd, buff, len) < 0)
 				/* ignore */;
@@ -300,6 +300,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE; /* e.g. permission error */
 	if (!dq_reload_config(gxconfig, g_config_file))
 		return EXIT_FAILURE;
+	setup_utf8_locale();
 
 	mlog_init("gromox-delivery-queue", g_config_file->get_value("lda_log_file"),
 		g_config_file->get_ll("lda_log_level"),

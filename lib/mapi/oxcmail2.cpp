@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2024 grommunio GmbH
+// SPDX-FileCopyrightText: 2024–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
+#include <libHX/ctype_helper.h>
 #include <libHX/libxml_helper.h>
+#include <libHX/string.h>
 #include <libxml/HTMLparser.h>
 #include <libxml/HTMLtree.h>
-#include <vmime/generationContext.hpp>
-#include <vmime/utility/outputStreamStringAdapter.hpp>
+#include <gromox/element_data.hpp>
+#include <gromox/mail.hpp>
 #include <gromox/mail_func.hpp>
 #include <gromox/mapidefs.h>
 #include <gromox/mime.hpp>
@@ -20,8 +22,9 @@
 #include <gromox/util.hpp>
 #include "oxcmail_int.hpp"
 
-using namespace gromox;
 using namespace std::string_literals;
+using namespace gromox;
+using namespace oxcmail;
 
 namespace oxcmail {
 
@@ -44,10 +47,10 @@ using xmldocptr = std::unique_ptr<xmlDoc, xmlfree>;
  */
 void select_parts(const MIME *part, MIME_ENUM_PARAM &info, unsigned int level) try
 {
-	char dispo[32];
-	if (part->get_field("Content-Disposition", dispo, std::size(dispo)) &&
-	    strncasecmp(dispo, "attachment", 10) == 0 &&
-	    (dispo[10] == '\0' || dispo[10] == ';'))
+	auto dispo = part->get_field("Content-Disposition");
+	if (dispo != nullptr &&
+	    strncasecmp(dispo->c_str(), "attachment", 10) == 0 &&
+	    ((*dispo)[10] == '\0' || (*dispo)[10] == ';'))
 		return;
 	if (part->mime_type == mime_type::single) {
 		if (strcasecmp(part->content_type, "text/plain") == 0) {
@@ -305,19 +308,23 @@ static ec_error_t multibody_image(MIME_ENUM_PARAM &epar, const MIME *mime,
     xmldocptr &ag_doc) try
 {
 	std::string ctid;
-	char ctid_raw[128];
-	if (!mime->get_field("Content-ID", ctid_raw, std::size(ctid_raw))) {
+	auto old_ctid = mime->get_field("Content-ID");
+
+	if (old_ctid == nullptr) {
+		char ctid_raw[128];
 		GUID::random_new().to_str(&ctid_raw[0], std::size(ctid_raw), 32);
 		ctid_raw[32] = '@';
 		GUID::random_new().to_str(&ctid_raw[33], std::size(ctid_raw) - 33, 32);
 		ctid = "cid:"s + ctid_raw;
 		epar.new_ctids.emplace(mime, ctid_raw);
-	} else if (ctid_raw[0] == '<') {
-		ctid = "cid:"s + &ctid_raw[1];
-		if (ctid.size() > 0 && ctid.back() == '>')
-			ctid.pop_back();
+	} else if (old_ctid->size() >= 2 && old_ctid->front() == '<' && old_ctid->back() == '>') {
+		std::string_view sv(*old_ctid);
+		sv.remove_prefix(1);
+		sv.remove_suffix(1);
+		ctid = "cid:"s;
+		ctid += sv;
 	} else {
-		ctid = "cid:"s + ctid_raw;
+		ctid = "cid:"s + *old_ctid;
 	}
 	auto ag_body = find_element(ag_doc.get(), "body");
 	if (ag_body == nullptr)
@@ -352,8 +359,7 @@ static ec_error_t multibody_image(MIME_ENUM_PARAM &epar, const MIME *mime,
  * @epar:  input mail and its parts
  * @props: target MAPI message properties
  */
-ec_error_t bodyset_multi(MIME_ENUM_PARAM &epar, TPROPVAL_ARRAY &props,
-    const char *charset)
+ec_error_t bodyset_multi(MIME_ENUM_PARAM &epar, TPROPVAL_ARRAY &props)
 {
 	xmldocptr ag_doc;
 
@@ -377,8 +383,7 @@ ec_error_t bodyset_multi(MIME_ENUM_PARAM &epar, TPROPVAL_ARRAY &props,
 
 			std::string mime_charset;
 			if (!oxcmail_get_content_param(mime, "charset", mime_charset))
-				mime_charset = utf8_valid(rawbody.c_str()) ?
-				               "utf-8" : epar.charset;
+				mime_charset = "us-ascii";
 			utfbody.resize(mb_to_utf8_xlen(rawbody.size()));
 			if (!string_mb_to_utf8(mime_charset.c_str(), rawbody.c_str(),
 			    utfbody.data(), utfbody.size() + 1))
@@ -416,27 +421,133 @@ ec_error_t bodyset_multi(MIME_ENUM_PARAM &epar, TPROPVAL_ARRAY &props,
 	return props.set(PR_INTERNET_CPID, &cpid);
 }
 
+static bool att_is_mtg_exception(const attachment_content &at)
+{
+	if (at.pembedded == nullptr)
+		return false;
+	auto s = at.pembedded->proplist.get<const char>(PR_MESSAGE_CLASS);
+	return s != nullptr && strcasecmp(s, IPM_Appointment_Exception) == 0;
+}
+
+bool attachment_is_inline(const attachment_content &at)
+{
+	if (at.pembedded != nullptr)
+		return false;
+	auto num = at.proplist.get<uint32_t>(PR_ATTACH_FLAGS);
+	if (num == nullptr || !(*num & ATT_MHTML_REF))
+		return false;
+	return at.proplist.has(PR_ATTACH_CONTENT_ID) ||
+	       at.proplist.has(PR_ATTACH_CONTENT_LOCATION);
+}
+
+bool parse_keywords(const char *field, propid_t propid,
+    TPROPVAL_ARRAY &props) try
+{
+	proptag_t tag;
+	std::string tmp_buff;
+
+	if (!mime_string_to_utf8(field, tmp_buff)) {
+		tag = PROP_TAG(PT_MV_STRING8, propid);
+		tmp_buff = field;
+	} else {
+		tag = PROP_TAG(PT_MV_UNICODE, propid);
+	}
+	std::vector<char *> vec;
+	char *saveptr = nullptr;
+	for (auto token = strtok_r(tmp_buff.data(), ",;", &saveptr);
+	     token != nullptr;
+	     token = strtok_r(nullptr, ",;", &saveptr)) {
+		while (HX_isspace(*token))
+			++token;
+		vec.emplace_back(token);
+	}
+	if (vec.empty())
+		return TRUE;
+	STRING_ARRAY sa;
+	sa.count = std::min(vec.size(), static_cast<size_t>(UINT32_MAX));
+	sa.ppstr = vec.data();
+	return props.set(tag, &sa) == ecSuccess;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
+	return false;
+}
+
+bool parse_response_suppress(const char *raw, TPROPVAL_ARRAY &props) try
+{
+	std::string field = raw;
+	uint32_t v = 0;
+	char *saveptr = nullptr;
+
+	for (auto token = strtok_r(field.data(), ",;", &saveptr);
+	     token != nullptr;
+	     token = strtok_r(nullptr, ",;", &saveptr)) {
+		while (HX_isspace(*token))
+			++token;
+		HX_strrtrim(token);
+		if (strcasecmp(token, "ALL") == 0)
+			v = ~0U;
+		else if (strcasecmp(token, "NONE") == 0)
+			v = 0;
+		else if (strcasecmp(token, "DR") == 0)
+			v |= AUTO_RESPONSE_SUPPRESS_DR;
+		else if (strcasecmp(token, "NDR") == 0)
+			v |= AUTO_RESPONSE_SUPPRESS_NDR;
+		else if (strcasecmp(token, "RN") == 0)
+			v |= AUTO_RESPONSE_SUPPRESS_RN;
+		else if (strcasecmp(token, "NRN") == 0)
+			v |= AUTO_RESPONSE_SUPPRESS_NRN;
+		else if (strcasecmp(token, "OOF") == 0)
+			v |= AUTO_RESPONSE_SUPPRESS_OOF;
+		else if (strcasecmp(token, "AutoReply") == 0)
+			v |= AUTO_RESPONSE_SUPPRESS_AUTOREPLY;
+	}
+	if (v == 0)
+		return true;
+	return props.set(PR_AUTO_RESPONSE_SUPPRESS, &v) == ecSuccess;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return false;
+}
+
+}
+
+/* For exporting MAPI Attachments as MIME parts */
+ec_error_t oxcmail_converter::export_attachments(const message_content &mc,
+    const mime_skeleton &skel, MAIL &m_mail, MIME *m_related, MIME *m_mixed,
+    unsigned int mail_depth)
+{
+	if (mc.children.pattachments == nullptr)
+		return ecSuccess;
+	for (const auto &at : *mc.children.pattachments) {
+		if (att_is_mtg_exception(at))
+			continue;
+		auto b_inline = attachment_is_inline(at);
+		auto new_part = m_mail.add_child(b_inline ? m_related : m_mixed, MIME_ADD_LAST);
+		if (new_part == nullptr)
+			return ecMAPIOOM;
+		if (!export_attachment(at, b_inline, skel, *new_part, mail_depth))
+			return ecError;
+	}
+	return ecSuccess;
+}
+
+/* Certain MAPI objects can only be expressed in MIME as TNEF */
+ec_error_t oxcmail_converter::export_tnef_body(const mime_skeleton &skel,
+    MAIL &mail, MIME *m_related, unsigned int mail_depth)
+{
+	if (skel.pattachments == nullptr)
+		return ecSuccess;
+	for (const auto &at : *skel.pattachments) {
+		auto new_part = mail.add_child(m_related, MIME_ADD_LAST);
+		if (new_part == nullptr)
+			return ecMAPIOOM;
+		if (!export_attachment(at, true, skel, *new_part, mail_depth))
+			return ecError;
+	}
+	return ecSuccess;
 }
 
 namespace gromox {
-
-vmime::generationContext vmail_default_genctx()
-{
-	vmime::generationContext c;
-	/* Outlook is unable to read RFC 2231. */
-	c.setEncodedParameterValueMode(vmime::generationContext::EncodedParameterValueModes::PARAMETER_VALUE_RFC2231_AND_RFC2047);
-	/* Outlook is also unable to parse Content-ID:\n id... */
-	c.setWrapMessageId(false);
-	return c;
-}
-
-std::string vmail_to_string(const vmime::message &msg)
-{
-	std::string ss;
-	vmime::utility::outputStreamStringAdapter adap(ss);
-	msg.generate(vmail_default_genctx(), adap);
-	return ss;
-}
 
 bool vmail_to_mail(const vmime::message &in, MAIL &out) try
 {

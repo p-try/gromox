@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <chrono>
@@ -386,7 +386,6 @@ void uid_to_goid(const char* uid, BINARY &goid_bin)
 namespace detail {
 
 void Cleaner::operator()(BINARY* x) {rop_util_free_binary(x);}
-void Cleaner::operator()(MESSAGE_CONTENT *x) {message_content_free(x);}
 
 } // gromox::EWS::detail
 
@@ -597,10 +596,9 @@ std::optional<uint64_t> EWSContext::findExistingByGoid(const sFolderSpec& calend
 		return std::nullopt;
 
 	static constexpr proptag_t midTagValue = PidTagMid;
-	static constexpr PROPTAG_ARRAY proptags = {1, deconst(&midTagValue)};
 	TARRAY_SET rows{};
 	if (!m_plugin.exmdb.query_table(calendarDir.c_str(), calUser, CP_ACP,
-	    tableId, &proptags, 0, 1, &rows))
+	    tableId, {&midTagValue, 1}, 0, 1, &rows))
 		throw EWSError::ItemCorrupt(E3284);
 	if (rows.count == 0 || rows.pparray[0] == nullptr)
 		return std::nullopt;
@@ -717,12 +715,20 @@ void EWSContext::enableEventStream(int timeout)
 std::string EWSContext::exportContent(const std::string& dir, const MESSAGE_CONTENT& content, const std::string& log_id) const
 {
 	MAIL mail;
-	auto getPropIds  = [&](const PROPNAME_ARRAY *names, PROPID_ARRAY *ids)
-		{ *ids = getNamedPropIds(dir, *names); return TRUE; };
-	auto getPropName = [&](propid_t id, PROPERTY_NAME **name) { *name = getPropertyName(dir, id); return TRUE; };
-	if (!oxcmail_export(&content, log_id.c_str(), false,
-	                    oxcmail_body::plain_and_html, &mail, alloc, getPropIds, getPropName))
+	oxcmail_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.alloc = alloc;
+	cvt.get_propids = [&](const PROPNAME_ARRAY *names, PROPID_ARRAY *ids) {
+	                  	*ids = getNamedPropIds(dir, *names);
+	                  	return TRUE;
+	                  };
+	cvt.get_propname = [&](propid_t id, PROPERTY_NAME **name) {
+	                   	*name = getPropertyName(dir, id);
+	                   	return TRUE;
+	                   };
+	if (!cvt.mapi_to_inet(content, mail))
 		throw EWSError::ItemCorrupt(E3072);
+
 	auto mail_len = mail.get_length();
 	if (mail_len < 0)
 		throw EWSError::ItemCorrupt(E3073);
@@ -1004,11 +1010,9 @@ TAGGED_PROPVAL EWSContext::getFolderEntryId(const std::string& dir, uint64_t fol
 TPROPVAL_ARRAY EWSContext::getFolderProps(const std::string &dir,
     uint64_t folderId, proptag_cspan tags) const
 {
-	PROPTAG_ARRAY props;
-	props.count    = std::min(tags.size(), static_cast<size_t>(UINT16_MAX));
-	props.pproptag = deconst(tags.data());
 	TPROPVAL_ARRAY result;
-	if (!m_plugin.exmdb.get_folder_properties(dir.c_str(), CP_ACP, folderId, &props, &result))
+	if (!m_plugin.exmdb.get_folder_properties(dir.c_str(), CP_ACP,
+	    folderId, tags, &result))
 		throw EWSError::FolderPropertyRequestFailed(E3023);
 	return result;
 }
@@ -1079,11 +1083,12 @@ const void *EWSContext::getItemProp(const std::string &dir, uint64_t mid,
  *
  * @return    Property values
  */
-TPROPVAL_ARRAY EWSContext::getItemProps(const std::string& dir,	uint64_t mid, const PROPTAG_ARRAY& props) const
+TPROPVAL_ARRAY EWSContext::getItemProps(const std::string &dir, uint64_t mid,
+    proptag_cspan props) const
 {
 	TPROPVAL_ARRAY result;
 	if (!m_plugin.exmdb.get_message_properties(dir.c_str(), m_auth_info.username,
-	    CP_ACP, mid, &props, &result))
+	    CP_ACP, mid, props, &result))
 		throw EWSError::ItemPropertyRequestFailed(E3025);
 	return result;
 }
@@ -1098,9 +1103,9 @@ TPROPVAL_ARRAY EWSContext::getItemProps(const std::string& dir,	uint64_t mid, co
 GUID EWSContext::getMailboxGuid(const std::string& dir) const
 {
 	static constexpr proptag_t recordKeyTag = PR_STORE_RECORD_KEY;
-	static constexpr PROPTAG_ARRAY recordKeyTags = {1, deconst(&recordKeyTag)};
 	TPROPVAL_ARRAY recordKeyProp;
-	if (!m_plugin.exmdb.get_store_properties(dir.c_str(), CP_ACP, &recordKeyTags, &recordKeyProp) ||
+	if (!m_plugin.exmdb.get_store_properties(dir.c_str(), CP_ACP,
+	    {&recordKeyTag, 1}, &recordKeyProp) ||
 	   recordKeyProp.count != 1 || recordKeyProp.ppropval->proptag != PR_STORE_RECORD_KEY)
 		throw DispatchError(E3194);
 	const BINARY* recordKeyData = static_cast<const BINARY*>(recordKeyProp.ppropval->pvalue);
@@ -1180,8 +1185,8 @@ sAttachment EWSContext::loadAttachment(const std::string& dir, const sAttachment
 		PR_ATTACH_LONG_FILENAME, PR_ATTACHMENT_FLAGS,
 	};
 	TPROPVAL_ARRAY props;
-	static constexpr PROPTAG_ARRAY tags{std::size(tagIDs), deconst(tagIDs)};
-	if (!m_plugin.exmdb.get_instance_properties(dir.c_str(), 0, aInst->instanceId, &tags, &props))
+	if (!m_plugin.exmdb.get_instance_properties(dir.c_str(), 0,
+	    aInst->instanceId, proptag_cspan{tagIDs}, &props))
 		throw DispatchError(E3083);
 	sShape shape(props);
 
@@ -1214,9 +1219,9 @@ TARRAY_SET EWSContext::loadPermissions(const std::string& dir, uint64_t fid) con
 		throw EWSError::ItemCorrupt(E3283);
 	auto unloadTable = HX::make_scope_exit([&, tableId]{exmdb.unload_table(dir.c_str(), tableId);});
 	static constexpr proptag_t tags[] = {PR_MEMBER_ID, PR_MEMBER_NAME, PR_MEMBER_RIGHTS, PR_SMTP_ADDRESS};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tags), deconst(tags)};
 	TARRAY_SET propTable;
-	if (!exmdb.query_table(dir.c_str(), "", CP_UTF8, tableId, &proptags, 0, rowCount, &propTable))
+	if (!exmdb.query_table(dir.c_str(), "", CP_UTF8, tableId,
+	    proptag_cspan{tags}, 0, rowCount, &propTable))
 		throw EWSError::ItemCorrupt(E3284);
 	return propTable;
 }
@@ -1344,8 +1349,8 @@ void EWSContext::loadSpecial(const std::string& dir, uint64_t fid, uint64_t mid,
 		for (uint16_t i = 0; i < count; ++i) {
 			auto aInst = m_plugin.loadAttachmentInstance(dir, fid, mid, i);
 			TPROPVAL_ARRAY props;
-			static constexpr PROPTAG_ARRAY tags = {std::size(tagIDs), deconst(tagIDs)};
-			if (!exmdb.get_instance_properties(dir.c_str(), 0, aInst->instanceId, &tags, &props))
+			if (!exmdb.get_instance_properties(dir.c_str(), 0,
+			    aInst->instanceId, proptag_cspan{tagIDs}, &props))
 				throw DispatchError(E3080);
 			sShape shape(props);
 			auto method = props.get<const uint32_t>(PR_ATTACH_METHOD);
@@ -1561,7 +1566,6 @@ sItem EWSContext::loadOccurrence(const std::string& dir, uint64_t fid, uint64_t 
 	TPROPVAL_ARRAY props;
 	auto tags_1 = shape.proptags_vec();
 	tags_1.emplace_back(ex_replace_time_tag);
-	const PROPTAG_ARRAY tags = {static_cast<uint16_t>(tags_1.size()), deconst(tags_1.data())};
 
 	auto basedate_ts = clock::to_time_t(rop_util_rtime_to_unix2(basedate));
 	struct tm basedate_local;
@@ -1570,7 +1574,7 @@ sItem EWSContext::loadOccurrence(const std::string& dir, uint64_t fid, uint64_t 
 	for (uint16_t i = 0; i < count; ++i) {
 		auto aInst = m_plugin.loadAttachmentInstance(dir, fid, mid, i);
 		auto eInst = m_plugin.loadEmbeddedInstance(dir, aInst->instanceId);
-		if (!m_plugin.exmdb.get_instance_properties(dir.c_str(), 0, eInst->instanceId, &tags, &props))
+		if (!m_plugin.exmdb.get_instance_properties(dir.c_str(), 0, eInst->instanceId, tags_1, &props))
 			throw DispatchError(E3211);
 
 		auto exstarttime = props.get<const uint64_t>(ex_replace_time_tag);
@@ -1623,9 +1627,9 @@ uint64_t EWSContext::moveCopyFolder(const std::string& dir, const sFolderSpec& f
                                     bool copy) const
 {
 	static constexpr proptag_t tagIds[] = {PidTagParentFolderId, PR_DISPLAY_NAME};
-	static constexpr PROPTAG_ARRAY tags = {std::size(tagIds), deconst(tagIds)};
 	TPROPVAL_ARRAY props;
-	if (!m_plugin.exmdb.get_folder_properties(dir.c_str(), CP_ACP, folder.folderId, &tags, &props))
+	if (!m_plugin.exmdb.get_folder_properties(dir.c_str(), CP_ACP,
+	    folder.folderId, proptag_cspan{tagIds}, &props))
 		throw DispatchError(E3159);
 	uint64_t* parentFid = props.get<uint64_t>(PidTagParentFolderId);
 	auto folderName = props.get<const char>(PR_DISPLAY_NAME);
@@ -1844,16 +1848,23 @@ void EWSContext::send(const std::string &dir, uint64_t log_msg_id,
 	if (!content.children.prcpts)
 		throw EWSError::MissingRecipients(E3115);
 	MAIL mail;
-	auto getPropIds = [&](const PROPNAME_ARRAY* names, PROPID_ARRAY* ids)
-		                  {*ids = getNamedPropIds(dir, *names); return TRUE;};
-	auto getPropName = [&](propid_t id, PROPERTY_NAME **name)
-					   {*name = getPropertyName(dir, id); return TRUE;};
 	std::string log_id;
+	oxcmail_converter cvt;
+	cvt.get_propids = [&](const PROPNAME_ARRAY *names, PROPID_ARRAY *ids) {
+	                  	*ids = getNamedPropIds(dir, *names);
+	                  	return TRUE;
+	                  };
+	cvt.get_propname = [&](propid_t id, PROPERTY_NAME **name) {
+	                   	*name = getPropertyName(dir, id);
+	                   	return TRUE;
+	                   };
 	if (log_msg_id != 0)
 		log_id = dir + ":m" + std::to_string(log_msg_id);
-	if (!oxcmail_export(&content, log_id.c_str(), false,
-	    oxcmail_body::plain_and_html, &mail, alloc, getPropIds, getPropName))
+	cvt.log_id = log_id.c_str();
+	cvt.alloc = alloc;
+	if (!cvt.mapi_to_inet(content, mail))
 		throw EWSError::ItemCorrupt(E3116);
+
 	std::vector<std::string> rcpts;
 	rcpts.reserve(content.children.prcpts->count);
 	for (auto &rcpt : *content.children.prcpts) {
@@ -1917,9 +1928,13 @@ EWSContext::MCONT_PTR EWSContext::toContent(const std::string& dir, std::string&
 	MAIL mail;
 	if (!mail.refonly_parse(mimeContent.data(), mimeContent.size()))
 		throw EWSError::ItemCorrupt(E3123);
-	auto getPropIds = [&](const PROPNAME_ARRAY* names, PROPID_ARRAY* ids)
-	{*ids = getNamedPropIds(dir, *names, true); return TRUE;};
-	MCONT_PTR cnt(oxcmail_import(&mail, EWSContext::alloc, getPropIds));
+	oxcmail_converter cvt;
+	cvt.alloc = EWSContext::alloc;
+	cvt.get_propids = [&](const PROPNAME_ARRAY *names, PROPID_ARRAY *ids) {
+	                  	*ids = getNamedPropIds(dir, *names, true);
+	                  	return TRUE;
+	                  };
+	auto cnt = cvt.inet_to_mapi(mail);
 	if (!cnt)
 		throw EWSError::ItemCorrupt(E3124);
 	return cnt;
@@ -2022,7 +2037,17 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		endOffset = std::chrono::duration_cast<std::chrono::minutes>(item.End.value().offset).count();
 		calcEndOffset = item.End.value().needCalcOffset();
 	}
-	// TODO handle no start and/or end times
+	if (!item.Start || !item.End) {
+		const char* missing = item.Start ? "End" : "Start";
+		throw EWSError::ItemCorrupt(E3046(missing, "CalendarItem"));
+	}
+
+	if (!shape.writes(NtCalendarTimeZone)) {
+		if (item.StartTimeZoneId)
+			shape.write(NtCalendarTimeZone, TAGGED_PROPVAL{PT_UNICODE, cpystr(*item.StartTimeZoneId)});
+		else if (item.EndTimeZoneId)
+			shape.write(NtCalendarTimeZone, TAGGED_PROPVAL{PT_UNICODE, cpystr(*item.EndTimeZoneId)});
+	}
 
 	if (item.IsAllDayEvent)
 		shape.write(NtAppointmentSubType, TAGGED_PROPVAL{PT_BOOLEAN, construct<uint32_t>(item.IsAllDayEvent.value())});
@@ -2215,6 +2240,8 @@ void EWSContext::toContent(const std::string& dir, tCalendarItem& item, sShape& 
 		const TAGGED_PROPVAL* caltz = shape.writes(NtCalendarTimeZone);
 		if (caltz) {
 			auto buf = ianatz_to_tzdef(static_cast<char*>(caltz->pvalue));
+			if (buf == nullptr)
+				buf = wintz_to_tzdef(static_cast<char*>(caltz->pvalue));
 			if (buf != nullptr) {
 				size_t len = buf->size();
 				if (len > UINT32_MAX)

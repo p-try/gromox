@@ -39,10 +39,6 @@ using event_list_t = std::vector<const ical_component *>;
 using uidxevent_list_t = std::unordered_map<std::string, event_list_t>;
 using message_ptr = std::unique_ptr<MESSAGE_CONTENT, mc_delete>;
 
-namespace gromox {
-bool g_oxcical_allday_ymd = true; /* MS-OXCICAL v13 §2.1.3.1.1.20.8 p. 49. */
-}
-
 static constexpr char
 	PidNameKeywords[] = "Keywords",
 	PidNameLocationUrl[] = "urn:schemas:calendar:locationurl";
@@ -2346,7 +2342,7 @@ static const char *oxcical_import_internal(const char *method,
 			if (pembedded == nullptr)
 				return "E-2725: ENOMEM";
 			pattachment->set_embedded_internal(pembedded);
-			if (pembedded->proplist.set(PR_MESSAGE_CLASS, "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}") != ecSuccess)
+			if (pembedded->proplist.set(PR_MESSAGE_CLASS, IPM_Appointment_Exception) != ecSuccess)
 				return "E-2726";
 
 			event_list_t tmp_list;
@@ -2458,7 +2454,7 @@ static const char *oxcical_import_internal(const char *method,
 			pexception->reminderdelta = alarmdelta;
 		}
 	}
-	if (!oxcical_fetch_propname(pmsg, phash, alloc, std::move(get_propids)))
+	if (!oxcical_fetch_propname(pmsg, phash, alloc, get_propids))
 		return "E-2735";
 	return nullptr;
 }
@@ -2699,9 +2695,8 @@ static uint32_t oxcical_get_calendartype(const ical_line *piline)
  * Read a bunch of VCALENDAR/VEVENT items from @pical and put each of them as
  * messages into @finalvec.
  */
-ec_error_t oxcical_import_multi(const ical &pical,
-    EXT_BUFFER_ALLOC alloc, GET_PROPIDS get_propids,
-    USERNAME_TO_ENTRYID username_to_entryid, std::vector<message_ptr> &finalvec)
+ec_error_t oxcical_converter::ical_to_mapi_multi(const ical &pical,
+    std::vector<message_ptr> &finalvec)
 {
 	bool b_proposal;
 	const char *pvalue = nullptr, *pvalue1 = nullptr;
@@ -2727,7 +2722,7 @@ ec_error_t oxcical_import_multi(const ical &pical,
 		if (pmsg->proplist.set(PR_MESSAGE_CLASS, "IPM.Task") != ecSuccess)
 			return ecError;
 		auto err = oxcical_import_todo(pical, *first_comp, alloc,
-		           std::move(get_propids), pmsg);
+		           get_propids, pmsg);
 		if (err != nullptr) {
 			mlog(LV_ERR, "%s", err);
 			return ecError;
@@ -2754,7 +2749,7 @@ ec_error_t oxcical_import_multi(const ical &pical,
 	piline = pical.get_line("METHOD");
 	if (piline == nullptr) {
 		if (!oxcical_import_events(calendartype,
-		    pical, uid_list, alloc, std::move(get_propids),
+		    pical, uid_list, alloc, get_propids,
 		    username_to_entryid, msgvec))
 			return ecError;
 		finalvec.insert(finalvec.end(), std::make_move_iterator(msgvec.begin()), std::make_move_iterator(msgvec.end()));
@@ -2766,7 +2761,7 @@ ec_error_t oxcical_import_multi(const ical &pical,
 		if (strcasecmp(pvalue, "PUBLISH") == 0) {
 			if (uid_list.size() > 1) {
 				if (!oxcical_import_events(calendartype, pical,
-				    uid_list, alloc, std::move(get_propids),
+				    uid_list, alloc, get_propids,
 				    username_to_entryid, msgvec))
 					return ecError;
 				finalvec.insert(finalvec.end(), std::make_move_iterator(msgvec.begin()), std::make_move_iterator(msgvec.end()));
@@ -2812,7 +2807,7 @@ ec_error_t oxcical_import_multi(const ical &pical,
 		return ecr;
 	auto err = oxcical_import_internal(pvalue, b_proposal,
 	           calendartype, pical, uid_list.begin()->second, alloc,
-	           std::move(get_propids), username_to_entryid, pmsg,
+	           get_propids, username_to_entryid, pmsg,
 	           nullptr, nullptr, nullptr, nullptr);
 	if (err != nullptr) {
 		mlog(LV_ERR, "%s", err);
@@ -2830,12 +2825,10 @@ ec_error_t oxcical_import_multi(const ical &pical,
  * item, the message_content object will be a blank IPM.Note with embedded
  * message attachments (IPM.Appointment).
  */
-message_ptr oxcical_import_single(const ical &pical, EXT_BUFFER_ALLOC alloc, GET_PROPIDS get_propids,
-    USERNAME_TO_ENTRYID username_to_entryid)
+message_ptr oxcical_converter::ical_to_mapi_single(const ical &pical)
 {
 	std::vector<message_ptr> vec;
-	if (oxcical_import_multi(pical, alloc, std::move(get_propids),
-	    username_to_entryid, vec) != ecSuccess || vec.size() == 0)
+	if (ical_to_mapi_multi(pical, vec) != ecSuccess || vec.size() == 0)
 		return nullptr;
 	if (vec.size() == 1)
 		return std::move(vec.front());
@@ -3348,7 +3341,7 @@ static void oxcical_export_organizer(const MESSAGE_CONTENT &msg,
 			str = msg.proplist.get<char>(PR_SENT_REPRESENTING_EMAIL_ADDRESS);
 			if (str != nullptr) {
 				auto ret = cvt_essdn_to_username(str, org_name,
-				           std::move(id2user), buf);
+				           id2user, buf);
 				str = ret == ecSuccess ? buf.c_str() : nullptr;
 			}
 		}
@@ -3620,8 +3613,8 @@ static std::string oxcical_export_valarm(const MESSAGE_CONTENT &msg,
 }
 
 static std::string oxcical_export_internal(const char *method, const char *tzid,
-    const MESSAGE_CONTENT *pmsg, const char *log_id, ical &pical,
-    const char *org_name, cvt_id2user id2user, EXT_BUFFER_ALLOC alloc,
+    const message_content &msg, const std::string &log_id_s, ical &pical,
+    const std::string &org_name_s, cvt_id2user id2user, EXT_BUFFER_ALLOC alloc,
     GET_PROPIDS get_propids) try
 {
 	const PROPERTY_NAME namequeries[] = {
@@ -3664,6 +3657,10 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 	const PROPNAME_ARRAY pna = {std::size(namequeries), deconst(namequeries)};
 	if (!get_propids(&pna, &propids) || propids.size() != pna.size())
 		return E_2201;
+
+	auto pmsg = &msg;
+	auto log_id = log_id_s.c_str();
+	auto org_name = org_name_s.c_str();
 
 	auto num = pmsg->proplist.get<const uint32_t>(PR_MESSAGE_LOCALE_ID);
 	auto planguage = num != nullptr ? lcid_to_ltag(*num) : nullptr;
@@ -3851,12 +3848,10 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		if (!oxcical_export_rrule(ptz_component, *pcomponent, &apprecurr))
 			return "E-2212: export_rrule - unspecified error";
 		if (oxcical_check_exdate(&apprecurr) &&
-		    !oxcical_export_exdate(tzid, b_allday && g_oxcical_allday_ymd,
-		    *pcomponent, &apprecurr))
+		    !oxcical_export_exdate(tzid, b_allday, *pcomponent, &apprecurr))
 			return "E-2213: export_exdate - unspecified error";
 		if (oxcical_check_rdate(&apprecurr) &&
-		    !oxcical_export_rdate(tzid, b_allday && g_oxcical_allday_ymd,
-		    *pcomponent, &apprecurr))
+		    !oxcical_export_rdate(tzid, b_allday, *pcomponent, &apprecurr))
 			return "E-2214: export_rdate - unspecified error";
 	}
 
@@ -3866,8 +3861,7 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 
 	auto proptag_xrt = PROP_TAG(PT_SYSTIME, propids[l_replacetime]);
 	err = oxcical_export_recid(*pmsg, proptag_xrt, b_exceptional,
-	      b_allday && g_oxcical_allday_ymd, *pcomponent, ptz_component,
-	      tzid, alloc, get_propids);
+	      b_allday, *pcomponent, ptz_component, tzid, alloc, get_propids);
 	if (err != nullptr)
 		return err;
 
@@ -3888,7 +3882,7 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		 * possible to cause a itime.hour!=0 situation. When that
 		 * happens, the event is nudged forwards/backwards by OL.
 		 *
-		 * Since the HMS part is cut off anyway (g_oxical_allday_ymd),
+		 * Since the HHMMSS part of the input timestamp is cut off anyway,
 		 * only the hour>=12 case needs to be handled. To flip itime to
 		 * the next day, adding 12 hours should do for *Gromox*
 		 * (precise OL behavior was not investigated). If there is a
@@ -3897,12 +3891,11 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		 */
 		if (!ical_utc_to_datetime(ptz_component, start_time, &itime))
 			return "E-2002";
-		regravitate_allday = b_allday && g_oxcical_allday_ymd && itime.hour >= 12 ? 12 * 3600 : 0;
+		regravitate_allday = b_allday && itime.hour >= 12 ? 12 * 3600 : 0;
 		if (regravitate_allday != 0 && !ical_utc_to_datetime(ptz_component,
 		    start_time + regravitate_allday, &itime))
 			return "E-2271";
-		append_dt(*pcomponent, "DTSTART", itime,
-			b_allday && g_oxcical_allday_ymd,
+		append_dt(*pcomponent, "DTSTART", itime, b_allday,
 			ptz_component != nullptr ? tzid : nullptr);
 	} else {
 		lnum = pmsg->proplist.get<const uint64_t>(PROP_TAG(PT_SYSTIME, propids[l_taskstart]));
@@ -3910,12 +3903,11 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 			ical_time itime;
 			if (!ical_utc_to_datetime(ptz_component, rop_util_nttime_to_unix(*lnum), &itime))
 				return "E-2003";
-			regravitate_allday = b_allday && g_oxcical_allday_ymd && itime.hour >= 12 ? 12 * 3600 : 0;
+			regravitate_allday = b_allday && itime.hour >= 12 ? 12 * 3600 : 0;
 			if (regravitate_allday != 0 && !ical_utc_to_datetime(ptz_component,
 			    start_time + regravitate_allday, &itime))
 				return "E-2272";
-			append_dt(*pcomponent, "DTSTART", itime,
-				b_allday && g_oxcical_allday_ymd,
+			append_dt(*pcomponent, "DTSTART", itime, b_allday,
 				ptz_component != nullptr ? tzid : nullptr);
 		}
 	}
@@ -3924,8 +3916,7 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		ical_time itime;
 		if (!ical_utc_to_datetime(ptz_component, end_time + regravitate_allday, &itime))
 			return "E-2222";
-		append_dt(*pcomponent, "DTEND", itime,
-			b_allday && g_oxcical_allday_ymd,
+		append_dt(*pcomponent, "DTEND", itime, b_allday,
 			ptz_component != nullptr ? tzid : nullptr);
 	}
 
@@ -4023,32 +4014,29 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 				str = pembedded->proplist.get<char>(PR_MESSAGE_CLASS_A);
 			if (str == nullptr)
 				str = "IPM.Note";
-			if (class_match_prefix(str,
-			    "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}"))
+			if (class_match_prefix(str, IPM_Appointment_Exception))
 				continue;
 			if (!pembedded->proplist.has(proptag_xrt))
 				continue;
 			auto estr = oxcical_export_internal(method, tzid,
-			      pembedded, log_id, pical, org_name,
-			      id2user, alloc, get_propids);
+			            *pembedded, log_id, pical, org_name,
+			            id2user, alloc, get_propids);
 			if (estr.size() > 0)
 				return estr;
 		}
 	}
 
-	return oxcical_export_valarm(*pmsg, *pcomponent, std::move(get_propids));
+	return oxcical_export_valarm(*pmsg, *pcomponent, get_propids);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return "E-2097";
 }
 #undef E_2201
 
-bool oxcical_export(const MESSAGE_CONTENT *pmsg, const char *log_id, ical &pical,
-    const char *org_name, EXT_BUFFER_ALLOC alloc, GET_PROPIDS get_propids,
-    cvt_id2user id2user)
+bool oxcical_converter::mapi_to_ical(const message_content &msg, ical &pical)
 {
-	auto err = oxcical_export_internal(nullptr, nullptr, pmsg, log_id, pical,
-	           org_name, std::move(id2user), alloc, std::move(get_propids));
+	auto err = oxcical_export_internal(nullptr, nullptr, msg, log_id, pical,
+	           org_name, id2user, alloc, get_propids);
 	if (err.size() > 0) {
 		mlog(LV_ERR, "%s", err.c_str());
 		return false;

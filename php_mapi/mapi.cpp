@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -419,10 +419,6 @@ PHP_INI_END()
 
 static PHP_MINIT_FUNCTION(mapi)
 {
-	if (!rtf_init_library()) {
-		fprintf(stderr, "rtf_init_library failed\n");
-		return FAILURE;
-	}
 	le_mapi_session = zend_register_list_destructors_ex(
 		mapi_resource_dtor, NULL, name_mapi_session, module_number);
 	le_mapi_addressbook = zend_register_list_destructors_ex(
@@ -1624,7 +1620,7 @@ static ZEND_FUNCTION(mapi_table_queryallrows)
 	zval pzrowset, *pzresource, *pzproptags = nullptr, *pzrestriction = nullptr;
 	TARRAY_SET rowset;
 	MAPI_RESOURCE *ptable;
-	PROPTAG_ARRAY proptags, *pproptags = nullptr;
+	std::optional<std::vector<proptag_t>> pproptags;
 	RESTRICTION restriction, *prestriction = nullptr;
 	
 	ZVAL_NULL(&pzrowset);
@@ -1642,10 +1638,9 @@ static ZEND_FUNCTION(mapi_table_queryallrows)
 		prestriction = &restriction;
 	}
 	if (NULL != pzproptags) {
-		auto err = php_to_proptag_array(pzproptags, &proptags);
+		auto err = php_to_proptag_array(pzproptags, pproptags);
 		if (err != ecSuccess)
 			pthrow(err);
-		pproptags = &proptags;
 	}
 	auto result = zclient_queryrows(ptable->hsession, ptable->hobject, 0,
 	         INT32_MAX, prestriction, pproptags, &rowset);
@@ -1664,7 +1659,7 @@ static ZEND_FUNCTION(mapi_table_queryrows)
 	zval pzrowset, *pzresource, *pzproptags = nullptr;
 	TARRAY_SET rowset;
 	MAPI_RESOURCE *ptable;
-	PROPTAG_ARRAY proptags, *pproptags = nullptr;
+	std::optional<std::vector<proptag_t>> pproptags;
 	
 	ZVAL_NULL(&pzrowset);
 	zend_long start = UINT32_MAX, row_count = UINT32_MAX;
@@ -1675,11 +1670,11 @@ static ZEND_FUNCTION(mapi_table_queryrows)
 	ZEND_FETCH_RESOURCE(ptable, pzresource, le_mapi_table);
 	if (ptable->type != zs_objtype::table)
 		pthrow(ecInvalidObject);
+
 	if (NULL != pzproptags) {
-		auto err = php_to_proptag_array(pzproptags, &proptags);
+		auto err = php_to_proptag_array(pzproptags, pproptags);
 		if (err != ecSuccess)
 			pthrow(err);
-		pproptags = &proptags;
 	}
 	auto result = zclient_queryrows(ptable->hsession,
 			ptable->hobject, start, row_count, NULL,
@@ -1713,7 +1708,7 @@ static ZEND_FUNCTION(mapi_table_setcolumns)
 		pthrow(err);
 	auto result = zclient_setcolumns(
 		ptable->hsession, ptable->hobject,
-		&proptags, flags);
+		proptags, flags);
 	if (result != ecSuccess)
 		pthrow(result);
 	RETVAL_TRUE;
@@ -2393,7 +2388,7 @@ static ZEND_FUNCTION(mapi_copyto)
 	ZCL_MEMORY;
 	zend_long flags = 0;
 	zval *pzsrc, *pzdst, *pzexcludeiids, *pzexcludeprops;
-	PROPTAG_ARRAY exclude_proptags, *pexclude_proptags = nullptr;
+	PROPTAG_ARRAY exclude_proptags{};
 	
 	if (zend_parse_parameters(ZEND_NUM_ARGS(), "raar|l",
 		&pzsrc, &pzexcludeiids, &pzexcludeprops, &pzdst, &flags)
@@ -2411,15 +2406,14 @@ static ZEND_FUNCTION(mapi_copyto)
 		pthrow(ecInvalidObject);
 	else if (pdstobject == nullptr)
 		pthrow(ecInvalidParam);
-
-	if (pzexcludeprops != nullptr) {
-		auto err = php_to_proptag_array(pzexcludeprops, &exclude_proptags);
-		if (err != ecSuccess)
-			pthrow(err);
-		pexclude_proptags = &exclude_proptags;
-	}
+	if (pzexcludeprops == nullptr)
+		/* can't happen because parse_param always fills non-optional zvals */
+		pthrow(ecInvalidParam);
+	auto err = php_to_proptag_array(pzexcludeprops, &exclude_proptags);
+	if (err != ecSuccess)
+		pthrow(err);
 	auto result = zclient_copyto(psrcobject->hsession,
-				psrcobject->hobject, pexclude_proptags,
+				psrcobject->hobject, exclude_proptags,
 				pdstobject->hobject, flags);
 	if (result != ecSuccess)
 		pthrow(result);
@@ -2476,7 +2470,7 @@ static ZEND_FUNCTION(mapi_deleteprops)
 	if (err != ecSuccess)
 		pthrow(err);
 	auto result = zclient_deletepropvals(probject->hsession,
-	              probject->hobject, &proptags);
+	              probject->hobject, proptags);
 	if (result != ecSuccess)
 		pthrow(result);
 	RETVAL_TRUE;
@@ -2641,7 +2635,7 @@ static ZEND_FUNCTION(mapi_getprops)
 {
 	ZCL_MEMORY;
 	zval pzpropvals, *pzresource, *pztagarray = nullptr;
-	PROPTAG_ARRAY proptags, *pproptags = nullptr;
+	std::optional<std::vector<proptag_t>> pproptags;
 	TPROPVAL_ARRAY propvals;
 	
 	ZVAL_NULL(&pzpropvals);
@@ -2658,10 +2652,9 @@ static ZEND_FUNCTION(mapi_getprops)
 	else if (probject == nullptr)
 		pthrow(ecNotSupported);
 	if(NULL != pztagarray) {
-		auto err = php_to_proptag_array(pztagarray, &proptags);
+		auto err = php_to_proptag_array(pztagarray, pproptags);
 		if (err != ecSuccess)
 			pthrow(err);
-		pproptags = &proptags;
 	}
 	auto result = zclient_getpropvals(probject->hsession,
 				probject->hobject, pproptags, &propvals);
@@ -3729,6 +3722,8 @@ static ZEND_FUNCTION(mapi_inetmapi_imtomapi)
 				php_error_docref(nullptr, E_WARNING, "imtomapi: options array ought to use string keys");
 			else if (strcmp(key->val, "parse_smime_signed") == 0)
 				mxf_flags |= MXF_UNWRAP_SMIME_CLEARSIGNED;
+			else if (strcmp(key->val, "add_rcvd_timestamp") == 0)
+				mxf_flags |= MXF_ADD_RCVD_TIMESTAMP;
 			else
 				php_error_docref(nullptr, E_WARNING, "Unknown imtomapi option: \"%s\"", key->val);
 		} ZEND_HASH_FOREACH_END();

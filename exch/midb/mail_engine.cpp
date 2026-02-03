@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #	include "config.h"
@@ -15,7 +15,6 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
-#include <iconv.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -123,19 +122,19 @@ struct ct_node {
 
 	union {
 		char *ct_headers[2]{};
-		char *ct_keyword;
 		time_t ct_time;
 		size_t ct_size;
 		imap_seq_list *ct_seq;
 	};
+	std::string ct_keyword;
 };
 using CONDITION_TREE_NODE = ct_node;
 
 struct KEYWORD_ENUM {
-	MJSON *pjson;
-	BOOL b_result;
-	const char *charset;
-	const char *keyword;
+	MJSON *pjson = nullptr;
+	BOOL b_result = false;
+	const char *charset = nullptr;
+	const char *keyword = nullptr;
 };
 
 struct IDB_ITEM {
@@ -201,35 +200,12 @@ static std::string make_midb_path(const char *d)
 	return d + "/exmdb/midb.sqlite3"s;
 }
 
-static std::unique_ptr<char[]> me_ct_to_utf8(const char *charset,
-    const char *string) try
+static std::string me_ct_to_utf8(const char *charset, const char *string)
 {
-	int length;
-	iconv_t conv_id;
-	size_t in_len, out_len;
-
 	if (strcasecmp(charset, "UTF-8") == 0||
 	    strcasecmp(charset, "US-ASCII") == 0)
-		return std::unique_ptr<char[]>(strdup(string));
-	cset_cstr_compatible(charset);
-	length = strlen(string) + 1;
-	auto ret_string = std::make_unique<char[]>(2 * length);
-	conv_id = iconv_open("UTF-8", charset);
-	if (conv_id == (iconv_t)-1)
-		return NULL;
-	auto pin = deconst(string);
-	auto pout = ret_string.get();
-	in_len = length;
-	out_len = 2*length;
-	if (iconv(conv_id, &pin, &in_len, &pout, &out_len) == static_cast<size_t>(-1)) {
-		iconv_close(conv_id);
-		return NULL;
-	}
-	iconv_close(conv_id);
-	return ret_string;
-} catch (const std::bad_alloc &) {
-	mlog(LV_ERR, "E-1963: ENOMEM");
-	return nullptr;
+		return string;
+	return iconvtext(string, charset, "UTF-8");
 }
 
 static uint64_t me_get_digest(sqlite3 *psqlite, const char *mid_string,
@@ -313,11 +289,8 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 				temp_buff[begin_pos - last_pos] = '\0';
 				HX_strltrim(temp_buff);
 				auto tmp_string = me_ct_to_utf8(charset, temp_buff);
-				if (tmp_string == nullptr)
-					return NULL;
-				auto tmp_len = strlen(tmp_string.get());
-				memcpy(out_buff + offset, tmp_string.get(), tmp_len);
-				offset += tmp_len;
+				memcpy(&out_buff[offset], tmp_string.c_str(), tmp_string.size());
+				offset += tmp_string.size();
 				last_pos = i;
 			}
 		}
@@ -329,7 +302,7 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 			parse_mime_encode_string(in_buff + begin_pos, 
 				end_pos - begin_pos + 1, &encode_string);
 			auto tmp_len = strlen(encode_string.title);
-			std::unique_ptr<char[]> tmp_string;
+			std::string tmp_string;
 			if (strcasecmp(encode_string.encoding, "base64") == 0) {
 				size_t decode_len = 0;
 				decode64(encode_string.title, tmp_len,
@@ -346,11 +319,8 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 			} else {
 				tmp_string = me_ct_to_utf8(charset, encode_string.title);
 			}
-			if (tmp_string == nullptr)
-				return NULL;
-			tmp_len = strlen(tmp_string.get());
-			memcpy(out_buff + offset, tmp_string.get(), tmp_len);
-			offset += tmp_len;
+			memcpy(&out_buff[offset], tmp_string.c_str(), tmp_string.size());
+			offset += tmp_string.size();
 			
 			last_pos = end_pos + 1;
 			i = end_pos;
@@ -361,11 +331,8 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 	}
 	if (i > last_pos) {
 		auto tmp_string = me_ct_to_utf8(charset, &in_buff[last_pos]);
-		if (tmp_string == nullptr)
-			return NULL;
-		auto tmp_len = strlen(tmp_string.get());
-		memcpy(out_buff + offset, tmp_string.get(), tmp_len);
-		offset += tmp_len;
+		memcpy(&out_buff[offset], tmp_string.c_str(), tmp_string.size());
+		offset += tmp_string.size();
 	} 
 	out_buff[offset] = '\0';
 	return ret_string;
@@ -410,7 +377,7 @@ static void me_ct_enum_mime(MJSON_MIME *pmime, void *param) try
 	auto charset = pmime->get_charset();
 	auto rs = me_ct_to_utf8(*charset != '\0' ?
 	          charset : penum->charset, content.c_str());
-	if (rs != nullptr && strcasestr(rs.get(), penum->keyword) != nullptr)
+	if (strcasestr(rs.c_str(), penum->keyword) != nullptr)
 		penum->b_result = TRUE;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1970: ENOMEM");
@@ -423,8 +390,7 @@ static bool me_ct_search_head(const char *charset, const char *mid_string,
 	if (!exmdb_client->imapfile_read(cu_get_maildir(), "eml",
 	    mid_string, &content))
 		return false;
-	vmime::parsingContext vpctx;
-	vpctx.setInternationalizedEmailSupport(true); /* RFC 6532 */
+	auto vpctx = vmail_default_parsectx();
 	vmime::header hdr;
 	hdr.parse(vpctx, content);
 
@@ -533,7 +499,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 				keyword_enum.pjson = &temp_mjson;
 				keyword_enum.b_result = FALSE;
 				keyword_enum.charset = charset;
-				keyword_enum.keyword = ptree_node->ct_keyword;
+				keyword_enum.keyword = ptree_node->ct_keyword.c_str();
 				temp_mjson.enum_mime(me_ct_enum_mime, &keyword_enum);
 				if (keyword_enum.b_result)
 					b_result1 = true;
@@ -552,7 +518,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 				temp_buff1[temp_len] = '\0';
 				auto rs = me_ct_decode_mime(charset, temp_buff1);
 				if (rs != nullptr && strcasestr(rs.get(),
-				    ptree_node->ct_keyword) != nullptr)
+				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
 				break;
 			}
@@ -596,7 +562,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 				temp_buff1[temp_len] = '\0';
 				auto rs = me_ct_decode_mime(charset, temp_buff1);
 				if (rs != nullptr && strcasestr(rs.get(),
-				    ptree_node->ct_keyword) != nullptr)
+				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
 				break;
 			}
@@ -734,7 +700,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 				temp_buff1[temp_len] = '\0';
 				auto rs = me_ct_decode_mime(charset, temp_buff1);
 				if (rs != nullptr && strcasestr(rs.get(),
-				    ptree_node->ct_keyword) != nullptr)
+				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
 				break;
 			}
@@ -750,7 +716,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 					temp_buff1[temp_len] = '\0';
 					auto rs = me_ct_decode_mime(charset, temp_buff1);
 					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword) != nullptr)
+					    ptree_node->ct_keyword.c_str()) != nullptr)
 						b_result1 = true;
 				}
 				if (b_result1)
@@ -761,7 +727,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 					temp_buff1[temp_len] = '\0';
 					auto rs = me_ct_decode_mime(charset, temp_buff1);
 					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword) != nullptr)
+					    ptree_node->ct_keyword.c_str()) != nullptr)
 						b_result1 = true;
 				}
 				if (b_result1)
@@ -772,7 +738,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 					temp_buff1[temp_len] = '\0';
 					auto rs = me_ct_decode_mime(charset, temp_buff1);
 					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword) != nullptr)
+					    ptree_node->ct_keyword.c_str()) != nullptr)
 						b_result1 = true;
 				}
 				if (b_result1)
@@ -783,7 +749,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 					temp_buff1[temp_len] = '\0';
 					auto rs = me_ct_decode_mime(charset, temp_buff1);
 					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword) != nullptr)
+					    ptree_node->ct_keyword.c_str()) != nullptr)
 						b_result1 = true;
 				}
 				if (b_result1)
@@ -797,7 +763,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 				keyword_enum.pjson = &temp_mjson;
 				keyword_enum.b_result = FALSE;
 				keyword_enum.charset = charset;
-				keyword_enum.keyword = ptree_node->ct_keyword;
+				keyword_enum.keyword = ptree_node->ct_keyword.c_str();
 				temp_mjson.enum_mime(me_ct_enum_mime, &keyword_enum);
 				if (keyword_enum.b_result)
 					b_result1 = true;
@@ -816,7 +782,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 				temp_buff1[temp_len] = '\0';
 				auto rs = me_ct_decode_mime(charset, temp_buff1);
 				if (rs != nullptr && strcasestr(rs.get(),
-				    ptree_node->ct_keyword) != nullptr)
+				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
 				break;
 			}
@@ -985,8 +951,7 @@ ct_node::ct_node(ct_node &&o) :
 		o.ct_seq = nullptr;
 		break;
 	case midb_cond::bcc ... midb_cond::unkeyword:
-		ct_keyword = o.ct_keyword;
-		o.ct_keyword = nullptr;
+		ct_keyword = std::move(o.ct_keyword);
 		break;
 	case midb_cond::header:
 		ct_headers[0] = o.ct_headers[0];
@@ -1010,9 +975,6 @@ ct_node::~ct_node()
 	if (pbranch != nullptr)
 		return;
 	switch (condition) {
-	case midb_cond::bcc ... midb_cond::unkeyword:
-		free(ct_keyword);
-		break;
 	case midb_cond::id ... midb_cond::uid:
 		delete ct_seq;
 		break;
@@ -1103,9 +1065,7 @@ static std::unique_ptr<CONDITION_TREE> me_ct_build_internal(const char *charset,
 			i ++;
 			if (i + 1 > argc)
 				return {};
-			ptree_node->ct_keyword = me_ct_to_utf8(charset, argv[i]).release();
-			if (ptree_node->ct_keyword == nullptr)
-				return {};
+			ptree_node->ct_keyword = me_ct_to_utf8(charset, argv[i]);
 		} else if (array_find_istr(kwlist2, argv[i])) {
 			if (i + 1 > argc)
 				return {};
@@ -1368,9 +1328,12 @@ static void me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 		}
 		auto log_id = dir + ":m"s + std::to_string(message_id);
 		MAIL imail;
-		if (!oxcmail_export(pmsgctnt, log_id.c_str(), false,
-		    oxcmail_body::plain_and_html, &imail, cu_alloc_bytes,
-		    cu_get_propids, cu_get_propname)) {
+		oxcmail_converter cvt;
+		cvt.log_id = log_id.c_str();
+		cvt.alloc = cu_alloc_bytes;
+		cvt.get_propids = cu_get_propids;
+		cvt.get_propname = cu_get_propname;
+		if (!cvt.mapi_to_inet(*pmsgctnt, imail)) {
 			mlog(LV_ERR, "E-1222: oxcmail_export %s failed", log_id.c_str());
 			cu_switch_allocator();
 			return;
@@ -1490,9 +1453,8 @@ static BOOL me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id) try
 			PR_MESSAGE_DELIVERY_TIME, PidTagMidString, PR_FLAG_STATUS,
 			PR_ICON_INDEX,
 		};
-		static constexpr PROPTAG_ARRAY proptags_1 = {std::size(proptags_0), deconst(proptags_0)};
 		if (!exmdb_client->query_table(dir, nullptr, CP_ACP, table_id,
-		    &proptags_1, 0, row_count, &rows))
+		    proptags_0, 0, row_count, &rows))
 			return false;
 	}
 
@@ -1683,10 +1645,9 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 	static constexpr proptag_t proptag_buff[] =
 		{PidTagFolderId, PidTagParentFolderId, PR_ATTR_HIDDEN,
 		PR_CONTAINER_CLASS, PR_DISPLAY_NAME, PR_LOCAL_COMMIT_TIME_MAX};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(proptag_buff), deconst(proptag_buff)};
 	TARRAY_SET rows{};
 	if (!exmdb_client->query_table(dir, NULL,
-	    CP_ACP, table_id, &proptags, 0, row_count, &rows)) {
+	    CP_ACP, table_id, proptag_buff, 0, row_count, &rows)) {
 		exmdb_client->unload_table(dir, table_id);
 		return FALSE;
 	}
@@ -2172,13 +2133,14 @@ static int me_minst(int argc, char **argv, int sockd) try
 	unsigned int user_id = 0;
 	if (!mysql_adaptor_get_user_ids(pidb->username.c_str(), &user_id, nullptr, nullptr))
 		return MIDB_E_SSGETID;
-	auto pmsgctnt = oxcmail_import(&imail,
-	                cu_alloc_bytes, cu_get_propids_create);
+	oxcmail_converter cvt;
+	cvt.alloc = cu_alloc_bytes;
+	cvt.get_propids = cu_get_propids_create;
+	auto pmsgctnt = cvt.inet_to_mapi(imail);
 	imail.clear();
 	pbuff.clear();
 	if (pmsgctnt == nullptr)
 		return MIDB_E_OXCMAIL_IMPORT;
-	auto cl_msg = HX::make_scope_exit([&]() { message_content_free(pmsgctnt); });
 	auto nt_time = rop_util_unix_to_nttime(strtol(argv[5], nullptr, 0));
 	if (pmsgctnt->proplist.set(PR_MESSAGE_DELIVERY_TIME, &nt_time) != ecSuccess)
 		return MIDB_E_NO_MEMORY;
@@ -2242,7 +2204,7 @@ static int me_minst(int argc, char **argv, int sockd) try
 	ec_error_t e_result = ecRpcFailed;
 	uint64_t outmid = 0, outcn = 0;
 	if (!exmdb_client->write_message(argv[1], CP_ACP,
-	    rop_util_make_eid_ex(1, folder_id), pmsgctnt, djson.c_str(),
+	    rop_util_make_eid_ex(1, folder_id), pmsgctnt.get(), djson.c_str(),
 	    &outmid, &outcn, &e_result) || e_result != ecSuccess)
 		return MIDB_E_MDB_WRITEMESSAGE;
 	return cmd_write(sockd, "TRUE\r\n");
@@ -2487,10 +2449,9 @@ static int me_mrenf(int argc, char **argv, int sockd)
 	if (!exmdb_client->allocate_cn(argv[1], &change_num))
 		return MIDB_E_MDB_ALLOCID;
 	static constexpr proptag_t tmp_proptag[] = {PR_PREDECESSOR_CHANGE_LIST};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
 	TPROPVAL_ARRAY propvals;
 	if (!exmdb_client->get_folder_properties(argv[1], CP_ACP,
-	    rop_util_make_eid_ex(1, folder_id), &proptags, &propvals))
+	    rop_util_make_eid_ex(1, folder_id), tmp_proptag, &propvals))
 		return MIDB_E_MDB_GETFOLDERPROPS;
 	auto pbin1 = propvals.get<BINARY>(PR_PREDECESSOR_CHANGE_LIST);
 
@@ -2695,7 +2656,7 @@ static int me_pfddt(int argc, char **argv, int sockd)
 	size_t recents = pstmt.step() == SQLITE_ROW ? pstmt.col_uint64(0) : 0;
 	pstmt.finalize();
 	pidb.reset();
-	auto temp_len = snprintf(temp_buff, std::size(temp_buff), "TRUE %zu %zu %zu %llu %llu\r\n",
+	auto temp_len = gx_snprintf(temp_buff, std::size(temp_buff), "TRUE %zu %zu %zu %llu %llu\r\n",
 	                total, recents, unreads, LLU{folder_id},
 	                LLU{uidnext + 1});
 	return cmd_write(sockd, temp_buff, temp_len);
@@ -3157,10 +3118,9 @@ static int me_psflg(int argc, char **argv, int sockd) try
 
 	if (set_unsent) {
 		static constexpr proptag_t tmp_proptag[] = {PR_MESSAGE_FLAGS};
-		static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
 		if (!exmdb_client->get_message_properties(argv[1], NULL,
 		    CP_ACP, rop_util_make_eid_ex(1, message_id),
-		    &proptags, &propvals) || propvals.count == 0)
+		    tmp_proptag, &propvals) || propvals.count == 0)
 			return MIDB_E_MDB_GETMSGPROPS;
 		auto message_flags = *static_cast<uint32_t *>(propvals.ppropval[0].pvalue);
 		if (!(message_flags & MSGFLAG_UNSENT)) {
@@ -3217,7 +3177,6 @@ static int me_prflg(int argc, char **argv, int sockd) try
 	uint64_t read_cn;
 	uint64_t message_id;
 	PROBLEM_ARRAY problems;
-	TPROPVAL_ARRAY propvals;
 
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -3259,10 +3218,10 @@ static int me_prflg(int argc, char **argv, int sockd) try
 
 	if (set_unsent) {
 		static constexpr proptag_t tmp_proptag[] = {PR_MESSAGE_FLAGS};
-		static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
+		TPROPVAL_ARRAY propvals{};
 		if (!exmdb_client->get_message_properties(argv[1], nullptr,
 		    CP_ACP, rop_util_make_eid_ex(1, message_id),
-		    &proptags, &propvals) || propvals.count == 0)
+		    tmp_proptag, &propvals) || propvals.count == 0)
 			return MIDB_E_MDB_GETMSGPROPS;
 		auto message_flags = *static_cast<uint32_t *>(propvals.ppropval[0].pvalue);
 		if (message_flags & MSGFLAG_UNSENT) {
@@ -3276,16 +3235,15 @@ static int me_prflg(int argc, char **argv, int sockd) try
 	}
 	if (set_answered || set_forwarded) {
 		static constexpr proptag_t proptags_1[] = {PR_ICON_INDEX};
-		static constexpr PROPTAG_ARRAY proptags = {std::size(proptags_1), deconst(proptags_1)};
 		TPROPVAL_ARRAY propvals{};
 		if (exmdb_client->get_message_properties(argv[1], nullptr,
 		    CP_ACP, rop_util_make_eid_ex(1, message_id),
-		    &proptags, &propvals)) {
+		    proptags_1, &propvals)) {
 			uint32_t testfor = set_answered ? MAIL_ICON_REPLIED : MAIL_ICON_FORWARDED;
 			auto icon = propvals.get<const uint32_t>(PR_ICON_INDEX);
 			if (icon != nullptr && *icon == testfor)
 				if (!exmdb_client->remove_message_properties(argv[1], CP_ACP,
-				    rop_util_make_eid_ex(1, message_id), &proptags))
+				    rop_util_make_eid_ex(1, message_id), proptags_1))
 					/* ignore */;
 		}
 	}
@@ -3293,9 +3251,8 @@ static int me_prflg(int argc, char **argv, int sockd) try
 		static constexpr proptag_t tags[] = {
 			PR_FLAG_STATUS, PR_FOLLOWUP_ICON, PR_TODO_ITEM_FLAGS,
 		};
-		static constexpr PROPTAG_ARRAY ta = {std::size(tags), deconst(tags)};
 		if (!exmdb_client->remove_message_properties(argv[1], CP_ACP,
-		    rop_util_make_eid_ex(1, message_id), &ta))
+		    rop_util_make_eid_ex(1, message_id), tags))
 			return MIDB_E_MDB_SETMSGPROPS;
 	}
 	if (set_seen && !exmdb_client->set_message_read_state(argv[1], nullptr,
@@ -3589,11 +3546,10 @@ static void notif_msg_added(IDB_ITEM *pidb,
 		{PR_MESSAGE_DELIVERY_TIME, PR_LAST_MODIFICATION_TIME,
 		PidTagMidString, PR_MESSAGE_FLAGS, PR_FLAG_STATUS,
 		PR_ICON_INDEX};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptags), deconst(tmp_proptags)};
 	TPROPVAL_ARRAY propvals;
 	if (!exmdb_client->get_message_properties(cu_get_maildir(),
 	    nullptr, CP_ACP, rop_util_make_eid_ex(1, message_id),
-	    &proptags, &propvals))
+	    tmp_proptags, &propvals))
 		return;		
 
 	auto lnum = propvals.get<const uint64_t>(PR_LAST_MODIFICATION_TIME);
@@ -3705,12 +3661,11 @@ static BOOL notif_folder_added(IDB_ITEM *pidb,
 	static constexpr proptag_t tmp_proptags[] =
 		{PR_DISPLAY_NAME, PR_LOCAL_COMMIT_TIME_MAX, PR_CONTAINER_CLASS,
 		PR_ATTR_HIDDEN};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptags), deconst(tmp_proptags)};
 	bool b_waited = false;
  REQUERY_FOLDER:
 	TPROPVAL_ARRAY propvals{};
 	if (!exmdb_client->get_folder_properties(cu_get_maildir(), CP_ACP,
-	    rop_util_make_eid_ex(1, folder_id), &proptags, &propvals))
+	    rop_util_make_eid_ex(1, folder_id), tmp_proptags, &propvals))
 		return FALSE;		
 	auto flag = propvals.get<const uint8_t>(PR_ATTR_HIDDEN);
 	if (flag != nullptr && *flag != 0)
@@ -3815,11 +3770,10 @@ static void notif_folder_moved(IDB_ITEM *pidb,
 		decoded_name = znul(pstmt.col_text(0));
 		pstmt.finalize();
 	}
-	static constexpr proptag_t tmp_proptag[] = {PR_DISPLAY_NAME};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
+	static constexpr proptag_t tmp_proptags[] = {PR_DISPLAY_NAME};
 	TPROPVAL_ARRAY propvals;
 	if (!exmdb_client->get_folder_properties(cu_get_maildir(), CP_ACP,
-	    rop_util_make_eid_ex(1, folder_id), &proptags, &propvals))
+	    rop_util_make_eid_ex(1, folder_id), tmp_proptags, &propvals))
 		return;		
 
 	auto str = propvals.get<const char>(PR_DISPLAY_NAME);
@@ -3862,11 +3816,10 @@ static void notif_folder_modified(IDB_ITEM *pidb,
 	uint64_t parent_fid = pstmt.col_uint64(1);
 	pstmt.finalize();
 
-	static constexpr proptag_t tmp_proptag[] = {PR_DISPLAY_NAME};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptag), deconst(tmp_proptag)};
+	static constexpr proptag_t tmp_proptags[] = {PR_DISPLAY_NAME};
 	TPROPVAL_ARRAY propvals;
 	if (!exmdb_client->get_folder_properties(cu_get_maildir(), CP_ACP,
-	    rop_util_make_eid_ex(1, folder_id), &proptags, &propvals))
+	    rop_util_make_eid_ex(1, folder_id), tmp_proptags, &propvals))
 		return;		
 	auto str = propvals.get<const char>(PR_DISPLAY_NAME);
 	if (str == nullptr)
@@ -3910,10 +3863,9 @@ static void notif_msg_modified(IDB_ITEM *pidb, uint64_t folder_id,
 		PR_MESSAGE_FLAGS, PR_LAST_MODIFICATION_TIME, PidTagMidString,
 		PR_FLAG_STATUS, PR_ICON_INDEX,
 	};
-	static constexpr PROPTAG_ARRAY proptags = {std::size(tmp_proptags), deconst(tmp_proptags)};
 	if (!exmdb_client->get_message_properties(cu_get_maildir(),
 	    nullptr, CP_ACP, rop_util_make_eid_ex(1, message_id),
-	    &proptags, &propvals))
+	    tmp_proptags, &propvals))
 		return;	
 	auto num = propvals.get<const uint32_t>(PR_MESSAGE_FLAGS);
 	auto message_flags = num != nullptr ? *num : 0;

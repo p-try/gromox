@@ -11,6 +11,7 @@
 #include <gromox/exmdb_client.hpp>
 #include <gromox/exmdb_rpc.hpp>
 #include <gromox/hook_common.h>
+#include <gromox/mail_func.hpp>
 #include <gromox/mysql_adaptor.hpp>
 #include <gromox/oxcmail.hpp>
 #include <gromox/util.hpp>
@@ -44,9 +45,8 @@ void auto_response_reply(const char *user_home,
 		return;
 
 	static constexpr proptag_t tags_1[] = {PR_OOF_STATE};
-	static constexpr PROPTAG_ARRAY tags_1r = {std::size(tags_1), deconst(tags_1)};
 	TPROPVAL_ARRAY store_props;
-	if (!exmdb_client->get_store_properties(user_home, CP_UTF8, &tags_1r, &store_props)) {
+	if (!exmdb_client->get_store_properties(user_home, CP_UTF8, tags_1, &store_props)) {
 		mlog(LV_ERR, "get_store_properties %s failed", user_home);
 		return;
 	}
@@ -66,10 +66,9 @@ void auto_response_reply(const char *user_home,
 		PR_EC_ALLOW_EXTERNAL, PR_EC_EXTERNAL_AUDIENCE,
 		PR_EC_EXTERNAL_SUBJECT, PR_EC_EXTERNAL_REPLY,
 	};
-	static constexpr PROPTAG_ARRAY tags_2r = {std::size(tags_2), deconst(tags_2)};
 	TPROPVAL_ARRAY ar_props;
 	if (!exmdb_client->autoreply_getprop(user_home, CP_UTF8,
-	    &tags_2r, &ar_props)) {
+	    tags_2, &ar_props)) {
 		mlog(LV_ERR, "autoreply_getprop %s failed", user_home);
 		return;
 	}
@@ -90,8 +89,7 @@ void auto_response_reply(const char *user_home,
 
 	auto subject_text = znul(ar_props.get<const char>(same_org ? PR_EC_OUTOFOFFICE_SUBJECT : PR_EC_EXTERNAL_SUBJECT));
 	auto message_text = znul(ar_props.get<const char>(same_org ? PR_EC_OUTOFOFFICE_MSG : PR_EC_EXTERNAL_REPLY));
-	vmime::parsingContext vpctx;
-	vpctx.setInternationalizedEmailSupport(true); /* RFC 6532 */
+	auto vpctx = vmail_default_parsectx();
 	vmime::message vmsg;
 
 	auto hdr = vmsg.getHeader();

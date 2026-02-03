@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2022–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2022–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #	include "config.h"
@@ -50,9 +50,7 @@ static std::shared_ptr<config_file> g_config_file;
 static const char *g_username;
 static unsigned int g_export_mode = EXPORT_MAIL, g_mlog_level = MLOG_DEFAULT_LEVEL;
 static unsigned int g_recursive, g_associated, g_splice;
-static int g_allday_mode = -1;
 static constexpr HXoption g_options_table[] = {
-	{nullptr, 'Y', HXTYPE_INT, &g_allday_mode, nullptr, nullptr, 0, "Allday emission mode (default=-1, YMDHMS=0, YMD=1)"},
 	{nullptr, 'a', HXTYPE_NONE, &g_associated, nullptr, nullptr, 0, "Include Associated Messages (FAI) in the export"},
 	{nullptr, 'p', HXTYPE_NONE | HXOPT_INC, &g_show_props, nullptr, nullptr, 0, "Show properties in detail (if -t)"},
 	{nullptr, 'r', HXTYPE_NONE, &g_recursive, {}, {}, 0, "Export folders recursively"},
@@ -164,9 +162,12 @@ static int fetch_message(const char *idstr, std::string &log_id, eid_t &msg_id,
 static int emit_message_im(const message_content &ctnt, const std::string &log_id)
 {
 	MAIL imail;
-	if (!oxcmail_export(&ctnt, log_id.c_str(), false, oxcmail_body::plain_and_html,
-	    &imail, zalloc, cu_get_propids,
-	    cu_get_propname)) {
+	oxcmail_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.alloc = zalloc;
+	cvt.get_propids = cu_get_propids;
+	cvt.get_propname = cu_get_propname;
+	if (!cvt.mapi_to_inet(ctnt, imail)) {
 		fprintf(stderr, "oxcmail_export failed for an unspecified reason.\n");
 		return -1;
 	}
@@ -297,9 +298,14 @@ static int emit_message_gxmt(const message_content &ctnt,
 static int emit_message_ical(const message_content &ctnt, const std::string &log_id)
 {
 	ical ic;
-	if (!oxcical_export(&ctnt, log_id.c_str(), ic,
-	    g_config_file->get_value("x500_org_name"),
-	    zalloc, cu_get_propids, mysql_adaptor_userid_to_name)) {
+	oxcical_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.org_name = g_config_file->get_value("x500_org_name");
+	cvt.alloc = zalloc;
+	cvt.get_propids = cu_get_propids;
+	cvt.id2user = mysql_adaptor_userid_to_name;
+
+	if (!cvt.mapi_to_ical(ctnt, ic)) {
 		fprintf(stderr, "oxcical_export failed for an unspecified reason.\n");
 		return -1;
 	}
@@ -315,8 +321,11 @@ static int emit_message_ical(const message_content &ctnt, const std::string &log
 
 static int emit_message_vcard(const message_content &ctnt, const std::string &log_id)
 {
+	oxvcard_converter cvt;
+	cvt.log_id = log_id.c_str();
+	cvt.get_propids = cu_get_propids;
 	vcard vc;
-	if (!oxvcard_export(&ctnt, log_id.c_str(), vc, cu_get_propids)) {
+	if (!cvt.mapi_to_vcard(ctnt, vc)) {
 		fprintf(stderr, "oxvcard_export %s failed for an unspecified reason.\n", log_id.c_str());
 		return -1;
 	}
@@ -378,7 +387,7 @@ static int do_folder(eid_t folder_id, const parent_desc &pd)
 
 	TPROPVAL_ARRAY fld_propvals{};
 	if (!exmdb_client->get_folder_properties(g_storedir, CP_UTF8,
-	    folder_id, &ptall, &fld_propvals)) {
+	    folder_id, ptall, &fld_propvals)) {
 		fprintf(stderr, "get_folder_properties: RPC failed\n");
 		return -1;
 	}
@@ -522,12 +531,11 @@ int main(int argc, char **argv) try
 			"You probably wanted to redirect output into a file or pipe.\n");
 		return EXIT_FAILURE;
 	}
-	if (g_allday_mode >= 0)
-		g_oxcical_allday_ymd = g_allday_mode;
 	mlog_init(nullptr, nullptr, g_mlog_level, nullptr);
+	setup_utf8_locale();
 	if (iconv_validate() != 0)
 		return EXIT_FAILURE;
-	textmaps_init(PKGDATADIR);
+	textmaps_init();
 	g_config_file = config_file_prg(nullptr, "midb.cfg",
 	                exm2eml_cfg_defaults);
 	if (g_config_file == nullptr) {

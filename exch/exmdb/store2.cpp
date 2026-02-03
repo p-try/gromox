@@ -138,12 +138,12 @@ int need_msg_perm_check(sqlite3 *db, const char *user, uint64_t fid)
 	return -1;
 }
 
-int have_delete_perm(sqlite3 *db, const char *user, uint64_t fid, uint64_t mid)
+int have_delete_perm(const db_conn &db, const char *user, uint64_t fid, uint64_t mid)
 {
 	if (user == STORE_OWNER_GRANTED)
 		return true;
 	uint32_t perms;
-	if (!cu_get_folder_permission(db, fid, user, &perms))
+	if (!cu_get_folder_permission(db.psqlite, fid, user, &perms))
 		return -1;
 	if (mid == 0)
 		/* Whether the folder itself may be deleted */
@@ -155,7 +155,7 @@ int have_delete_perm(sqlite3 *db, const char *user, uint64_t fid, uint64_t mid)
 	if (!(perms & frightsDeleteOwned))
 		return false;
 	BOOL owner = false;
-	if (!common_util_check_message_owner(db, mid, user, &owner))
+	if (!cu_msg_test_owner(db, mid, user, &owner))
 		return -1;
 	return !!owner;
 }
@@ -211,20 +211,20 @@ ec_error_t autoreply_make_oofstate(const char *dir, void *&outptr)
  * @fai_size:    Size that the caller should subtract from store size/FAI
  * @msg_count:   Indicator for the caller to update the folder commit time
  */
-static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
+static bool folder_purge_softdel(db_conn &db, cpid_t cpid,
     const char *username, uint64_t folder_id, unsigned int del_flags,
     bool *partial, uint64_t *normal_size, uint64_t *fai_size,
     uint32_t *msg_count, uint32_t *fld_count, mapitime_t cutoff,
     const db_base *dbase, db_conn::NOTIFQ &notifq)
 {
 	uint32_t folder_type = 0;
-	if (!common_util_get_folder_type(db->psqlite, folder_id, &folder_type))
+	if (!common_util_get_folder_type(db.psqlite, folder_id, &folder_type))
 		return false;
 	if (folder_type == FOLDER_SEARCH)
 		/* Search folders do not have real messages */
 		return true;
 
-	auto ret = need_msg_perm_check(db->psqlite, username, folder_id);
+	auto ret = need_msg_perm_check(db.psqlite, username, folder_id);
 	if (ret < 0)
 		return false;
 	auto b_check = ret > 0;
@@ -237,12 +237,18 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 		         "ON m.message_id=mp.message_id AND m.is_deleted=1 AND m.parent_fid=%llu AND "
 		         "mp.proptag=%u AND mp.propval<=%llu GROUP BY m.is_associated",
 		         LLU{folder_id}, PR_LAST_MODIFICATION_TIME, LLU{cutoff});
-		if (gx_sql_exec(db->psqlite, qstr) != SQLITE_OK)
+		if (gx_sql_exec(db.psqlite, qstr) != SQLITE_OK)
 			return false;
-		auto stm = gx_sql_prep(db->psqlite, qstr);
+		auto stm = gx_sql_prep(db.psqlite, qstr);
 		if (stm == nullptr)
 			return false;
-		while (stm.step() == SQLITE_ROW) {
+		while (true) {
+			ret = stm.step();
+			if (ret == SQLITE_DONE)
+				break;
+			else if (ret != SQLITE_ROW)
+				return false;
+
 			auto assoc = stm.col_uint64(0);
 			auto count = stm.col_uint64(1);
 			auto size  = stm.col_uint64(2);
@@ -259,7 +265,7 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 		         "ON m.message_id=mp.message_id AND m.is_deleted=1 AND m.parent_fid=%llu AND "
 		         "mp.proptag=%u AND mp.propval<=%llu)",
 			 LLU{folder_id}, PR_LAST_MODIFICATION_TIME, LLU{cutoff});
-		if (gx_sql_exec(db->psqlite, qstr) != SQLITE_OK)
+		if (gx_sql_exec(db.psqlite, qstr) != SQLITE_OK)
 			return false;
 	} else {
 		char qstr[257];
@@ -268,12 +274,18 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 		         "ON m.message_id=mp.message_id AND m.is_deleted=1 AND m.parent_fid=%llu AND "
 		         "mp.proptag=%u AND mp.propval<=%llu",
 			 LLU{folder_id}, PR_LAST_MODIFICATION_TIME, LLU{cutoff});
-		auto stmt = gx_sql_prep(db->psqlite, qstr);
+		auto stmt = gx_sql_prep(db.psqlite, qstr);
 		if (stmt == nullptr)
 			return false;
-		while (stmt.step() == SQLITE_ROW) {
+		while (true) {
+			ret = stmt.step();
+			if (ret == SQLITE_DONE)
+				break;
+			else if (ret != SQLITE_ROW)
+				return false;
+
 			auto msgid = stmt.col_uint64(0);
-			ret = have_delete_perm(db->psqlite, username, folder_id, msgid);
+			ret = have_delete_perm(db, username, folder_id, msgid);
 			if (ret < 0)
 				return false;
 			if (ret == 0) {
@@ -288,7 +300,7 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 			else if (assoc && fai_size != nullptr)
 				*fai_size += stmt.col_uint64(1);
 			snprintf(qstr, sizeof(qstr), "DELETE FROM messages WHERE message_id=%llu", LLU{msgid});
-			if (gx_sql_exec(db->psqlite, qstr) != SQLITE_OK)
+			if (gx_sql_exec(db.psqlite, qstr) != SQLITE_OK)
 				return false;
 		}
 	}
@@ -299,10 +311,16 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 	char qstr[80];
 	snprintf(qstr, sizeof(qstr), "SELECT folder_id,"
 	         " is_deleted FROM folders WHERE parent_id=%llu", LLU{folder_id});
-	auto stm = gx_sql_prep(db->psqlite, qstr);
+	auto stm = gx_sql_prep(db.psqlite, qstr);
 	if (stm == nullptr)
 		return FALSE;
-	while (stm.step() == SQLITE_ROW) {
+	while (true) {
+		ret = stm.step();
+		if (ret == SQLITE_DONE)
+			break;
+		else if (ret != SQLITE_ROW)
+			return false;
+
 		auto subfld = stm.col_uint64(0);
 		bool sub_partial = false;
 		if (!folder_purge_softdel(db, cpid, username, subfld,
@@ -321,7 +339,7 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 		bool is_del = stm.col_int64(1);
 		if (!is_del)
 			continue;
-		ret = have_delete_perm(db->psqlite, username, subfld);
+		ret = have_delete_perm(db, username, subfld);
 		if (ret < 0)
 			return false;
 		if (ret == 0) {
@@ -332,9 +350,9 @@ static bool folder_purge_softdel(db_conn_ptr &db, cpid_t cpid,
 			++*fld_count;
 		snprintf(qstr, sizeof(qstr), "DELETE FROM folders "
 		         "WHERE folder_id=%llu", LLU{subfld});
-		if (gx_sql_exec(db->psqlite, qstr) != SQLITE_OK)
+		if (gx_sql_exec(db.psqlite, qstr) != SQLITE_OK)
 			return false;
-		db->notify_folder_deletion(folder_id, subfld, *dbase, notifq);
+		db.notify_folder_deletion(folder_id, subfld, *dbase, notifq);
 	}
 	return true;
 }
@@ -365,7 +383,7 @@ BOOL exmdb_server::purge_softdelete(const char *dir, const char *username,
 
 	auto dbase = db->lock_base_wr();
 	db_conn::NOTIFQ notifq;
-	if (!folder_purge_softdel(db, CP_ACP, username, fid_val, del_flags,
+	if (!folder_purge_softdel(*db, CP_ACP, username, fid_val, del_flags,
 	    &partial, &normal_size, &fai_size, &msg_count, &fld_count, cutoff,
 	    dbase.get(), notifq))
 		return false;
@@ -425,8 +443,14 @@ static bool purg_discover_ids(sqlite3 *db, const std::string &query,
 	auto stm = gx_sql_prep(db, query.c_str());
 	if (stm == nullptr)
 		return false;
-	while (stm.step() == SQLITE_ROW)
+	while (true) {
+		auto ret = stm.step();
+		if (ret == SQLITE_DONE)
+			break;
+		else if (ret != SQLITE_ROW)
+			return false;
 		used.push_back(stm.col_text(0));
+	}
 	return true;
 }
 
@@ -639,7 +663,6 @@ BOOL exmdb_server::autoreply_tsupdate(const char *dir, const char *peer) try
 static ec_error_t autoreply_getprop1(const char *dir,
     proptag_t proptag, void *&value)
 {
-	char subject[1024];
 	MIME_FIELD mime_field;
 	auto path = autoreply_fspath(dir, proptag);
 
@@ -685,10 +708,10 @@ static ec_error_t autoreply_getprop1(const char *dir,
 		size_t offset = 0;
 		while (auto parsed = parse_mime_field(&buf[offset], st.st_size - offset, &mime_field)) {
 			offset += parsed;
+			std::string subject;
 			if (strcasecmp(mime_field.name.c_str(), "Subject") == 0 &&
-			    mime_field.value.size() < sizeof(subject) &&
-			    mime_string_to_utf8("utf-8", mime_field.value.c_str(), subject, sizeof(subject))) {
-				value = common_util_dup(subject);
+			    mime_string_to_utf8(mime_field.value, subject)) {
+				value = common_util_dup(subject.c_str());
 				return value != nullptr ? ecSuccess : ecServerOOM;
 			}
 			if (buf[offset] == '\r' && buf[offset+1] == '\n')
@@ -729,13 +752,13 @@ static ec_error_t autoreply_getprop1(const char *dir,
 }
 
 BOOL exmdb_server::autoreply_getprop(const char *dir, cpid_t cpid,
-    const PROPTAG_ARRAY *pproptags, TPROPVAL_ARRAY *ppropvals) try
+    proptag_cspan pproptags, TPROPVAL_ARRAY *ppropvals) try
 {
 	ppropvals->count = 0;
-	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags->count);
+	ppropvals->ppropval = cu_alloc<TAGGED_PROPVAL>(pproptags.size());
 	if (ppropvals->ppropval == nullptr)
 		return false;
-	for (proptag_t tag : *pproptags) {
+	for (const auto tag : pproptags) {
 		void *value = nullptr;
 		auto err = autoreply_getprop1(dir, tag, value);
 		if (err == ecSuccess) {
@@ -795,77 +818,67 @@ static BOOL autoreply_setprop1(const char *dir, const TAGGED_PROPVAL &pv)
 	case PR_EC_EXTERNAL_REPLY: {
 		wrapfd fd = open(path.c_str(), O_RDONLY);
 		struct stat st{};
-		ssize_t buff_len = 0;
-		char *buf = nullptr;
+		std::string buf;
 
+		static constexpr char ct_hdr[] = "Content-Type: text/html; charset=\"utf-8\"\r\n\r\n";
 		if (fd.get() < 0 || fstat(fd.get(), &st) != 0) {
-			buff_len = strlen(static_cast<const char *>(pv.pvalue));
-			buf = cu_alloc<char>(buff_len + 256);
-			if (buf == nullptr)
-				return false;
-			buff_len = gx_snprintf(buf, buff_len + 256,
-				   "Content-Type: text/html; charset=\"utf-8\"\r\n\r\n%s",
-				   static_cast<const char *>(pv.pvalue));
+			buf = ct_hdr;
 		} else {
-			buff_len = st.st_size;
-			buf = cu_alloc<char>(buff_len + strlen(static_cast<const char *>(pv.pvalue)) + 1);
-			if (buf == nullptr || read(fd.get(), buf, buff_len) != buff_len)
+			buf.resize(st.st_size);
+			auto rdret = read(fd.get(), buf.data(), buf.size());
+			if (rdret < 0 || static_cast<size_t>(rdret) != buf.size())
 				return false;
-			buf[buff_len] = '\0';
-			auto token = strstr(buf, "\r\n\r\n");
-			if (token != nullptr) {
-				strcpy(&token[4], static_cast<const char *>(pv.pvalue));
-				buff_len = strlen(buf);
-			} else {
-				buff_len = sprintf(buf,
-					   "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\n\r\n%s",
-					   static_cast<const char *>(pv.pvalue));
-			}
+			auto token = buf.find("\r\n\r\n");
+			if (token != buf.npos)
+				buf.erase(token + 4);
+			else
+				buf = ct_hdr;
 		}
+		buf += static_cast<const char *>(pv.pvalue);
 		gromox::tmpfile tf;
 		auto fdw = tf.open_linkable((dir + "/config"s).c_str(), O_WRONLY, FMODE_PUBLIC);
-		if (fdw < 0 || HXio_fullwrite(fdw, buf, buff_len) != buff_len)
+		if (fdw < 0)
+			return false;
+		auto wrret = HXio_fullwrite(fdw, buf.c_str(), buf.size());
+		if (wrret < 0 || static_cast<size_t>(wrret) != buf.size())
 			return false;
 		return tf.link_to_overwrite(path.c_str()) == 0;
 	}
 	case PR_EC_OUTOFOFFICE_SUBJECT:
 	case PR_EC_EXTERNAL_SUBJECT: {
+		auto newsubj = static_cast<const char *>(pv.pvalue);
 		wrapfd fd = open(path.c_str(), O_RDONLY);
 		struct stat st{};
-		ssize_t buff_len = 0;
-		char *buf = nullptr;
+		std::string buf;
 
 		if (fd.get() < 0 || fstat(fd.get(), &st) != 0) {
-			buff_len = strlen(static_cast<const char *>(pv.pvalue));
-			buf = cu_alloc<char>(buff_len + 256);
-			if (buf == nullptr)
-				return false;
-			buff_len = sprintf(buf,
-				   "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\nSubject: %s\r\n\r\n",
-				   static_cast<const char *>(pv.pvalue));
+			buf = fmt::format(
+				   "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\nSubject: {}\r\n\r\n",
+				   newsubj);
 		} else {
-			buff_len = st.st_size;
-			buf = cu_alloc<char>(buff_len + strlen(static_cast<const char *>(pv.pvalue)) + 16);
-			if (buf == nullptr)
+			buf.resize(st.st_size);
+			auto rdret = read(fd.get(), buf.data(), buf.size());
+			if (rdret < 0 || static_cast<size_t>(rdret) != buf.size())
 				return false;
-			auto token = cu_alloc<char>(buff_len + 1);
-			if (token == nullptr ||
-			    read(fd.get(), token, buff_len) != buff_len)
-				return false;
-			token[buff_len] = '\0';
-			auto body = strstr(token, "\r\n\r\n");
-			if (body == nullptr)
-				buff_len = sprintf(buf,
-				           "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\nSubject: %s\r\n\r\n",
-				           static_cast<const char *>(pv.pvalue));
-			else
-				buff_len = sprintf(buf,
-				           "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\nSubject: %s%s",
-				           static_cast<const char *>(pv.pvalue), body);
+			auto marker = buf.find("\r\n\r\n");
+			if (marker == buf.npos) {
+				buf = fmt::format(
+				      "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\nSubject: {}\r\n\r\n",
+				      newsubj);
+			} else {
+				std::string_view body_sv(buf);
+				body_sv.remove_prefix(marker);
+				buf = fmt::format(
+				      "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\nSubject: {}{}",
+				      newsubj, body_sv);
+			}
 		}
 		gromox::tmpfile tf;
 		auto fdw = tf.open_linkable((dir + "/config"s).c_str(), O_WRONLY, FMODE_PUBLIC);
-		if (fdw < 0 || HXio_fullwrite(fdw, buf, buff_len) != buff_len)
+		if (fdw < 0)
+			return false;
+		auto wrret = HXio_fullwrite(fdw, buf.c_str(), buf.size());
+		if (wrret < 0 || static_cast<size_t>(wrret) != buf.size())
 			return false;
 		return tf.link_to_overwrite(path.c_str()) == 0;
 	}
