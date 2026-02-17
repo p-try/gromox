@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2023–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2023–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cstdint>
@@ -739,7 +739,8 @@ static ec_error_t op_copy_other(rxparam &par, const rule_node &rule,
 		return ecRpcFailed;
 	}
 	if (g_ruleproc_debug)
-		mlog(LV_DEBUG, "ruleproc: OP_COPY/MOVE to %s:%llxh", newdir, LLU{dst_fid});
+		mlog(LV_DEBUG, "ruleproc: OP_COPY/MOVE to %s:f%llxh:m%llxh",
+			newdir, LLU{dst_fid}, LLU{rop_util_get_gc_value(outmid)});
 	if (act_type != OP_MOVE)
 		return ecSuccess;
 
@@ -926,14 +927,17 @@ static ec_error_t mr_get_policy(const char *ev_to, mr_policy &pol)
 	auto &uprop = *props;
 	if (!mysql_adaptor_get_user_properties(ev_to, uprop))
 		return ecError;
+	auto value = uprop.get<uint32_t>(PR_DISPLAY_TYPE_EX);
+	pol.dtyp = value == nullptr ? 0 : *value & DTE_MASK_LOCAL;
 	auto flag = uprop.get<const uint8_t>(PR_SCHDINFO_DISALLOW_OVERLAPPING_APPTS);
-	pol.decline_overlap = flag != nullptr && *flag != 0;
+	if (flag != nullptr)
+		pol.decline_overlap = *flag != 0;
+	else
+		pol.decline_overlap = pol.dtyp == DT_ROOM || pol.dtyp == DT_EQUIPMENT;
 	flag = uprop.get<uint8_t>(PR_SCHDINFO_DISALLOW_RECURRING_APPTS);
 	pol.decline_recurring = flag != nullptr && *flag != 0;
-	auto value = uprop.get<uint32_t>(PR_EMS_AB_ROOM_CAPACITY);
+	value = uprop.get<uint32_t>(PR_EMS_AB_ROOM_CAPACITY);
 	pol.capacity = value != nullptr ? *value : 0;
-	value = uprop.get<uint32_t>(PR_DISPLAY_TYPE_EX);
-	pol.dtyp = value == nullptr ? 0 : *value & DTE_MASK_LOCAL;
 	flag = uprop.get<uint8_t>(PR_SCHDINFO_AUTO_ACCEPT_APPTS);
 	if (flag != nullptr)
 		pol.accept_appts = !!*flag;
@@ -995,12 +999,18 @@ static ec_error_t mr_insert_to_cal(rxparam &par, const PROPID_ARRAY &propids,
 	for (auto t : rmprops)
 		prop.erase(t);
 	static constexpr uint32_t v_busy = olBusy, stateflags = asfMeeting | asfReceived;
+	static constexpr uint8_t v_false = false;
 	ec_error_t err;
 	if ((err = prop.set(PROP_TAG(PT_LONG, propids[l_response_status]), &accept_type)) != ecSuccess ||
 	    (err = prop.set(PROP_TAG(PT_LONG, propids[l_busy_status]), &v_busy)) != ecSuccess ||
 	    (err = prop.set(PROP_TAG(PT_LONG, propids[l_appt_state_flags]), &stateflags)) != ecSuccess ||
 	    (err = prop.set(PR_MESSAGE_CLASS, "IPM.Appointment")) != ecSuccess)
 		return err;
+	if (!prop.has(propids[l_recurring])) {
+		err = prop.set(PROP_TAG(PT_LONG, propids[l_recurring]), &v_false);
+		if (err != ecSuccess)
+			return err;
+	}
 	uint64_t cal_mid = 0, cal_cn = 0;
 	if (!exmdb_client->write_message(par.cur.dir.c_str(), CP_ACP,
 	    cal_fid, msg.get(), std::string(), &cal_mid, &cal_cn, &err))
@@ -1179,8 +1189,12 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 
 	/* Lookup conflict state */
 	bool res_in_use = false, response_allowed = false;
-	auto start_nt = rq_prop.get<uint64_t>(PR_START_DATE);
-	auto end_nt   = rq_prop.get<uint64_t>(PR_END_DATE);
+	auto start_nt = rq_prop.get<uint64_t>(PROP_TAG(PT_SYSTIME, propids[l_start_whole]));
+	auto end_nt   = rq_prop.get<uint64_t>(PROP_TAG(PT_SYSTIME, propids[l_end_whole]));
+	if (start_nt == nullptr || end_nt == nullptr) {
+		start_nt = rq_prop.get<uint64_t>(PR_START_DATE);
+		end_nt   = rq_prop.get<uint64_t>(PR_END_DATE);
+	}
 	if (start_nt != nullptr && end_nt != nullptr) {
 		std::vector<freebusy_event> fbdata;
 		auto start_ts = rop_util_nttime_to_unix(*start_nt);
@@ -1196,7 +1210,7 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 			if ((event.start_time >= start_ts && event.start_time <= end_ts) ||
 			    (event.end_time   >= start_ts && event.end_time <= end_ts) ||
 			    (event.start_time < start_ts  && event.end_time > end_ts))
-				if (event.busy_status == olBusy) {
+				if (event.busy_status != olFree) {
 					res_in_use = true;
 					break;
 				}

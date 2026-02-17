@@ -15,14 +15,14 @@
 
 using namespace gromox;
 
-static void buildenv(const remote_svr &s)
+static void buildenv(bool pvt)
 {
 	common_util_build_environment();
 }
 
 int exmdb_client_run_front(const char *dir)
 {
-	return exmdb_client_run(dir, EXMDB_CLIENT_ASYNC_CONNECT, buildenv,
+	return exmdb_client_run(dir, EXMDB_CLIENT_NO_FLAGS, buildenv,
 	       common_util_free_environment, zs_notification_proc);
 }
 

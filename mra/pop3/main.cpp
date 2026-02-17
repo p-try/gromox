@@ -10,8 +10,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
-#include <netdb.h>
-#include <pthread.h>
 #include <string>
 #include <typeinfo>
 #include <unistd.h>
@@ -21,12 +19,10 @@
 #include <libHX/misc.h>
 #include <libHX/option.h>
 #include <libHX/scope.hpp>
-#include <libHX/socket.h>
 #include <libHX/string.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <gromox/atomic.hpp>
 #include <gromox/config_file.hpp>
 #include <gromox/contexts_pool.hpp>
@@ -34,6 +30,7 @@
 #include <gromox/exmdb_client.hpp>
 #include <gromox/exmdb_rpc.hpp>
 #include <gromox/fileio.h>
+#include <gromox/listener_ctx.hpp>
 #include <gromox/paths.h>
 #include <gromox/process.hpp>
 #include <gromox/svc_loader.hpp>
@@ -57,12 +54,7 @@ static const char *opt_config_file;
 static gromox::atomic_bool g_hup_signalled;
 static thread_local std::unique_ptr<alloc_context> g_alloc_mgr;
 static thread_local unsigned int g_amgr_refcount;
-static pthread_t g_thr_id;
-static gromox::atomic_bool g_stop_accept;
-static std::string g_listener_addr;
-static int g_listener_sock = -1, g_listener_ssl_sock = -1;
 uint16_t g_listener_port, g_listener_ssl_port;
-static pthread_t g_ssl_thr_id;
 static unsigned int g_haproxy_level;
 
 static struct HXoption g_options_table[] = {
@@ -103,9 +95,6 @@ static constexpr cfg_directive pop3_cfg_defaults[] = {
 	{"pop3_conn_timeout", "3min", CFG_TIME, "1s"},
 	{"pop3_force_stls", "pop3_force_tls", CFG_ALIAS},
 	{"pop3_force_tls", "false", CFG_BOOL},
-	{"pop3_listen_addr", "::"},
-	{"pop3_listen_port", "110"},
-	{"pop3_listen_tls_port", "0"},
 	{"pop3_log_file", "-"},
 	{"pop3_log_level", "4" /* LV_NOTICE */},
 	{"pop3_support_stls", "pop3_support_tls", CFG_ALIAS},
@@ -183,22 +172,15 @@ static void system_services_stop()
 	service_release("broadcast_event", "system");
 }
 
-static void *p3ls_thrwork(void *arg)
+static int p3ls_thrwork(generic_connection &&conn)
 {
-	const bool use_tls = reinterpret_cast<uintptr_t>(arg);
-	auto sv_sock = use_tls ? g_listener_ssl_sock : g_listener_sock;
+	const bool use_tls = conn.mark == M_TLS_CONN;
 	
-	while (true) {
-		auto conn = generic_connection::accept(sv_sock, g_haproxy_level, &g_stop_accept);
-		if (conn.sockd == -2)
-			break;
-		else if (conn.sockd < 0)
-			continue;
 		if (fcntl(conn.sockd, F_SETFL, O_NONBLOCK) < 0)
 			mlog(LV_WARN, "W-1405: fctnl: %s", strerror(errno));
 		static constexpr int flag = 1;
 		if (setsockopt(conn.sockd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0)
-			mlog(LV_WARN, "W-1339: setsockopt: %s", strerror(errno));
+			/* ignore */;
 		auto ctx = static_cast<pop3_context *>(contexts_pool_get_context(sctx_status::free));
 		/* there's no context available in contexts pool, close the connection*/
 		if (ctx == nullptr) {
@@ -212,7 +194,7 @@ static void *p3ls_thrwork(void *arg)
 			           str, host_ID, str2);
 			if (HXio_fullwrite(conn.sockd, buff, len) < 0)
 				/* ignore */;
-			continue;
+			return 0;
 		}
 		ctx->type = sctx_status::constructing;
 		/* pass the client ipaddr into the ipaddr filter */
@@ -230,7 +212,7 @@ static void *p3ls_thrwork(void *arg)
 			mlog(LV_DEBUG, "Connection %s is denied by ipaddr filter", conn.client_addr);
 			/* release the context */
 			contexts_pool_insert(ctx, sctx_status::free);
-			continue;
+			return 0;
 		}
 
 		if (!use_tls) {
@@ -253,87 +235,8 @@ static void *p3ls_thrwork(void *arg)
 		 */
 		ctx->polling_mask = POLLING_READ;
 		contexts_pool_insert(ctx, sctx_status::polling);
-	}
-	return nullptr;
-}
 
-static void listener_init(const char *addr, uint16_t port, uint16_t ssl_port)
-{
-	g_listener_addr = addr;
-	g_listener_port = port;
-	g_listener_ssl_port = ssl_port;
-	g_stop_accept = false;
-}
-
-static int listener_run()
-{
-	g_listener_sock = HX_inet_listen(g_listener_addr.c_str(), g_listener_port);
-	if (g_listener_sock < 0) {
-		printf("[listener]: failed to create socket [*]:%hu: %s\n",
-		       g_listener_port, strerror(-g_listener_sock));
-		return -1;
-	}
-	gx_reexec_record(g_listener_sock);
-	if (g_listener_ssl_port > 0) {
-		g_listener_ssl_sock = HX_inet_listen(g_listener_addr.c_str(), g_listener_ssl_port);
-		if (g_listener_ssl_sock < 0) {
-			printf("[listener]: failed to create socket [*]:%hu: %s\n",
-			       g_listener_ssl_port, strerror(-g_listener_ssl_sock));
-			return -1;
-		}
-		gx_reexec_record(g_listener_ssl_sock);
-	}
 	return 0;
-}
-
-static int listener_trigger_accept()
-{
-	auto ret = pthread_create4(&g_thr_id, nullptr, p3ls_thrwork,
-	           reinterpret_cast<void *>(uintptr_t(false)));
-	if (ret != 0) {
-		printf("[listener]: failed to create listener thread: %s\n", strerror(ret));
-		return -1;
-	}
-	pthread_setname_np(g_thr_id, "accept");
-	if (g_listener_ssl_port > 0) {
-		ret = pthread_create4(&g_ssl_thr_id, nullptr, p3ls_thrwork,
-		      reinterpret_cast<void *>(uintptr_t(true)));
-		if (ret != 0) {
-			printf("[listener]: failed to create listener thread: %s\n", strerror(ret));
-			return -2;
-		}
-		pthread_setname_np(g_ssl_thr_id, "tls_accept");
-	}
-	return 0;
-}
-
-static void listener_stop_accept()
-{
-	g_stop_accept = true;
-	if (g_listener_sock >= 0)
-		shutdown(g_listener_sock, SHUT_RDWR); /* closed in listener_stop */
-	if (!pthread_equal(g_thr_id, {})) {
-		pthread_kill(g_thr_id, SIGALRM);
-		pthread_join(g_thr_id, NULL);
-	}
-	if (g_listener_ssl_sock >= 0)
-		shutdown(g_listener_ssl_sock, SHUT_RDWR);
-	if (!pthread_equal(g_ssl_thr_id, {})) {
-		pthread_kill(g_ssl_thr_id, SIGALRM);
-		pthread_join(g_ssl_thr_id, NULL);
-	}
-}
-
-static void listener_stop()
-{
-	if (g_listener_sock >= 0) {
-		close(g_listener_sock);
-		g_listener_sock = -1;
-	}
-	if (g_listener_ssl_sock >= 0) {
-		close(g_listener_ssl_sock);
-		g_listener_ssl_sock = -1;
-	}
 }
 
 void xrpc_build_env()
@@ -343,7 +246,7 @@ void xrpc_build_env()
 	++g_amgr_refcount;
 }
 
-static void xrpc_build_env1(const remote_svr &)
+static void xrpc_build_env1(bool pvt)
 {
 	xrpc_build_env();
 }
@@ -359,9 +262,36 @@ static void *xrpc_alloc(size_t z)
 	return g_alloc_mgr->alloc(z);
 }
 
+static int pop3_parse_binds(listener_ctx &ctx, const config_file &gxcfg,
+    const char *gxkey, const config_file &oldcfg, const char *oldkey,
+    const char *oldportkey, unsigned int mark)
+{
+	auto line = gxcfg.get_value(gxkey);
+	if (line != nullptr)
+		return ctx.add_bunch(line, mark);
+	auto host = oldcfg.get_value(oldkey);
+	if (host != nullptr)
+		mlog(LV_NOTICE, "%s:%s is deprecated in favor of %s:%s",
+			oldcfg.m_filename.c_str(), oldkey,
+			gxcfg.m_filename.c_str(), gxkey);
+	else
+		host = "::";
+	auto ps = oldcfg.get_value(oldportkey);
+	uint16_t port = mark == M_UNENCRYPTED_CONN ? 110 : 995;
+	if (ps != nullptr) {
+		mlog(LV_NOTICE, "%s:%s is deprecated in favor of %s:%s",
+			oldcfg.m_filename.c_str(), oldportkey,
+			gxcfg.m_filename.c_str(), gxkey);
+		port = strtoul(ps, nullptr, 0);
+	}
+	if (port != 0 &&
+	    ctx.add_inet(host, port, mark) != 0)
+		return -1;
+	return 0;
+}
+
 int main(int argc, char **argv)
 { 
-	int retcode = EXIT_FAILURE;
 	char temp_buff[256];
 	HXopt6_auto_result argp;
 
@@ -482,25 +412,23 @@ int main(int argc, char **argv)
 	auto pop3_force_tls = parse_bool(g_config_file->get_value("pop3_force_tls"));
 	if (pop3_support_tls && pop3_force_tls)
 		printf("[pop3]: pop3 MUST be running with TLS\n");
-	uint16_t listen_tls_port = g_config_file->get_ll("pop3_listen_tls_port");
-	if (!pop3_support_tls && listen_tls_port > 0)
-		listen_tls_port = 0;
-	if (listen_tls_port > 0)
-		printf("[system]: system TLS listening port %d\n", listen_tls_port);
 
 	if (resource_run() != 0) {
 		printf("[system]: Failed to load resource\n");
 		return EXIT_FAILURE;
 	}
 	auto cleanup_2 = HX::make_scope_exit(resource_stop);
-	uint16_t listen_port = g_config_file->get_ll("pop3_listen_port");
-	listener_init(g_config_file->get_value("pop3_listen_addr"),
-		listen_port, listen_tls_port);
-	if (0 != listener_run()) {
-		printf("[system]: fail to start listener\n");
+
+	listener_ctx listener;
+	if (pop3_parse_binds(listener, *gxconfig, "pop3_listen", *g_config_file,
+	    "pop3_listen_addr", "pop3_listen_port", M_UNENCRYPTED_CONN) != 0)
 		return EXIT_FAILURE;
-	}
-	auto cleanup_4 = HX::make_scope_exit(listener_stop);
+	if (pop3_support_tls &&
+	    pop3_parse_binds(listener, *gxconfig, "pop3_listen_tls", *g_config_file,
+	    "pop3_listen_addr", "pop3_listen_tls_port", M_TLS_CONN) != 0)
+		return EXIT_FAILURE;
+	listener.m_haproxy_level = g_haproxy_level;
+	listener.m_thread_name   = "accept";
 
 	filedes_limit_bump(gxconfig->get_ll("pop3_fd_limit"));
 	service_init({g_config_file, g_dfl_svc_plugins, context_num});
@@ -554,8 +482,9 @@ int main(int argc, char **argv)
 	auto cleanup_20 = HX::make_scope_exit(threads_pool_stop);
 
 	/* accept the connection */
-	if (listener_trigger_accept() != 0) {
-		printf("[system]: fail trigger accept\n");
+	auto err = listener.watch_start(g_notify_stop, p3ls_thrwork);
+	if (err != 0) {
+		mlog(LV_ERR, "listener.thread_start: %s", strerror(err));
 		return EXIT_FAILURE;
 	}
 	
@@ -564,12 +493,11 @@ int main(int argc, char **argv)
 	exmdb_client.emplace(UINT_MAX, UINT_MAX);
 	auto cl_0 = HX::make_scope_exit([]() { exmdb_client.reset(); });
 	if (exmdb_client_run(g_config_file->get_value("config_file_path"),
-	    EXMDB_CLIENT_ASYNC_CONNECT, xrpc_build_env1, xrpc_free_env, nullptr) != 0) {
+	    EXMDB_CLIENT_NO_FLAGS, xrpc_build_env1, xrpc_free_env, nullptr) != 0) {
 		mlog(LV_ERR, "Failed to start exmdb_client");
 		return EXIT_FAILURE;
 	}
 
-	retcode = EXIT_SUCCESS;
 	printf("[system]: POP3 DAEMON is now running\n");
 	while (!g_notify_stop) {
 		sleep(3);
@@ -578,6 +506,5 @@ int main(int argc, char **argv)
 			service_trigger_all(PLUGIN_RELOAD);
 		}
 	}
-	listener_stop_accept();
-	return retcode;
+	return EXIT_SUCCESS;
 }

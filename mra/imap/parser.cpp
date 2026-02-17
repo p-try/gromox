@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 /*
  * imap parser is a module, which first read data from socket, parses the imap
@@ -195,7 +195,6 @@ int imap_parser_run()
 		g_parser_stop = true;
 		return -11;
 	}
-	pthread_setname_np(g_thr_id, "parser/worker");
 	ret = pthread_create4(&g_scan_id, nullptr, imps_scanwork, nullptr);
 	if (ret != 0) {
 		mlog(LV_ERR, "Failed to create select hash scanning thread: %s", strerror(ret));
@@ -301,7 +300,7 @@ static tproc_status ps_stat_stls(imap_context &ctx)
 
 	if (SSL_accept(pcontext->connection.ssl) != -1) {
 		pcontext->sched_stat = isched_stat::rdcmd;
-		if (pcontext->connection.server_port == g_listener_ssl_port) {
+		if (pcontext->connection.mark == M_TLS_CONN) {
 			char caps[128];
 			capability_list(caps, std::size(caps), pcontext);
 			SSL_write(pcontext->connection.ssl, "* OK [CAPABILITY ", 17);
@@ -644,8 +643,8 @@ static tproc_status ps_cmd_processing(imap_context &ctx)
 		if (pcontext->sched_stat == isched_stat::appended) {
 			if (0 != argc) {
 				/* Clears pcontext->mid; is this wanted here? */
-				ctx.wrdat_backing = {};
 				ctx.wrdat_content = nullptr;
+				ctx.wrdat_backing.reset();
 				size_t string_length = 0;
 				auto imap_reply_str = resource_get_imap_code(1800, 1, &string_length);
 				pcontext->connection.write(pcontext->tag_string, strlen(pcontext->tag_string));
@@ -841,8 +840,8 @@ static tproc_status ps_stat_wrdat(imap_context &ctx)
 	pcontext->write_offset = 0;
 	if (pcontext->literal_len != pcontext->current_len)
 		return tproc_status::cont;
-	ctx.wrdat_backing = {};
 	ctx.wrdat_content = nullptr;
+	ctx.wrdat_backing.reset();
 	pcontext->literal_len = 0;
 	pcontext->current_len = 0;
 	if (imap_parser_wrdat_retrieve(ctx) != IMAP_RETRIEVE_ERROR)
@@ -951,8 +950,8 @@ static tproc_status ps_end_processing(imap_context *pcontext,
 		pcontext->proto_stat = iproto_stat::auth;
 		pcontext->selected_folder[0] = '\0';
 	}
-	ctx.wrdat_backing = {};
 	ctx.wrdat_content = nullptr;
+	ctx.wrdat_backing.reset();
 	imap_parser_context_clear(pcontext);
 	return tproc_status::close;
 }
@@ -1003,18 +1002,18 @@ static int imap_parser_wrdat_retrieve(imap_context &ctx)
 			} else {
 				*ptr = '\0';
 				*ptr1 = '\0';
-				ctx.wrdat_backing = {};
 				ctx.wrdat_content = nullptr;
+				ctx.wrdat_backing.reset();
 				try {
 					auto eml_path = ctx.maildir + "/eml/"s + (last_line + 8);
 					ctx.wrdat_content = ctx.io_actor.get_full(eml_path);
 					if (ctx.wrdat_content == nullptr) {
-						ctx.wrdat_backing = {};
+						ctx.wrdat_backing.emplace();
 						imrpc_build_env();
 						auto cl_0 = HX::make_scope_exit(imrpc_free_env);
 						if (exmdb_client->imapfile_read(ctx.maildir, "eml",
-						    &last_line[8], &ctx.wrdat_backing))
-							ctx.wrdat_content = &ctx.wrdat_backing;
+						    &last_line[8], &*ctx.wrdat_backing))
+							ctx.wrdat_content = &*ctx.wrdat_backing;
 					}
 				} catch (const std::bad_alloc &) {
 					mlog(LV_ERR, "E-1466: ENOMEM");
@@ -1026,8 +1025,8 @@ static int imap_parser_wrdat_retrieve(imap_context &ctx)
 					ctx.wrdat_offset = strtoul(&ptr[1], nullptr, 0);
 					if (ctx.wrdat_offset > ctx.wrdat_content->size()) {
 						mlog(LV_ERR, "E-1758");
-						ctx.wrdat_backing = {};
 						ctx.wrdat_content = nullptr;
+						ctx.wrdat_backing.reset();
 						return IMAP_RETRIEVE_ERROR;
 					}
 					ctx.literal_len = std::min(static_cast<size_t>(strtoul(&ptr1[1], nullptr, 0)),
@@ -1042,8 +1041,8 @@ static int imap_parser_wrdat_retrieve(imap_context &ctx)
 					pcontext->current_len += len;
 					pcontext->write_length += len;
 					if (pcontext->literal_len == len) {
-						ctx.wrdat_backing = {};
 						ctx.wrdat_content = nullptr;
+						ctx.wrdat_backing.reset();
 						pcontext->literal_len = 0;
 						pcontext->current_len = 0;
 					}
@@ -1058,8 +1057,8 @@ static int imap_parser_wrdat_retrieve(imap_context &ctx)
 			} else {
 				*ptr = '\0';
 				*ptr1 = '\0';
-				ctx.wrdat_backing = {};
 				ctx.wrdat_content = nullptr;
+				ctx.wrdat_backing.reset();
 				try {
 					auto eml_path = pcontext->maildir + "/tmp/imap.rfc822/"s + (last_line + 10);
 					ctx.wrdat_content = ctx.io_actor.get_full(eml_path);
@@ -1073,8 +1072,8 @@ static int imap_parser_wrdat_retrieve(imap_context &ctx)
 					ctx.wrdat_offset = strtoul(&ptr[1], nullptr, 0);
 					if (ctx.wrdat_offset > ctx.wrdat_content->size()) {
 						mlog(LV_ERR, "E-1757");
-						ctx.wrdat_backing = {};
 						ctx.wrdat_content = nullptr;
+						ctx.wrdat_backing.reset();
 						return IMAP_RETRIEVE_ERROR;
 					}
 					ctx.literal_len = std::min(static_cast<size_t>(strtoul(&ptr1[1], nullptr, 0)),
@@ -1089,8 +1088,8 @@ static int imap_parser_wrdat_retrieve(imap_context &ctx)
 					pcontext->current_len += len;
 					pcontext->write_length += len;
 					if (pcontext->literal_len == len) {
-						ctx.wrdat_backing = {};
 						ctx.wrdat_content = nullptr;
+						ctx.wrdat_backing.reset();
 						pcontext->literal_len = 0;
 						pcontext->current_len = 0;
 					}
@@ -1492,8 +1491,8 @@ static void imap_parser_context_clear(imap_context *pcontext)
 	pcontext->connection.reset();
 	pcontext->proto_stat = iproto_stat::none;
 	pcontext->sched_stat = isched_stat::none;
-	ctx.wrdat_backing = {};
 	ctx.wrdat_content = nullptr;
+	ctx.wrdat_backing.reset();
 	pcontext->mid.clear();
 	pcontext->write_buff = nullptr;
 	pcontext->write_length = 0;
@@ -1519,6 +1518,7 @@ static void imap_parser_context_clear(imap_context *pcontext)
 
 static void *imps_thrwork(void *argp)
 {
+	pthread_setname_np(pthread_self(), "imps_thrwork");
 	int peek_len;
 	char tmp_buff;
 

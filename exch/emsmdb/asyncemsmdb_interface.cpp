@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <condition_variable>
 #include <csignal>
@@ -38,7 +38,7 @@ struct ASYNC_WAIT {
 	std::string username;
 	uint16_t cxr = 0;
 	uint32_t async_id = 0;
-	ECDOASYNCWAITEX_OUT *pout = nullptr;
+	ECDOASYNCWAITEX_OUT xout{};
 	int context_id = 0; /* when async_id is 0 */
 };
 
@@ -87,7 +87,6 @@ int asyncemsmdb_interface_run()
 		g_aemsi_stop = true;
 		return -5;
 	}
-	pthread_setname_np(g_scan_id, "asyncems/scan");
 	for (unsigned int i = 0; i < g_threads_num; ++i) {
 		pthread_t tid;
 		ret = pthread_create4(&tid, nullptr, aemsi_thrwork, nullptr);
@@ -152,13 +151,10 @@ int asyncemsmdb_interface_async_wait(uint32_t async_id,
 	pwait->async_id = async_id;
 	HX_strlower(pwait->username.data());
 	pwait->wait_time = time(nullptr);
-	if (async_id == 0) {
+	if (async_id == 0)
 		pwait->context_id = pout->flags_out;
-		pwait->pout = nullptr;
-	} else {
+	else
 		pwait->context_id = 0;
-		pwait->pout = pout;
-	}
 	auto tag = pwait->username + ":" + std::to_string(pwait->cxr);
 	HX_strlower(tag.data());
 	std::unique_lock as_hold(g_async_lock);
@@ -178,7 +174,7 @@ int asyncemsmdb_interface_async_wait(uint32_t async_id,
 	if (!pair.second)
 		return DISPATCH_SUCCESS;
 	auto cl_fail2 = HX::make_scope_exit([&]() { g_async_hash.erase(async_id); });
-	if (g_tag_hash.size() >= g_tag_hash_max &&
+	if (g_tag_hash.size() < g_tag_hash_max &&
 	    g_tag_hash.emplace(tag, pwait).second) {
 		/* actual success case */
 		cl_fail2.release();
@@ -230,9 +226,9 @@ static void asyncemsmdb_interface_activate(std::shared_ptr<ASYNC_WAIT> &&pwait, 
 	if (0 == pwait->async_id) {
 		active_hpm_context(pwait->context_id, b_pending);
 	} else if (rpc_build_environment(pwait->async_id)) {
-		pwait->pout->result = ecSuccess;
-		pwait->pout->flags_out = b_pending ? FLAG_NOTIFICATION_PENDING : 0;
-		async_reply(pwait->async_id, pwait->pout);
+		pwait->xout.result = ecSuccess;
+		pwait->xout.flags_out = b_pending ? FLAG_NOTIFICATION_PENDING : 0;
+		async_reply(pwait->async_id, &pwait->xout);
 	}
 }
 
@@ -281,6 +277,7 @@ static void *aemsi_thrwork(void *param)
 
 static void *aemsi_scanwork(void *param)
 {
+	pthread_setname_np(pthread_self(), "aemsi_scan");
 	std::vector<std::shared_ptr<ASYNC_WAIT>> tl;
 	
 	while (!g_aemsi_stop) {

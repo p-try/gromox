@@ -12,15 +12,14 @@
 
 using namespace gromox;
 
-static void buildenv(const remote_svr &s)
+static void buildenv(bool pvt)
 {
-	auto flags = s.type == EXMDB_ITEM::EXMDB_PRIVATE ? EM_PRIVATE : 0;
-	exmdb_server::build_env(flags, nullptr);
+	exmdb_server::build_env(pvt ? EM_PRIVATE : 0, nullptr);
 }
 
 int exmdb_client_run_front(const char *dir)
 {
-	return exmdb_client_run(dir, EXMDB_CLIENT_ALLOW_DIRECT | EXMDB_CLIENT_ASYNC_CONNECT,
+	return exmdb_client_run(dir, EXMDB_CLIENT_ALLOW_DIRECT,
 	       buildenv, exmdb_server::free_env, exmdb_server::event_proc);
 }
 
@@ -33,7 +32,7 @@ BOOL exmdb_client_relay_delivery(const char *dir, const char *from_address,
 {
 	BOOL b_private;
 	
-	if (exmdb_client_is_local(dir, &b_private)) {
+	if (exmdb_client_can_use_lpc(dir, &b_private)) {
 		auto original_dir = exmdb_server::get_dir();
 		exmdb_server::set_dir(dir);
 		uint64_t folder_id = 0, msg_id = 0;
@@ -53,8 +52,10 @@ BOOL exmdb_client_relay_delivery(const char *dir, const char *from_address,
 	q.cpid = cpid;
 	q.pmsg = deconst(pmsg);
 	q.pdigest = deconst(pdigest);
-	if (!exmdb_client_do_rpc(&q, &r))
+	if (!exmdb_client_do_rpc(&q, &r)) {
+		mlog(LV_ERR, "relay_delivery: do_rpc failed");
 		return FALSE;
+	}
 	*presult = r.result;
 	return TRUE;
 }

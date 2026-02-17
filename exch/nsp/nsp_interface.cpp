@@ -250,7 +250,7 @@ static ec_error_t nsp_interface_fetch_property(const ab_tree::ab_node &node,
 			return ecInvalidObject;
 		if (pprop == nullptr)
 			return ecSuccess;
-		pprop->value.pstr = cu_strdup(std::move(dn), NDR_STACK_OUT);
+		pprop->value.pstr = cu_strdup(dn, NDR_STACK_OUT);
 		return pprop->value.pstr != nullptr ? ecSuccess : ecServerOOM;
 	case PR_OBJECT_TYPE: {
 		if (pprop == nullptr)
@@ -339,7 +339,7 @@ static ec_error_t nsp_interface_fetch_property(const ab_tree::ab_node &node,
 			return ecNotFound;
 		if (pprop == nullptr)
 			return ecSuccess;
-		pprop->value.pstr = cu_strdup(std::move(dn), NDR_STACK_OUT);
+		pprop->value.pstr = cu_strdup(dn, NDR_STACK_OUT);
 		return pprop->value.pstr != nullptr ? ecSuccess : ecServerOOM;
 	case PR_TRANSMITABLE_DISPLAY_NAME_A:
 		if (node_type != ab_tree::abnode_type::user)
@@ -356,28 +356,28 @@ static ec_error_t nsp_interface_fetch_property(const ab_tree::ab_node &node,
 		pprop->value.pstr = cu_utf8_to_mb_dup(codepage, dn);
 		return pprop->value.pstr != nullptr ? ecSuccess : errno2mapi(errno);
 	case PR_COMPANY_NAME:
-		if (!node.company_info(&dn, nullptr))
+		if (!node.company_name(dn))
 			return ecNotFound;
 		if (pprop == nullptr)
 			return ecSuccess;
-		pprop->value.pstr = cu_strdup(std::move(dn), NDR_STACK_OUT);
+		pprop->value.pstr = cu_strdup(dn, NDR_STACK_OUT);
 		return pprop->value.pstr != nullptr ? ecSuccess : ecServerOOM;
 	case PR_COMPANY_NAME_A:
-		if (!node.company_info(&dn, nullptr))
+		if (!node.company_name(dn))
 			return ecNotFound;
 		if (pprop == nullptr)
 			return ecSuccess;
 		pprop->value.pstr = cu_utf8_to_mb_dup(codepage, dn);
 		return pprop->value.pstr != nullptr ? ecSuccess : errno2mapi(errno);
 	case PR_OFFICE_LOCATION:
-		if (!node.company_info(nullptr, &dn))
+		if (!node.office_location(dn))
 			return ecNotFound;
 		if (pprop == nullptr)
 			return ecSuccess;
-		pprop->value.pstr = cu_strdup(std::move(dn), NDR_STACK_OUT);
+		pprop->value.pstr = cu_strdup(dn, NDR_STACK_OUT);
 		return pprop->value.pstr != nullptr ? ecSuccess : ecServerOOM;
 	case PR_OFFICE_LOCATION_A:
-		if (!node.company_info(nullptr, &dn))
+		if (!node.office_location(dn))
 			return ecNotFound;
 		if (pprop == nullptr)
 			return ecSuccess;
@@ -397,7 +397,7 @@ static ec_error_t nsp_interface_fetch_property(const ab_tree::ab_node &node,
 			return ecNotFound;
 		if (pprop == nullptr)
 			return ecSuccess;
-		pprop->value.pstr = cu_strdup(std::move(dn), NDR_STACK_OUT);
+		pprop->value.pstr = cu_strdup(dn, NDR_STACK_OUT);
 		return pprop->value.pstr != nullptr ? ecSuccess : ecServerOOM;
 	case PR_EMS_AB_PROXY_ADDRESSES:
 	case PR_EMS_AB_PROXY_ADDRESSES_A: {
@@ -529,21 +529,21 @@ ec_error_t nsp_interface_bind(uint64_t hrpc, uint32_t flags, const STAT &xstat,
 	nsp_trace(__func__, 0, pstat);
 	auto rpc_info = get_rpc_info();
 	if (flags & fAnonymousLogin) {
-		memset(phandle, 0, sizeof(NSPI_HANDLE));
+		*phandle = {};
 		return MAPI_E_FAILONEPROVIDER;
 	}
 	if (pstat == nullptr || pstat->codepage == CP_WINUNICODE) {
-		memset(phandle, 0, sizeof(NSPI_HANDLE));
+		*phandle = {};
 		return ecNotSupported;
 	}
 	/* check if valid cpid has been supplied */
 	if (!acceptable_cpid_for_mapi(pstat->codepage)) {
-		memset(phandle, 0, sizeof(NSPI_HANDLE));
+		*phandle = {};
 		return MAPI_E_UNKNOWN_CPID;
 	}
 	auto pdomain = strchr(rpc_info.username, '@');
 	if (NULL == pdomain) {
-		memset(phandle, 0, sizeof(NSPI_HANDLE));
+		*phandle = {};
 		return ecLoginFailure;
 	}
 	pdomain ++;
@@ -551,14 +551,14 @@ ec_error_t nsp_interface_bind(uint64_t hrpc, uint32_t flags, const STAT &xstat,
 	if (!mysql_adaptor_get_domain_ids(pdomain, &domain_id, &org_id)) {
 		mlog(LV_WARN, "W-2176: could not satisfy nsp_bind request for domain %s: not found", pdomain);
 		phandle->handle_type = HANDLE_EXCHANGE_NSP;
-		memset(&phandle->guid, 0, sizeof(GUID));
+		phandle->guid = {};
 		return ecError;
 	}
 	phandle->handle_type = HANDLE_EXCHANGE_NSP;
 	int base_id = org_id == 0 ? -domain_id : org_id;
 	auto pbase = ab_tree::AB.get(base_id);
 	if (pbase == nullptr) {
-		memset(&phandle->guid, 0, sizeof(GUID));
+		phandle->guid = {};
 		return ecError;
 	}
 	if (g_nsp_trace >= 2)
@@ -574,7 +574,7 @@ ec_error_t nsp_interface_unbind(NSPI_HANDLE *phandle)
 {
 	if (g_nsp_trace > 0)
 		fprintf(stderr, "Entering %s\n", __func__);
-	memset(phandle, 0, sizeof(NSPI_HANDLE));
+	*phandle = {};
 	return MAPI_E_UNBINDSUCCESS;
 }
 

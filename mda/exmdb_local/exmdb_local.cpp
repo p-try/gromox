@@ -354,8 +354,11 @@ delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
 		flags |= DELIVERY_FORCE_JUNK;
 	if (!exmdb_client_remote::deliver_message(home_dir,
 	    pcontext->ctrl.from, address, CP_ACP, flags,
-	    pmsg.get(), djson.c_str(), &folder_id, &message_id, &r32))
+	    pmsg.get(), djson.c_str(), &folder_id, &message_id, &r32)) {
+		exmdb_local_log_info(pcontext->ctrl, address, LV_ERR,
+			"exmdb.deliver_message to %s failed (see gxhttp log for more)", home_dir);
 		return delivery_status::perm_fail;
+	}
 
 	auto dm_status = static_cast<deliver_message_result>(r32);
 	if (dm_status == deliver_message_result::result_ok) {
@@ -573,7 +576,7 @@ BOOL HOOK_exmdb_local(enum plugin_op reason, const struct dlfuncs &ppdata)
 			mlog(LV_ERR, "exmdb_local: failed to start cache queue");
 			return FALSE;
 		}
-		if (exmdb_client_run(get_config_path(), EXMDB_CLIENT_ASYNC_CONNECT) != 0) {
+		if (exmdb_client_run(get_config_path()) != 0) {
 			mlog(LV_ERR, "exmdb_local: failed to start exmdb_client");
 			return FALSE;
 		}

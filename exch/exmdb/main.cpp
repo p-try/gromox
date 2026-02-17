@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cerrno>
 #include <cstdio>
@@ -26,7 +26,6 @@
 #include <gromox/util.hpp>
 #include "bounce_producer.hpp"
 #include "db_engine.hpp"
-#include "listener.hpp"
 #include "parser.hpp"
 
 using namespace std::string_literals;
@@ -34,7 +33,7 @@ using namespace gromox;
 DECLARE_SVC_API(exmdb, );
 using namespace exmdb;
 
-static std::shared_ptr<CONFIG_FILE> g_config_during_init;
+static std::shared_ptr<CONFIG_FILE> g_config_during_init, g_config_during_init2;
 
 static constexpr cfg_directive exmdb_gromox_cfg_defaults[] = {
 	{"exmdb_deep_backtrace", "0", CFG_BOOL},
@@ -52,7 +51,6 @@ static constexpr cfg_directive exmdb_cfg_defaults[] = {
 	{"exmdb_eph_prefix", ""},
 	{"exmdb_file_compression", "zstd-6"},
 	{"exmdb_hosts_allow", ""}, /* ::1 default set later during startup */
-	{"exmdb_listen_port", "5000"},
 	{"exmdb_max_sqlite_spares", "3", CFG_SIZE},
 	{"exmdb_pf_read_per_user", "1"},
 	{"exmdb_pf_read_states", "2"},
@@ -63,7 +61,6 @@ static constexpr cfg_directive exmdb_cfg_defaults[] = {
 	{"exmdb_search_pacing_time", "0.5s", CFG_TIME_NS},
 	{"exmdb_search_yield", "0", CFG_BOOL},
 	{"exrpc_debug", "0"},
-	{"listen_ip", "::1"},
 	{"listen_port", "exmdb_listen_port", CFG_ALIAS},
 	{"max_ext_rule_number", "20", CFG_SIZE, "1", "100"},
 	{"max_router_connections", "4095M", CFG_SIZE},
@@ -149,28 +146,25 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 				strerror(errno));
 			return FALSE;
 		}
-		if (!exmdb_provider_reload(nullptr, pconfig))
-			return false;
-		g_exmdb_disallow_lpc = strcasecmp(get_prog_id(), "istore") != 0;
-		if (g_exmdb_disallow_lpc)
-			return TRUE;
-
-		auto listen_ip = pconfig->get_value("listen_ip");
-		uint16_t listen_port = pconfig->get_ll("exmdb_listen_port");
-		mlog(LV_INFO, "exmdb_provider: listen address is [%s]:%hu",
-		       *listen_ip == '\0' ? "*" : listen_ip, listen_port);
-
-		exmdb_listener_init(listen_ip, listen_port);
-		if (exmdb_listener_run(get_config_path(),
-		    pconfig->get_value("exmdb_hosts_allow")) != 0) {
-			mlog(LV_ERR, "exmdb_provider: failed to run exmdb listener");
+		auto gxcfg = g_config_during_init2 = config_file_initd("gromox.cfg",
+		             get_config_path(), exmdb_gromox_cfg_defaults);
+		if (gxcfg == nullptr) {
+			mlog(LV_ERR, "exmdb_provider: config_file_initd exmdb_provider.cfg: %s",
+				strerror(errno));
 			return FALSE;
 		}
+		if (!exmdb_provider_reload(gxcfg, pconfig))
+			return false;
+		g_exmdb_allow_lpc = strcasecmp(get_prog_id(), "istore") == 0;
+		if (!g_exmdb_allow_lpc)
+			return TRUE;
+		if (exmdb_listener_init(*gxcfg, *pconfig) != 0)
+			return FALSE;
 		return TRUE;
 	}
 	case PLUGIN_INIT: {
 		auto pconfig = std::move(g_config_during_init);
-		auto gxcfg = config_file_initd("gromox.cfg", get_config_path(), exmdb_gromox_cfg_defaults);
+		auto gxcfg = std::move(g_config_during_init2);
 		if (gxcfg == nullptr) {
 			mlog(LV_ERR, "emsmdb: config_file_initd gromox.cfg: %s",
 			       strerror(errno));
@@ -223,12 +217,11 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 
 		common_util_init(org_name, max_msg_count, max_rule, max_ext_rule, std::move(smtp_url));
 		db_engine_init(table_size, cache_interval, populating_num);
-		uint16_t listen_port = pconfig->get_ll("exmdb_listen_port");
-		if (0 == listen_port) {
+		if (!g_exmdb_allow_lpc)
 			exmdb_parser_init(0, 0);
-		} else {
+		else
 			exmdb_parser_init(max_threads, max_routers);
-		}
+
 		exmdb_client.emplace(connection_num, threads_num);
 		
 		if (bounce_gen_init(get_config_path(), get_data_path(),
@@ -246,7 +239,7 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 			db_engine_stop();
 			return FALSE;
 		}
-		if (!g_exmdb_disallow_lpc && exmdb_listener_trigger_accept() != 0) {
+		if (g_exmdb_allow_lpc && exmdb_listener_trigger_accept() != 0) {
 			mlog(LV_ERR, "exmdb_provider: failed to start exmdb listener");
 			exmdb_listener_stop();
 			exmdb_parser_stop();
@@ -271,8 +264,8 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 		return TRUE;
 	}
 	case PLUGIN_FREE:
-		exmdb_client.reset();
 		exmdb_listener_stop();
+		exmdb_client.reset();
 		exmdb_parser_stop();
 		db_engine_stop();
 		return TRUE;

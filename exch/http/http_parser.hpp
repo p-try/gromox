@@ -142,8 +142,14 @@ void http_parser_vconnection_async_reply(const char *host,
 extern void http_report();
 extern std::string http_make_err_response(const http_context &, http_status);
 
+extern int listener_init(const config_file &gx, const config_file &oldcfg, bool with_tls);
+extern int listener_trigger_accept();
+extern void listener_stop();
+extern int htls_thrwork(generic_connection &&);
+
 extern unsigned int g_http_debug, g_msrpc_debug;
 extern size_t g_rqbody_flush_size, g_rqbody_max_size;
 extern bool g_enforce_auth;
 extern std::string g_http_remote_host_hdr;
 extern gromox::time_duration g_http_basic_auth_validity;
+extern gromox::atomic_bool g_httpmain_stop;

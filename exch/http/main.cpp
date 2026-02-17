@@ -33,7 +33,6 @@
 #include <gromox/util.hpp>
 #include "hpm_processor.hpp"
 #include "http_parser.hpp"
-#include "listener.hpp"
 #include "cache.hpp"
 #include "fastcgi.hpp"
 #include "rewrite.hpp"
@@ -102,9 +101,6 @@ static constexpr cfg_directive http_cfg_defaults[] = {
 	{"http_debug", "0"},
 	{"http_enforce_auth", "0", CFG_BOOL},
 	{"http_krb_service_principal", ""},
-	{"http_listen_addr", "::"},
-	{"http_listen_port", "80"},
-	{"http_listen_tls_port", "0"},
 	{"http_log_file", "-"},
 	{"http_log_level", "4" /* LV_NOTICE */},
 	{"http_rqbody_flush_size", "512K", CFG_SIZE, "0"},
@@ -119,7 +115,6 @@ static constexpr cfg_directive http_cfg_defaults[] = {
 	{"ntlmssp_program", "/usr/bin/ntlm_auth --helper-protocol=squid-2.5-ntlmssp"},
 	{"request_max_mem", "4M", CFG_SIZE, "1M"},
 	{"running_identity", RUNNING_IDENTITY},
-	{"tcp_max_segment", "0", CFG_SIZE},
 	{"thread_charge_num", "http_thread_charge_num", CFG_ALIAS},
 	{"thread_init_num", "http_thread_init_num", CFG_ALIAS},
 	{"tls_min_proto", "tls1.2"},
@@ -159,7 +154,6 @@ static bool http_reload_config(std::shared_ptr<CONFIG_FILE> xcfg = nullptr,
 
 int main(int argc, char **argv)
 {
-	int retcode = EXIT_FAILURE;
 	char host_name[UDOM_SIZE], *ptoken;
 	const char *dns_name, *dns_domain, *netbios_name;
 	HXopt6_auto_result argp;
@@ -279,12 +273,6 @@ int main(int argc, char **argv)
 		mlog(LV_NOTICE, "http: TLS support deactivated via config");
 	}
 
-	uint16_t listen_tls_port = g_config_file->get_ll("http_listen_tls_port");
-	if (!http_support_tls && listen_tls_port > 0)
-		listen_tls_port = 0;
-	if (listen_tls_port > 0)
-		mlog(LV_NOTICE, "system: system TLS listening port %hu", listen_tls_port);
-	
 	size_t max_request_mem = g_config_file->get_ll("request_max_mem");
 	HX_unit_size(temp_buff, std::size(temp_buff), max_request_mem, 1024, 0);
 	mlog(LV_INFO, "pdu_processor: maximum request memory is %s", temp_buff);
@@ -302,15 +290,9 @@ int main(int argc, char **argv)
 	std::chrono::seconds fastcgi_exec_timeout{g_config_file->get_ll("fastcgi_exec_timeout")};
 	HX_unit_seconds(temp_buff, std::size(temp_buff), fastcgi_exec_timeout.count(), 0);
 	mlog(LV_INFO, "http: fastcgi execution timeout is %s", temp_buff);
-	uint16_t listen_port = g_config_file->get_ll("http_listen_port");
-	unsigned int mss_size = g_config_file->get_ll("tcp_max_segment");
-	listener_init(g_config_file->get_value("http_listen_addr"),
-		listen_port, listen_tls_port, mss_size);
-	auto cleanup_4 = HX::make_scope_exit(listener_stop);
-	if (0 != listener_run()) {
-		mlog(LV_ERR, "system: failed to start listener");
+	if (listener_init(*gxconfig, *g_config_file, http_support_tls) != 0)
 		return EXIT_FAILURE;
-	}
+	auto cleanup_4 = HX::make_scope_exit(listener_stop);
 
 	const char *program_identifier = "http";
 	auto istore_standalone = gxconfig->get_ll("istore_standalone");
@@ -418,16 +400,14 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * The listening socket comes last. The htls_thrwork function
+	 * Connection acceptance thread comes last. The htls_thrwork function
 	 * needs an initialized contexts_pool object.
 	 */
 	if (listener_trigger_accept() != 0) {
 		mlog(LV_ERR, "system: failed listening socket setup");
 		return EXIT_FAILURE;
 	}
-	auto cleanup_29 = HX::make_scope_exit(listener_stop_accept);
 	
-	retcode = EXIT_SUCCESS;
 	mlog(LV_INFO, "system: HTTP daemon is now running");
 	while (!g_httpmain_stop) {
 		sleep(3);
@@ -448,7 +428,7 @@ int main(int argc, char **argv)
 	service_trigger_all(PLUGIN_QUENCH_ASYNC);
 	pdu_processor_trigger(PLUGIN_QUENCH_ASYNC);
 	pdu_processor_trigger(PLUGIN_QUENCH_ASYNC);
-	return retcode;
+	return EXIT_SUCCESS;
 }
 
 static void term_handler(int signo)

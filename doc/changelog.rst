@@ -1,5 +1,38 @@
-Gromox 3.3.185 (Development)
-===========================
+Milestone 3.4.62
+================
+
+Enhancements:
+
+* Finer-grained control over listening socket creation, including new config
+  directives (`http_listen`, `imap_listen_tls`, etc.) for specifying these.
+  This makes it possible not having to use the wildcard address.
+* importer: make -B option usable with public stores
+
+Fixes:
+
+* emsmdb: async notification connections were not marked active and would not
+  deliver a signal of new pending events.
+* emsmdb: fix UAF/crash when notifications are sent over RPCH
+* oxcical: upon reception of non-recurring appointments, the PidLidRecurring=0
+  property will be set now, as some Outlook versions fail to show appointments
+  in the daily/weekly/monthly view if the property is absent.
+* exmdb: limit production of PR_RTF_COMPRESSED variants of
+  PR_BODY/PR_HTML when saving messages to IPM.Task objects, as OL
+  only depends on it for those message classes.
+* Plugged a memory leak that occurred when a multi-HTML Internet Mail is
+  converted to MAPI
+* Plugged a memory leak that occurred when HTML is converted to RTF
+* Plugged a logical memleak stemming from never shrinking the buffer of
+  `FETCH RFC822` and related commands
+
+Changes:
+
+* php_mapi can now tolerate the _presence_ of the PHP `opcache` module,
+  though opcache must still be disabled due to miscompilation.
+
+
+Gromox 3.4 (2026-02-02)
+=======================
 
 Enhancements:
 
@@ -21,6 +54,7 @@ Fixes:
   sometimes lost the last character in the conversion, which has been fixed.
 * exmdb: abort purge-datafiles if there is a database error midway
 * imap: release potentially-large APPEND buffers much earlier
+* exporter: plug two memory leaks
 
 Changes:
 
@@ -29,6 +63,12 @@ Changes:
   and no longer magically assumed to be in the same charset as the body.
 * exporter: FAI messages are no longer emitted by default and explicitly need
   to be requested with the -a option.
+* ruleproc: treat not only "Busy" as a collision, but also "Tentative" and
+  "Out-Of-Office"
+* ruleproc: evaluate not just PR_START_DATE but also
+  PidLidAppointmentStartWhole (and their end counterparts)
+* ab_tree: PR_COMPANY_NAME is no longer synthesized from the title of the
+  domain a user belongs to
 * daemons: deleted the oxcical_allday_ymd config directive
 
 
