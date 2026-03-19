@@ -6,6 +6,7 @@
 #endif
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,10 @@
 
 using namespace std::string_literals;
 using namespace gromox;
+
+extern "C" {
+extern char **environ;
+}
 
 namespace {
 
@@ -286,8 +291,12 @@ errno_t canonical_hostname(std::string &out) try
 
 std::unique_ptr<FILE, file_deleter> fopen_sd(const char *filename, const char *sdlist)
 {
-	if (sdlist == nullptr || strchr(filename, '/') != nullptr)
+	if (filename[0] == '/')
 		return std::unique_ptr<FILE, file_deleter>(fopen(filename, "r"));
+	if (sdlist == nullptr) {
+		errno = ENOENT;
+		return nullptr;
+	}
 	try {
 		for (auto &&dir : gx_split(sdlist, ':')) {
 			errno = 0;

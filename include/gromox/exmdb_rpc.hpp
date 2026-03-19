@@ -158,7 +158,7 @@ enum class exmdb_callid : uint8_t {
 	flush_instance /* v2 */ = 0x7f,
 	unload_store = 0x80,
 	deliver_message = 0x81,
-	notify_new_mail = 0x82,
+	// notify_new_mail = 0x82,
 	store_eid_to_user = 0x83,
 	empty_folder = 0x84,
 	purge_softdelete = 0x85,
@@ -1086,11 +1086,6 @@ struct exreq_get_public_folder_unread_count final : public exreq {
 	uint64_t folder_id;
 };
 
-struct exreq_notify_new_mail final : public exreq {
-	using view_t = exreq_notify_new_mail;
-	uint64_t folder_id, message_id;
-};
-
 struct exreq_store_eid_to_user final : public exreq {
 	using view_t = exreq_store_eid_to_user;
 	STORE_ENTRYID *store_eid;
@@ -1742,7 +1737,6 @@ using exresp_transport_new_mail = exresp;
 using exresp_vacuum = exresp;
 using exresp_unload_store = exresp;
 using exresp_ping_store = exresp;
-using exresp_notify_new_mail = exresp;
 
 using exresp_purge_datafiles = exresp;
 using exresp_autoreply_tsupdate = exresp;
@@ -1762,14 +1756,14 @@ struct DB_NOTIFY_DATAGRAM {
 	DB_NOTIFY db_notify{};
 };
 
-extern GX_EXPORT pack_result exmdb_ext_pull_request(const BINARY *, std::unique_ptr<exreq> &alloc_by_callee);
+extern GX_EXPORT pack_result exmdb_ext_pull_request(std::string_view, std::unique_ptr<exreq> &alloc_by_callee);
 extern GX_EXPORT pack_result exmdb_ext_push_request(const exreq *, BINARY *);
-extern GX_EXPORT pack_result exmdb_ext_pull_response(const BINARY *, exresp *partial_fill_by_caller);
+extern GX_EXPORT pack_result exmdb_ext_pull_response(std::string_view, exresp *partial_fill_by_caller);
 extern GX_EXPORT pack_result exmdb_ext_push_response(const exresp *presponse, BINARY *);
-extern GX_EXPORT pack_result exmdb_ext_pull_db_notify(const BINARY *, DB_NOTIFY_DATAGRAM *);
+extern GX_EXPORT pack_result exmdb_ext_pull_db_notify(std::string_view, DB_NOTIFY_DATAGRAM *);
 extern GX_EXPORT pack_result exmdb_ext_push_db_notify(const DB_NOTIFY_DATAGRAM *, BINARY *);
 extern GX_EXPORT const char *exmdb_rpc_strerror(exmdb_response);
-extern GX_EXPORT BOOL exmdb_client_read_socket(int, BINARY &, long timeout = -1);
+extern GX_EXPORT bool exmdb_client_read_socket(int, std::string &, long timeout = -1);
 extern GX_EXPORT BOOL exmdb_client_write_socket(int, std::string_view, long timeout = -1);
 
 extern GX_EXPORT void *(*exmdb_rpc_alloc)(size_t);
