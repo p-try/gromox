@@ -723,7 +723,7 @@ static bool table_load_content_table(db_conn &db, db_base_wr_ptr &dbase,
 		pstmt.finalize();
 		pstmt1.finalize();
 		if (psqlite != nullptr)
-			sqlite3_close(psqlite);
+			sqlite3_close_v2(psqlite);
 	});
 	if (NULL != remote_id) {
 		ptnode->remote_id = strdup(remote_id);
@@ -924,12 +924,12 @@ static bool table_load_content_table(db_conn &db, db_base_wr_ptr &dbase,
 				}
 				uint16_t type = PROP_TYPE(ptnode->instance_tag) & ~MV_INSTANCE;
 				switch (type) {
-#define H(ctyp, memb) { \
+#define H(ctyp, memb, ptrify) { \
 		auto sa = static_cast<ctyp *>(pvalue); \
 		if (sa->count == 0) \
 			goto BIND_NULL_INSTANCE; \
 		for (size_t i = 0; i < sa->count; ++i) { \
-			if (!common_util_bind_sqlite_statement(pstmt1, multi_index, type & ~MVI_FLAG, &sa->memb[i])) \
+			if (!common_util_bind_sqlite_statement(pstmt1, multi_index, type & ~MVI_FLAG, ptrify sa->memb[i])) \
 				return false; \
 			pstmt1.bind_int64(col_inum, i + 1); \
 			if (pstmt1.step() != SQLITE_DONE) \
@@ -939,18 +939,18 @@ static bool table_load_content_table(db_conn &db, db_base_wr_ptr &dbase,
 		break; \
 	}
 
-				case PT_MV_SHORT: H(SHORT_ARRAY, ps)
-				case PT_MV_LONG: H(LONG_ARRAY, pl)
+				case PT_MV_SHORT: H(SHORT_ARRAY, ps, &)
+				case PT_MV_LONG: H(LONG_ARRAY, pl, &)
 				case PT_MV_CURRENCY:
 				case PT_MV_I8:
-				case PT_MV_SYSTIME: H(LONGLONG_ARRAY, pll)
-				case PT_MV_FLOAT: H(FLOAT_ARRAY, mval)
+				case PT_MV_SYSTIME: H(LONGLONG_ARRAY, pll, &)
+				case PT_MV_FLOAT: H(FLOAT_ARRAY, mval, &)
 				case PT_MV_DOUBLE:
-				case PT_MV_APPTIME: H(DOUBLE_ARRAY, mval)
+				case PT_MV_APPTIME: H(DOUBLE_ARRAY, mval, &)
 				case PT_MV_STRING8:
-				case PT_MV_UNICODE: H(STRING_ARRAY, ppstr)
-				case PT_MV_CLSID: H(GUID_ARRAY, pguid)
-				case PT_MV_BINARY: H(BINARY_ARRAY, pbin)
+				case PT_MV_UNICODE: H(STRING_ARRAY, ppstr, )
+				case PT_MV_CLSID: H(GUID_ARRAY, pguid, &)
+				case PT_MV_BINARY: H(BINARY_ARRAY, pbin, &)
 				default:
 					return false;
 #undef H
@@ -993,7 +993,7 @@ static bool table_load_content_table(db_conn &db, db_base_wr_ptr &dbase,
 		pstmt1.finalize();
 		if (psort_transact.commit() != SQLITE_OK)
 			return false;
-		sqlite3_close(psqlite);
+		sqlite3_close_v2(psqlite);
 		psqlite = NULL;
 		/* index the content table */
 		if (psorts->ccategories > 0) {
@@ -3075,6 +3075,7 @@ BOOL exmdb_server::store_table_state(const char *dir, uint32_t table_id,
 			mlog(LV_ERR, "E-1435: sqlite3_open %s: %s", state_path.c_str(), sqlite3_errstr(ret));
 			return FALSE;
 		}
+		sqlite3_busy_timeout(psqlite, g_sqlite_busy_timeout_ns / 1000000);
 		gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF");
 		gx_sql_exec(psqlite, "PRAGMA synchronous=OFF");
 		const char *sql_string = (
@@ -3088,7 +3089,7 @@ BOOL exmdb_server::store_table_state(const char *dir, uint32_t table_id,
 			"header_id INTEGER DEFAULT NULL, "
 			"header_stat INTEGER DEFAULT NULL)");
 		if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK) {
-			sqlite3_close(psqlite);
+			sqlite3_close_v2(psqlite);
 			if (remove(state_path.c_str()) < 0 && errno != ENOENT)
 				mlog(LV_WARN, "W-1348: remove %s: %s", state_path.c_str(), strerror(errno));
 			return FALSE;
@@ -3096,7 +3097,7 @@ BOOL exmdb_server::store_table_state(const char *dir, uint32_t table_id,
 		sql_string = ("CREATE UNIQUE INDEX state_index"
 		             " ON state_info (folder_id, table_flags, sorts)");
 		if (gx_sql_exec(psqlite, sql_string) != SQLITE_OK) {
-			sqlite3_close(psqlite);
+			sqlite3_close_v2(psqlite);
 			remove(state_path.c_str());
 			return FALSE;
 		}
@@ -3106,13 +3107,14 @@ BOOL exmdb_server::store_table_state(const char *dir, uint32_t table_id,
 			mlog(LV_ERR, "E-1436: sqlite3_open %s: %s", state_path.c_str(), sqlite3_errstr(ret));
 			return FALSE;
 		}
+		sqlite3_busy_timeout(psqlite, g_sqlite_busy_timeout_ns / 1000000);
 		gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF");
 		gx_sql_exec(psqlite, "PRAGMA synchronous=OFF");
 	} else {
 		mlog(LV_ERR, "E-1943: open %s: %s", state_path.c_str(), strerror(errno));
 		return false;
 	}
-	auto cl_0 = HX::make_scope_exit([&]() { sqlite3_close(psqlite); });
+	auto cl_0 = HX::make_scope_exit([&]() { sqlite3_close_v2(psqlite); });
 	static constexpr char sel_with_sort[] =
 		("SELECT state_id FROM "
 		"state_info WHERE folder_id=? AND table_flags=? "
@@ -3349,7 +3351,8 @@ BOOL exmdb_server::restore_table_state(const char *dir, uint32_t table_id,
 		mlog(LV_ERR, "E-1437: sqlite3_open %s: %s", state_path.c_str(), sqlite3_errstr(ret));
 		return false;
 	}
-	auto cl_0 = HX::make_scope_exit([&]() { sqlite3_close(psqlite); });
+	auto cl_0 = HX::make_scope_exit([&]() { sqlite3_close_v2(psqlite); });
+	sqlite3_busy_timeout(psqlite, g_sqlite_busy_timeout_ns / 1000000);
 	gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF");
 	gx_sql_exec(psqlite, "PRAGMA synchronous=OFF");
 	snprintf(sql_string, std::size(sql_string), "SELECT folder_id, table_flags,"
@@ -3496,7 +3499,7 @@ BOOL exmdb_server::restore_table_state(const char *dir, uint32_t table_id,
 	pstmt1.finalize();
 	pstmt2.finalize();
 	stm_upd_tx.finalize();
-	sqlite3_close(psqlite);
+	sqlite3_close_v2(psqlite);
 	cl_0.release();
 	snprintf(sql_string, std::size(sql_string), "UPDATE t%u SET idx=NULL", ptnode->table_id);
 	if (pdb->eph_exec(sql_string) != SQLITE_OK)

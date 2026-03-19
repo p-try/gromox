@@ -630,8 +630,12 @@ static int icp_process_fetch_item(imap_context &ctx,
 	
 	if (pitem->flag_bits & FLAG_LOADED) {
 		auto eml_path = std::string(pcontext->maildir) + "/eml";
-		if (!mjson.load_from_json(pitem->digest)) {
-			mlog(LV_ERR, "E-1921: load_from_json %s/%s oopsied", ctx.maildir, ctx.mid.c_str());
+		Json::Value digest;
+		if (!str_to_json(pitem->digest, digest)) {
+			mlog(LV_ERR, "E-1921: load_from_json %s/%s oopsied1", ctx.maildir, ctx.mid.c_str());
+			return 1923;
+		} else if (!mjson.load_from_json(digest)) {
+			mlog(LV_ERR, "E-1921: load_from_json %s/%s oopsied2", ctx.maildir, ctx.mid.c_str());
 			return 1923;
 		}
 		mjson.path = std::move(eml_path);
@@ -937,40 +941,14 @@ static void icp_store_flags(const char *cmd, const std::string &mid,
 
 static BOOL icp_convert_imaptime(const char *str_time, time_t *ptime)
 {
-	time_t tmp_time;
-	char tmp_buff[3];
 	struct tm tmp_tm{};
 	auto str_zone = strptime(str_time, "%d-%b-%Y %T ", &tmp_tm);
 	if (str_zone == nullptr)
 		return FALSE;
-	if (strlen(str_zone) < 5)
-		return FALSE;
-
-	int factor;
-	if (*str_zone == '-')
-		factor = 1;
-	else if (*str_zone == '+')
-		factor = -1;
-	else
-		return FALSE;
-	if (!HX_isdigit(str_zone[1]) || !HX_isdigit(str_zone[2]) ||
-	    !HX_isdigit(str_zone[3]) || !HX_isdigit(str_zone[4]))
-		return FALSE;
-	tmp_buff[0] = str_zone[1];
-	tmp_buff[1] = str_zone[2];
-	tmp_buff[2] = '\0';
-	int hour = strtol(tmp_buff, nullptr, 0);
-	if (hour < 0 || hour > 23)
-		return FALSE;
-	tmp_buff[0] = str_zone[3];
-	tmp_buff[1] = str_zone[4];
-	tmp_buff[2] = '\0';
-	int minute = strtol(tmp_buff, nullptr, 0);
-	if (minute < 0 || minute > 59)
-		return FALSE;
-	tmp_time = timegm(&tmp_tm);
-	tmp_time += factor*(60*60*hour + 60*minute);
-	*ptime = tmp_time;
+	int min_west = 0;
+	if (!simple_zone_to_minwest(str_zone, &min_west, nullptr))
+		return false;
+	*ptime = timegm(&tmp_tm) + 60 * min_west;
 	return TRUE;
 }
 

@@ -112,7 +112,7 @@ unsigned int g_exmdb_pvt_folder_softdel, g_exmdb_max_sqlite_spares;
 unsigned long long g_sqlite_busy_timeout_ns;
 std::string exmdb_eph_prefix;
 
-static bool remove_from_hash(const db_base &, time_point);
+static bool dbase_is_purgable(const db_base &, time_point);
 static void dbeng_notify_cttbl_modify_row(db_conn &, uint64_t folder_id, uint64_t message_id, db_base &, db_conn::NOTIFQ &);
 
 static void db_engine_load_dynamic_list(db_base *dbase, sqlite3* psqlite) try
@@ -319,14 +319,10 @@ BOOL db_engine_unload_db(const char *path)
 		auto it = g_hash_table.find(path);
 		if (it == g_hash_table.end())
 			return TRUE;
-		auto now = tp_now();
-		auto &dbase = it->second;
-		std::unique_lock dhold(dbase.giant_lock);
-		if (remove_from_hash(dbase, now + g_cache_interval)) {
+		if (dbase_is_purgable(it->second, tp_now() + g_cache_interval)) {
 			g_hash_table.erase(it);
 			return TRUE;
 		}
-		dhold.unlock();
 		hhold.unlock();
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
@@ -582,8 +578,10 @@ db_handle db_base::get_db(const char* dir, DB_TYPE type)
 	}
 	gx_sql_exec(db, "PRAGMA journal_mode=WAL");
 	sqlite3_busy_timeout(db, int(g_sqlite_busy_timeout_ns / 1000000)); // ns -> ms
-	if (type == DB_EPH)
-		gx_sql_exec(db, "PRAGMA	synchronous=OFF"); /* completely disable disk synchronization for eph db */
+	if (type == DB_MAIN)
+		gx_sql_exec(db, "PRAGMA synchronous=FULL");
+	else
+		gx_sql_exec(db, "PRAGMA synchronous=OFF");
 	return hdb;
 }
 
@@ -651,9 +649,9 @@ void db_base::handle_spares(sqlite3 *main, sqlite3 *eph)
 	}
 	lock.unlock();
 	if (eph != nullptr)
-		sqlite3_close(eph);
+		sqlite3_close_v2(eph);
 	if (main != nullptr)
-		sqlite3_close(main);
+		sqlite3_close_v2(main);
 }
 
 db_conn::db_conn(db_base &base) :
@@ -665,6 +663,7 @@ db_conn::db_conn(db_base &base) :
 db_conn::db_conn(db_conn &&o) :
 	psqlite(std::move(o.psqlite)),
 	m_sqlite_eph(std::move(o.m_sqlite_eph)),
+	m_prepstm(std::move(o.m_prepstm)),
 	m_base(std::move(o.m_base))
 {
 	o.psqlite = o.m_sqlite_eph = nullptr;
@@ -675,6 +674,13 @@ db_conn::~db_conn()
 {
 	if (m_base == nullptr)
 		return;
+	/*
+	 * Finalize any cached prepared statements while the
+	 * sqlite3 handles are still ours, before returning them
+	 * to the connection pool where another thread could
+	 * pick them up immediately.
+	 */
+	m_prepstm.reset();
 	m_base->handle_spares(std::move(psqlite), std::move(m_sqlite_eph));
 	--m_base->reference;
 	g_maint_ref_cv.notify_all();
@@ -682,8 +688,18 @@ db_conn::~db_conn()
 
 db_conn &db_conn::operator=(db_conn &&o)
 {
+	if (this == &o)
+		return *this;
+	/* Clean up our own state first. */
+	m_prepstm.reset();
+	if (m_base != nullptr) {
+		m_base->handle_spares(std::move(psqlite), std::move(m_sqlite_eph));
+		--m_base->reference;
+		g_maint_ref_cv.notify_all();
+	}
 	psqlite = std::move(o.psqlite);
 	m_sqlite_eph = std::move(o.m_sqlite_eph);
+	m_prepstm = std::move(o.m_prepstm);
 	o.psqlite = o.m_sqlite_eph = nullptr;
 	m_base = std::move(o.m_base);
 	o.m_base = nullptr;
@@ -749,8 +765,10 @@ void db_base::drop_all()
 /**
  * Check if this db_base object is ripe for deletion.
  */
-static bool remove_from_hash(const db_base &pdb, time_point now)
+static bool dbase_is_purgable(const db_base &pdb, time_point now)
 {
+	/* Guard against writers that might interfere with reads. */
+	std::lock_guard hold(pdb.giant_lock);
 	if (pdb.tables.table_list.size() > 0)
 		/* emsmdb still references in-memory tables */
 		return false;
@@ -778,18 +796,15 @@ static void *db_expiry_thread(void *param)
 		/* Exclusive ownership over the list is needed, obviously, since we modify it */
 		std::lock_guard hhold(g_hash_lock);
 		auto now_time = tp_now();
-		for (auto it = g_hash_table.begin(); it != g_hash_table.end(); ) {
-			auto &dbase = it->second;
-			/*
-			 * There must be no readers nor writers if we destroy it.
-			 * Hence another lock.
-			 */
-			std::unique_lock dhold(dbase.giant_lock);
-			if (remove_from_hash(dbase, now_time))
-				it = g_hash_table.erase(it);
-			else
-				++it;
-		}
+		/*
+		 * There must be no readers nor writers when we destroy it.
+		 * dbase_is_purgable is taking dbase.giant_lock, which is good
+		 * enough to establish absence of other readers (and there
+		 * ought to be no new ones, since we also hold g_hash_lock).
+		 */
+		std::erase_if(g_hash_table, [=](const decltype(g_hash_table)::value_type &iter) {
+			return dbase_is_purgable(iter.second, now_time);
+		});
 	}
 	return nullptr;
 }
@@ -2294,9 +2309,6 @@ void db_conn::notify_new_mail(uint64_t folder_id, uint64_t message_id,
 		pnew_mail->pmessage_class = static_cast<char *>(pvalue);
 		notifq.emplace_back(std::move(datagram), std::move(parrays));
 	}
-	dbeng_notify_cttbl_add_row(*pdb, folder_id, message_id, dbase, notifq);
-	pdb->notify_folder_modification(common_util_get_folder_parent_fid(
-		pdb->psqlite, folder_id), folder_id, dbase, notifq);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __PRETTY_FUNCTION__);
 }

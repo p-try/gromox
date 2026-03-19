@@ -63,10 +63,6 @@
 using namespace std::string_literals;
 using namespace gromox;
 
-extern "C" {
-extern char **environ;
-}
-
 namespace {
 
 class hxmc_deleter {
@@ -76,10 +72,17 @@ class hxmc_deleter {
 
 }
 
+enum output_mode {
+	OM_STDERR, /* direct to existing stderr file descriptor */
+	OM_STDERR_COLORS, /* with colors */
+	OM_SYSLOG, /* send to syslog instead */
+	OM_FILE, /* send to a g_logfp */
+};
+
 static unsigned int g_max_loglevel = MLOG_DEFAULT_LEVEL;
 static std::mutex g_log_mutex;
 static std::unique_ptr<FILE, file_deleter> g_logfp;
-static bool g_log_tty, g_log_syslog;
+static enum output_mode g_log_mode;
 
 static const char *mapi_errname(unsigned int e)
 {
@@ -773,37 +776,36 @@ bool set_digest(char *json, size_t iomax, const char *key, uint64_t val)
 	return set_digest2(json, iomax, key, Json::Value::UInt64(val));
 }
 
+static enum output_mode mlog_typical_mode(const char *filename)
+{
+	if (filename == nullptr || *filename == '\0' || strcmp(filename, "-") == 0) {
+		if (isatty(STDERR_FILENO))
+			return OM_STDERR_COLORS;
+		else if (getppid() == 1 && getenv("JOURNAL_STREAM") != nullptr)
+			return OM_SYSLOG;
+		return OM_STDERR;
+	}
+	return strcmp(filename, "syslog") == 0 ? OM_SYSLOG : OM_FILE;
+}
+
 void mlog_init(const char *ident, const char *filename, unsigned int max_level,
     const char *user)
 {
 	g_max_loglevel = max_level;
-	bool for_syslog = false, for_tty = false;
-	if (filename == nullptr || *filename == '\0' || strcmp(filename, "-") == 0) {
-		if (isatty(STDERR_FILENO))
-			for_tty = true;
-		else if (getppid() == 1 && getenv("JOURNAL_STREAM") != nullptr)
-			for_syslog = true;
-		else
-			for_tty = true;
-	} else if (strcmp(filename, "syslog") == 0) {
-		for_syslog = true;
-	}
-	if (for_syslog) {
+	auto mode = mlog_typical_mode(filename);
+	if (mode == OM_SYSLOG) {
 		openlog(ident, LOG_PID, LOG_MAIL);
 		setlogmask((1 << (max_level + 2)) - 1);
-		g_log_syslog = true;
-		g_log_tty = false;
+		g_log_mode = mode;
 		g_logfp.reset();
 		return;
-	}
-	if (for_tty) {
-		g_log_tty = true;
-		g_log_syslog = false;
+	} else if (mode == OM_STDERR || mode == OM_STDERR_COLORS) {
+		g_log_mode = mode;
 		g_logfp.reset();
 		setvbuf(stderr, nullptr, _IOLBF, 0);
 		return;
 	}
-	g_log_tty = g_log_syslog = false;
+	g_log_mode = mode;
 	if (user != nullptr) {
 		auto fd = open(filename, O_RDWR | O_CREAT | O_EXCL, FMODE_PRIVATE);
 		if (fd >= 0) {
@@ -818,12 +820,12 @@ void mlog_init(const char *ident, const char *filename, unsigned int max_level,
 	std::lock_guard hold(g_log_mutex);
 	g_logfp.reset(fopen(filename, "a"));
 	if (g_logfp == nullptr) {
-		g_log_tty = true;
-		g_log_syslog = false;
+		g_log_mode = mode;
+		setvbuf(stderr, nullptr, _IOLBF, 0);
 		mlog(LV_ERR, "Could not open %s for writing: %s. Using stderr.",
 		        filename, strerror(errno));
-		setvbuf(stderr, nullptr, _IOLBF, 0);
 	} else {
+		g_log_mode = OM_FILE;
 		setvbuf(g_logfp.get(), nullptr, _IOLBF, 0);
 	}
 }
@@ -834,27 +836,24 @@ void mlog(unsigned int level, const char *fmt, ...)
 		return;
 	va_list args;
 	va_start(args, fmt);
-	if (g_log_syslog) {
+	if (g_log_mode == OM_SYSLOG) {
 		vsyslog(level + 1, fmt, args);
 		va_end(args);
 		return;
-	} else if (g_logfp == nullptr) {
-		if (g_log_tty) {
-			auto c = level <= LV_ERR ? "\e[1;31m" :
-				 level <= LV_WARN ? "\e[31m" :
-				 level <= LV_NOTICE ? "\e[1;37m" :
-				 level == LV_DEBUG ? "\e[1;30m" : "";
-			if (*c != '\0')
-				fputs(c, stderr);
-		}
-#if 0
-		fprintf(stderr, "[%f] ", std::chrono::duration<double>(tp_now() - decltype(tp_now()){}).count());
-#endif
+	} else if (g_log_mode == OM_STDERR_COLORS) {
+		auto c = level <= LV_ERR ? "\e[1;31m" :
+			 level <= LV_WARN ? "\e[31m" :
+			 level <= LV_NOTICE ? "\e[1;37m" :
+			 level == LV_DEBUG ? "\e[1;30m" : "";
+		if (*c != '\0')
+			fputs(c, stderr);
 		vfprintf(stderr, fmt, args);
-		if (g_log_tty)
-			fputs("\e[0m\n", stderr);
-		else
-			fputc('\n', stderr);
+		fputs("\e[0m\n", stderr);
+		va_end(args);
+		return;
+	} else if (g_log_mode == OM_STDERR) {
+		vfprintf(stderr, fmt, args);
+		fputc('\n', stderr);
 		va_end(args);
 		return;
 	}
@@ -1251,6 +1250,91 @@ std::vector<std::string> gx_split_ws(std::string_view sv)
 		azbeg = sv.find_first_not_of(sep, azend);
 	}
 	return out;
+}
+
+/**
+ * Parses "Z" or "±HHMM" into minutes west of GMT.
+ * Returns a bool indicating whether a zone was recognized.
+ */
+bool simple_zone_to_minwest(const char *s, int *west, char **end)
+{
+	if (s[0] == 'Z' && s[1] == '\0') {
+		if (end != nullptr)
+			*end = deconst(s + 1);
+		*west = 0;
+		return true;
+	} else if (s[0] != '+' && s[0] != '-') {
+		if (end != nullptr)
+			*end = deconst(s);
+		return false;
+	} else if (!HX_isdigit(s[1]) || !HX_isdigit(s[2]) || !HX_isdigit(s[3]) || !HX_isdigit(s[4])) {
+		if (end != nullptr)
+			*end = deconst(s);
+		return false;
+	}
+	int min = (s[4] - '0') + (s[3] - '0') * 10 +
+		  (s[2] - '0') * 60 + (s[1] - '0') * 600;
+	*west = s[0] == '-' ? min : -min;
+	if (end != nullptr)
+		*end = deconst(s + 5);
+	return true;
+}
+
+/**
+ * Parses a zone, supports the archaic RFC 822 zone labels.
+ */
+bool rfc822_zone_to_minwest(const char *s, int *west, char **end)
+{
+	if (s[0] == '+' || s[0] == '-')
+		return simple_zone_to_minwest(s, west, end);
+	if (s[0] == 'Z' && s[1] == '\0') {
+		*west = 0;
+		if (end != nullptr)
+			*end = deconst(&s[1]);
+		return true;
+	}
+	/* these are the Sandford Fleming timezone labels */
+	if (s[0] >= 'A' && s[0] <= 'I' && s[1] == '\0') {
+		*west = 60 * (s[0] - 'A' + 1);
+		if (end != nullptr)
+			*end = deconst(&s[1]);
+		return true;
+	} else if (s[0] >= 'K' && s[0] <= 'M' && s[1] == '\0') {
+		*west = 60 * (s[0] - 'K' + 10);
+		if (end != nullptr)
+			*end = deconst(&s[1]);
+		return true;
+	} else if (s[0] >= 'N' && s[0] <= 'Y' && s[1] == '\0') {
+		*west = -60 * static_cast<int>(s[0] - 'N' + 1);
+		if (end != nullptr)
+			*end = deconst(&s[1]);
+		return true;
+	}
+	/* Also obsoleted: magic fixed strings */
+	static constexpr struct zmap_entry {
+		char name[4]{};
+		int west = 0;
+	} zmap[] = {
+		{"UT", 0},
+		{"GMT", 0},
+		{"EST", 5*60},
+		{"EDT", 4*60},
+		{"CST", 6*60},
+		{"CDT", 5*60},
+		{"MST", 7*60},
+		{"MDT", 6*60},
+		{"PST", 8*60},
+		{"PDT", 7*60},
+	};
+	for (const auto &row : zmap) {
+		if (strcmp(s, row.name) != 0)
+			continue;
+		*west = row.west;
+		if (end != nullptr)
+			*end = deconst(&s[strlen(s)]);
+		return true;
+	}
+	return false;
 }
 
 }

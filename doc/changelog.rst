@@ -1,19 +1,54 @@
-Milestone 3.4.62
-================
+In Development 3.5.24
+=====================
+
+Enhancements:
+
+* oxcical: treat zero-length PidLidAppointmentTimeZoneDefinitionStartDisplay as if absent
+* eml2mt: output GXMT data as soon as practical
+
+Fixes:
+
+* oxcmail: resolve a case of bad_function_call getting thrown
+* midb: retrieve midb_sqlite_busy_timeout from the right config file,
+  avert a "config key .. has no default and was not set either" log message
+* exmdb: close cursors before modifying tables in purge
+* exmdb: fix use-after-free when exmdb_provider utilizes exmdb_client in multiserver
+* exmdb: proper symmetric unlocking for db_base_rd_ptr class
+* exmdb: unlock giant_lock before erasing the same from hash table
+* midb: release lock and reference when me_sync_mailbox experiences a sync failure
+* lib: avoid emitting colors to stderr when that is not a tty
+* exmdb: strip redundant notifications from notify_new_mail()
+* exmdb: stop returning garbage in MAPI content table cells when the table sort
+  order contains a PT_MV_UNICODE | MV_INSTANCE column.
+
+Changes:
+
+* imap: remodeled midb_agent to require a less memory in practice
+
+
+Gromox 3.5 (2025-02-26)
+=======================
 
 Enhancements:
 
 * Finer-grained control over listening socket creation, including new config
   directives (`http_listen`, `imap_listen_tls`, etc.) for specifying these.
   This makes it possible not having to use the wildcard address.
+* importer: make -B option usable with public stores
 
 Fixes:
 
 * emsmdb: async notification connections were not marked active and would not
   deliver a signal of new pending events.
+* emsmdb: repair EcDoAsyncWaitEx to immediately return when notifications are
+  already pending in the session queue
+* emsmdb: fix UAF/crash when notifications are sent over RPCH
 * oxcical: upon reception of non-recurring appointments, the PidLidRecurring=0
   property will be set now, as some Outlook versions fail to show appointments
   in the daily/weekly/monthly view if the property is absent.
+* oxcmail: messages with timezones ±08xx/09xx were mistreated as UTC
+* oxvcard: fixed a field shift in the ADR line's parsing and emission
+* ews: trim all C0 control codes from XML responses
 * exmdb: limit production of PR_RTF_COMPRESSED variants of
   PR_BODY/PR_HTML when saving messages to IPM.Task objects, as OL
   only depends on it for those message classes.

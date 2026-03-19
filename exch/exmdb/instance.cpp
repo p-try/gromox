@@ -183,6 +183,8 @@ void instance_node::release()
 
 instance_node &instance_node::operator=(instance_node &&o) noexcept
 {
+	if (this == &o)
+		return *this;
 	release();
 	instance_id = o.instance_id;
 	parent_id = o.parent_id;
@@ -246,7 +248,7 @@ static bool instance_load_message(db_conn &db,
 				return FALSE;
 			proptag_t proptag = pstmt.col_uint64(0);
 			auto cid = pstmt.col_text(1);
-			if (cid == nullptr) {
+			if (*cid == '\0') {
 				mlog(LV_DEBUG, "W-1441: illegal CID reference in msg %llu prop %xh",
 					LLU{message_id}, tag);
 				break;
@@ -266,7 +268,7 @@ static bool instance_load_message(db_conn &db,
 			if (pstmt == nullptr || pstmt.step() != SQLITE_ROW)
 				return FALSE;
 			auto cid = pstmt.col_text(0);
-			if (cid == nullptr) {
+			if (*cid == '\0') {
 				mlog(LV_DEBUG, "W-1442: illegal CID reference in msg %llu prop %xh",
 					LLU{message_id}, tag);
 				break;
@@ -288,7 +290,7 @@ static bool instance_load_message(db_conn &db,
 				return FALSE;
 			proptag_t proptag = pstmt.col_uint64(0);
 			auto cid = pstmt.col_text(1);
-			if (cid == nullptr) {
+			if (*cid == '\0') {
 				mlog(LV_DEBUG, "W-1444: illegal CID reference in msg %llu prop %xh",
 					LLU{message_id}, tag);
 				break;
