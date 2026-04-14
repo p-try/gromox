@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2022–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2022–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #	include "config.h"
@@ -66,6 +66,7 @@ struct svc_mgr final {
 	void *symget(const char *, const char *, const std::type_info &);
 	void symput(const char *, const char *);
 	void trigger_all(enum plugin_op);
+	int run_library(const generic_module &);
 
 	public:
 	std::string g_config_dir, g_data_dir;
@@ -74,11 +75,12 @@ struct svc_mgr final {
 	std::shared_ptr<config_file> g_config_file;
 
 	protected:
-	int load_library(const generic_module &);
+	bool library_present(const generic_module &);
+	void insert_library(const generic_module &);
+	int run_library_internal(SVC_PLUG_ENTITY &);
 
 	std::list<SVC_PLUG_ENTITY> g_list_plug;
 	std::vector<std::shared_ptr<service_entry>> g_list_service;
-	std::span<const generic_module> g_plugin_names;
 	SVC_PLUG_ENTITY g_system_image;
 };
 
@@ -94,12 +96,19 @@ static thread_local SVC_PLUG_ENTITY *g_cur_plug;
  *  init the service module with the path specified where
  *  we can load the .svc plug-in
  */
-svc_mgr::svc_mgr(service_init_param &&parm)
+svc_mgr::svc_mgr(service_init_param &&parm) :
+	g_context_num(parm.context_num), g_program_identifier(parm.prog_id),
+	g_config_file(std::move(parm.cfg))
 {
-	g_context_num = parm.context_num;
-	g_config_file = std::move(parm.cfg);
-	g_plugin_names = parm.plugin_list;
-	g_program_identifier = parm.prog_id;
+	if (g_config_file == nullptr) {
+		g_config_file = std::make_shared<config_file>();
+		g_config_file->set_value("config_file_path", PKGSYSCONFDIR);
+		g_config_file->set_value("data_file_path", PKGDATADIR);
+	}
+	g_config_dir = znul(g_config_file->get_value("config_file_path"));
+	g_data_dir = znul(g_config_file->get_value("data_file_path"));
+	for (const auto &i : parm.plugin_list)
+		insert_library(i);
 }
 
 /* See commentary of service_query() why it's done */
@@ -116,53 +125,31 @@ static constexpr struct dlfuncs server_funcs = {
 	/* .get_prog_id = */ []() { return le_svc_mgr->g_program_identifier; },
 };
 
-int svc_mgr::run_early() try
+int svc_mgr::run_early()
 {
-	if (g_config_file == nullptr) {
-		g_config_file = std::make_shared<config_file>();
-		g_config_file->set_value("config_file_path", PKGSYSCONFDIR);
-		g_config_file->set_value("data_file_path", PKGDATADIR);
-	}
-	g_config_dir = znul(g_config_file->get_value("config_file_path"));
-	g_data_dir = znul(g_config_file->get_value("data_file_path"));
-
-	for (const auto &i : g_plugin_names) {
-		int ret = load_library(i);
-		if (ret == PLUGIN_LOAD_OK) {
-			if (g_cur_plug == nullptr)
-				continue;
-			if (g_cur_plug->lib_main(PLUGIN_EARLY_INIT, server_funcs)) {
-				g_cur_plug = nullptr;
-				continue;
-			}
-			g_list_plug.pop_back();
+	for (auto it = g_list_plug.begin(); it != g_list_plug.end(); ) {
+		if (it->init_state != generic_module::state::uninit)
+			continue;
+		it->init_state = generic_module::state::early_start;
+		if (it->lib_main(PLUGIN_EARLY_INIT, server_funcs)) {
+			it->init_state = generic_module::state::early_done;
+			++it;
+			continue;
 		}
-		g_cur_plug = nullptr;
-		service_stop();
+		mlog(LV_ERR, "service: init of %s not successful", znul(it->file_name));
 		return PLUGIN_FAIL_EXECUTEMAIN;
 	}
-	return 0;
-} catch (const std::bad_alloc &) {
-	return PLUGIN_FAIL_EXECUTEMAIN;
+	return PLUGIN_LOAD_OK;
 }
 
 int svc_mgr::run()
 {
-	for (auto it = g_list_plug.begin(); it != g_list_plug.end(); ) {
-		g_cur_plug = &*it;
-		if (g_cur_plug->lib_main(PLUGIN_INIT, server_funcs)) {
-			g_cur_plug->completed_init = true;
-			g_cur_plug = nullptr;
-			++it;
-			continue;
-		}
-		mlog(LV_ERR, "service: init of %s not successful", znul(g_cur_plug->file_name));
-		it = g_list_plug.erase(it);
-		g_cur_plug = nullptr;
-		service_stop();
-		return PLUGIN_FAIL_EXECUTEMAIN;
+	for (auto it = g_list_plug.begin(); it != g_list_plug.end(); ++it) {
+		auto ret = run_library_internal(*it);
+		if (ret != PLUGIN_LOAD_OK)
+			return ret;
 	}
-	return 0;
+	return PLUGIN_LOAD_OK;
 }
 
 svc_mgr::~svc_mgr()
@@ -177,35 +164,54 @@ svc_mgr::~svc_mgr()
 	g_list_service.clear();
 }
 
-/*
- *  load the plug-in in the specified path
- *
- *  @return
- *      PLUGIN_LOAD_OK              success
- *      PLUGIN_ALREADY_LOADED       already loaded by service module
- *      PLUGIN_FAIL_OPEN            error loading the file
- *      PLUGIN_NO_MAIN              error finding library function
- *      PLUGIN_FAIL_ALLOCNODE       fail to allocate memory for a node
- *      PLUGIN_FAIL_EXECUTEMAIN     error executing the plugin's init function
- */
-int svc_mgr::load_library(const generic_module &mod)
+bool svc_mgr::library_present(const generic_module &mod)
+{
+	return std::find(g_list_plug.cbegin(), g_list_plug.cend(), mod) != g_list_plug.cend();
+}
+
+void svc_mgr::insert_library(const generic_module &mod)
 {
 	/* check whether the library is already loaded */
-	if (std::any_of(g_list_plug.cbegin(), g_list_plug.cend(),
-	    [&](const SVC_PLUG_ENTITY &p) { return p.file_name == znul(mod.file_name); })) {
-		mlog(LV_ERR, "%s: already loaded", znul(mod.file_name));
-		return PLUGIN_ALREADY_LOADED;
-	}
+	if (library_present(mod))
+		return;
 	SVC_PLUG_ENTITY plug;
 	plug.lib_main = mod.lib_main;
 	plug.file_name = mod.file_name;
 	g_list_plug.push_back(std::move(plug));
-	/*
-	 *  indicate the current lib node when plugin rigisters service
-     *  plugin can only register service in "SVC_LibMain"
-	 *  with the parameter PLUGIN_INIT
-	 */
-	g_cur_plug = &g_list_plug.back();
+}
+
+/*
+ * For use by all kinds of modules to load libraries in the moment they are
+ * needed. EARLY_INIT not included on purpose.
+ */
+int svc_mgr::run_library(const generic_module &mod) try
+{
+	auto iter = std::find(g_list_plug.begin(), g_list_plug.end(), mod);
+	if (iter != g_list_plug.end())
+		return run_library_internal(*iter);
+	SVC_PLUG_ENTITY e;
+	e.file_name = mod.file_name;
+	e.lib_main  = mod.lib_main;
+	g_list_plug.emplace_back(std::move(e));
+	return run_library_internal(g_list_plug.back());
+} catch (const std::bad_alloc &) {
+	return PLUGIN_FAIL_ALLOCNODE;
+}
+
+int svc_mgr::run_library_internal(SVC_PLUG_ENTITY &cur)
+{
+	if (cur.init_state != generic_module::state::uninit &&
+	    cur.init_state != generic_module::state::early_done)
+		return 0;
+	cur.init_state = generic_module::state::init_start;
+	g_cur_plug = &cur;
+	if (!cur.lib_main(PLUGIN_INIT, server_funcs)) {
+		g_cur_plug = nullptr;
+		mlog(LV_ERR, "service: init of %s not successful", znul(cur.file_name));
+		return PLUGIN_FAIL_EXECUTEMAIN;
+	}
+	g_cur_plug = nullptr;
+	cur.init_state = generic_module::state::init_done;
 	return PLUGIN_LOAD_OK;
 }
 
@@ -233,7 +239,7 @@ SVC_PLUG_ENTITY::~SVC_PLUG_ENTITY()
 		mlog(LV_NOTICE, "Unbalanced refcount on %s + ENOMEM", znul(plib->file_name));
 		return;
 	}
-	if (!plib->completed_init)
+	if (plib->init_state != generic_module::state::init_done)
 		return;
 	if (plib->file_name != nullptr)
 		mlog(LV_INFO, "service: unloading %s", plib->file_name);
@@ -370,9 +376,16 @@ void svc_mgr::trigger_all(enum plugin_op ev)
 generic_module::generic_module(generic_module &&o) noexcept :
 	file_name(std::move(o.file_name)),
 	lib_main(std::move(o.lib_main)),
-	completed_init(std::move(o.completed_init))
+	init_state(std::move(o.init_state))
 {
-	o.completed_init = false;
+	o.init_state = state::uninit;
+}
+
+bool generic_module::operator==(const generic_module &o) const noexcept
+{
+	return lib_main == o.lib_main ||
+	       (file_name != nullptr && o.file_name != nullptr &&
+	       strcmp(file_name, o.file_name) == 0);
 }
 
 void service_init(service_init_param &&parm)
@@ -393,6 +406,11 @@ int service_run_early()
 int service_run()
 {
 	return le_svc_mgr->run();
+}
+
+int service_run_library(const generic_module &mod)
+{
+	return le_svc_mgr->run_library(mod);
 }
 
 BOOL service_register_service(const char *fun, void *addr,

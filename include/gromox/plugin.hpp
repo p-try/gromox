@@ -132,14 +132,19 @@ struct GX_EXPORT service_node {
  * @file_name: can be nullptr in case of g_system_image
  */
 struct GX_EXPORT generic_module {
+	enum class state : uint8_t {
+		uninit = 0, early_start, early_done, init_start, init_done,
+	};
+
 	constexpr generic_module() = default;
 	constexpr generic_module(const char *a, PLUGIN_MAIN b) : file_name(a), lib_main(b) {}
 	generic_module(generic_module &&) noexcept;
 	void operator=(generic_module &&) noexcept = delete;
+	bool operator==(const generic_module &) const noexcept;
 
 	const char *file_name = nullptr;
 	PLUGIN_MAIN lib_main = nullptr;
-	bool completed_init = false;
+	state init_state = state::uninit;
 };
 
 }

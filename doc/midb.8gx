@@ -15,7 +15,7 @@ sender to facilitate IMAP listings.
 .TP
 \fB\-c\fP \fIconfig\fP
 Read configuration directives from the given file. If this option is not
-specified, /etc/gromox/midb.cfg will be read if it exists.
+specified, /etc/gromox/gromox.cfg and /etc/gromox/midb.cfg will be read.
 .TP
 \fB\-\-version\fP
 Output version information and exit.
@@ -127,12 +127,10 @@ towards midb.
 .br
 Default: \fI100\fP
 .TP
-\fBnotify_stub_threads_num\fP
-Default: \fI10\fP
-.TP
 \fBrpc_proxy_connection_num\fP
-The maximum number of concurrent connections that midb may open towards exmdb.
-Every prefix in exmdb_list.txt takes up one slot effectively.
+For every exmdb server in exmdb_list.txt, establish and keep this many number
+of outbound connections for sending commands. (There is at most one additional
+connection, for async notification, alive per server.)
 .br
 Default: \fI10\fP
 .TP

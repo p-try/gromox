@@ -93,7 +93,7 @@ static bool oxcical_parse_vtsubcomponent(const ical_component &sub,
 		if (pvalue == nullptr)
 			return false;
 		int fromwest = 0;
-		if (!simple_zone_to_minwest(pvalue, &west, nullptr))
+		if (!simple_zone_to_minwest(pvalue, &fromwest, nullptr))
 			return false;
 		*pdaylightbias = west - fromwest;
 	}
@@ -794,8 +794,12 @@ static bool oxcical_parse_recipients(const ical_component &main_ev,
 		if (!is_attendee && !is_organizer)
 			continue;
 		paddress = piline->get_first_subvalue();
-		if (paddress == nullptr || strncasecmp(paddress, "MAILTO:", 7) != 0)
+		if (paddress == nullptr || strncasecmp(paddress, "MAILTO:", 7) != 0) {
+			if (paddress != nullptr && is_organizer)
+				mlog(LV_WARN, "W-2745: %s has non-MAILTO URI \"%s\", skipping recipient entry",
+					piline->m_name.c_str(), paddress);
 			continue;
+		}
 		paddress += 7;
 		pdisplay_name = piline->get_first_paramval("CN");
 		auto cutype = piline->get_first_paramval("CUTYPE");
@@ -1051,16 +1055,43 @@ static bool oxcical_parse_subtype(namemap &phash, uint16_t *plast_propid,
 	return true;
 }
 
-static bool oxcical_set_stateflags(namemap &hash, uint16_t &last_propid,
-    MESSAGE_CONTENT &msg)
+static bool oxcical_set_stateflags(const char *method,
+    namemap &hash, uint16_t &last_propid, message_content &msg)
 {
 	uint32_t val = 0;
+	if (method != nullptr) {
+		if (strcasecmp(method, "REQUEST") == 0)
+			val = asfMeeting | asfReceived;
+		else if (strcasecmp(method, "CANCEL") == 0)
+			val = asfMeeting | asfReceived | asfCanceled;
+	}
 	PROPERTY_NAME pn = {MNID_ID, PSETID_Appointment, PidLidAppointmentStateFlags};
 	if (namemap_add(hash, last_propid, std::move(pn)) != 0)
 		return false;
 	if (msg.proplist.set(PROP_TAG(PT_LONG, last_propid), &val) != ecSuccess)
 		return false;
 	++last_propid;
+
+	/* An incoming request should start as respNotResponded. */
+	if (method != nullptr &&
+	    (strcasecmp(method, "REQUEST") == 0 ||
+	     strcasecmp(method, "CANCEL") == 0)) {
+		uint32_t rs = respNotResponded;
+		pn = {MNID_ID, PSETID_Appointment, PidLidResponseStatus};
+		if (namemap_add(hash, last_propid, std::move(pn)) != 0)
+			return false;
+		if (msg.proplist.set(PROP_TAG(PT_LONG, last_propid), &rs) != ecSuccess)
+			return false;
+		++last_propid;
+
+		rs = mtgRequest | mtgFull;
+		pn = {MNID_ID, PSETID_Meeting, PidLidMeetingType};
+		if (namemap_add(hash, last_propid, std::move(pn)) != 0)
+			return false;
+		if (msg.proplist.set(PROP_TAG(PT_LONG, last_propid), &rs) != ecSuccess)
+			return false;
+		++last_propid;
+	}
 	return true;
 }
 
@@ -1207,7 +1238,7 @@ static bool oxcical_parse_uid(const ical_component &main_event,
 			goto MAKE_GLOBALOBJID;
 		}
 	}
-	memset(&globalobjectid, 0, sizeof(GLOBALOBJECTID));
+	globalobjectid = {};
 	globalobjectid.arrayid = EncodedGlobalId;
 	globalobjectid.year = effective_itime.year;
 	globalobjectid.month = effective_itime.month;
@@ -1329,10 +1360,13 @@ static bool oxcical_parse_organizer(const ical_component &main_event,
 		return true;
 	paddress = piline->get_first_subvalue();
 	if (paddress != nullptr) {
-		if (strncasecmp(paddress, "MAILTO:", 7) == 0)
+		if (strncasecmp(paddress, "MAILTO:", 7) == 0) {
 			paddress += 7;
-		else
+		} else {
+			mlog(LV_WARN, "W-2744: ORGANIZER has non-MAILTO URI \"%s\", "
+				"address properties will be incomplete", paddress);
 			paddress = nullptr;
+		}
 	}
 	pdisplay_name = piline->get_first_paramval("CN");
 	/*
@@ -1366,14 +1400,21 @@ static bool oxcical_parse_organizer(const ical_component &main_event,
 	 * but EXC2019 does not do that either, and X-MS-OLK-SENDER is only generated
 	 * under peculiar circumstances (cf. doc/oxocal.rst).
 	 */
+	auto skb = "SMTP:"s + paddress;
+	HX_strupper(skb.data());
+	BINARY srchkey;
+	srchkey.cb = skb.size() + 1;
+	srchkey.pc = deconst(skb.c_str());
 	if (pmsg->proplist.set(PR_SENT_REPRESENTING_ADDRTYPE, "SMTP") != ecSuccess ||
 	    pmsg->proplist.set(PR_SENT_REPRESENTING_EMAIL_ADDRESS, paddress) != ecSuccess ||
 	    pmsg->proplist.set(PR_SENT_REPRESENTING_SMTP_ADDRESS, paddress) != ecSuccess ||
 	    pmsg->proplist.set(PR_SENT_REPRESENTING_ENTRYID, &tmp_bin) != ecSuccess ||
+	    pmsg->proplist.set(PR_SENT_REPRESENTING_SEARCH_KEY, &srchkey) != ecSuccess ||
 	    pmsg->proplist.set(PR_SENDER_ADDRTYPE, "SMTP") != ecSuccess ||
 	    pmsg->proplist.set(PR_SENDER_EMAIL_ADDRESS, paddress) != ecSuccess ||
 	    pmsg->proplist.set(PR_SENDER_SMTP_ADDRESS, paddress) != ecSuccess ||
-	    pmsg->proplist.set(PR_SENDER_ENTRYID, &tmp_bin) != ecSuccess)
+	    pmsg->proplist.set(PR_SENDER_ENTRYID, &tmp_bin) != ecSuccess ||
+	    pmsg->proplist.set(PR_SENDER_SEARCH_KEY, &srchkey) != ecSuccess)
 		return false;
 	return true;
 }
@@ -2201,7 +2242,7 @@ static const char *oxcical_import_internal(const char *method,
 		b_allday = true;
 	if (b_allday && !oxcical_parse_subtype(phash, &last_propid, pmsg, pexception))
 		return "E-2704: oxcical_parse_subtype returned an unspecified error";
-	if (!oxcical_set_stateflags(phash, last_propid, *pmsg))
+	if (!oxcical_set_stateflags(method, phash, last_propid, *pmsg))
 		return "E-2739";
 
 	ical_time itime{};
@@ -3634,7 +3675,7 @@ static std::string oxcical_export_valarm(const MESSAGE_CONTENT &msg,
 static std::string oxcical_export_internal(const char *method, const char *tzid,
     const message_content &msg, const std::string &log_id_s, ical &pical,
     const std::string &org_name_s, cvt_id2user id2user, EXT_BUFFER_ALLOC alloc,
-    GET_PROPIDS get_propids) try
+    GET_PROPIDS get_propids, const char *parent_uid = nullptr) try
 {
 	const PROPERTY_NAME namequeries[] = {
 		{MNID_ID, PSETID_Appointment, PidLidAppointmentCounterProposal},
@@ -3874,12 +3915,16 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 			return "E-2214: export_rdate - unspecified error";
 	}
 
-	auto err = oxcical_export_uid(*pmsg, *pcomponent, alloc, get_propids);
-	if (err != nullptr)
-		return err;
+	if (parent_uid != nullptr) {
+		pcomponent->append_line("UID", parent_uid);
+	} else {
+		auto err = oxcical_export_uid(*pmsg, *pcomponent, alloc, get_propids);
+		if (err != nullptr)
+			return err;
+	}
 
 	auto proptag_xrt = PROP_TAG(PT_SYSTIME, propids[l_replacetime]);
-	err = oxcical_export_recid(*pmsg, proptag_xrt, b_exceptional,
+	auto err = oxcical_export_recid(*pmsg, proptag_xrt, b_exceptional,
 	      b_allday, *pcomponent, ptz_component, tzid, alloc, get_propids);
 	if (err != nullptr)
 		return err;
@@ -4024,6 +4069,8 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 		pcomponent->append_line("X-MICROSOFT-DISALLOW-COUNTER", *flag != 0 ? "TRUE" : "FALSE");
 
 	if (!b_exceptional && pmsg->children.pattachments != nullptr) {
+		auto uid_line = pcomponent->get_line("UID");
+		auto uid_val  = uid_line != nullptr ? uid_line->get_first_subvalue() : nullptr;
 		for (auto &attachment : *pmsg->children.pattachments) {
 			auto pembedded = attachment.pembedded;
 			if (pembedded == nullptr)
@@ -4039,7 +4086,7 @@ static std::string oxcical_export_internal(const char *method, const char *tzid,
 				continue;
 			auto estr = oxcical_export_internal(method, tzid,
 			            *pembedded, log_id, pical, org_name,
-			            id2user, alloc, get_propids);
+			            id2user, alloc, get_propids, uid_val);
 			if (estr.size() > 0)
 				return estr;
 		}

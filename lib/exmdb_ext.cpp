@@ -37,6 +37,11 @@ template<typename T> T *cu_alloc(size_t elem)
 	return static_cast<T *>(exmdb_rpc_alloc(sizeof(T) * elem));
 }
 
+static inline pack_result exmdb_pull(EXT_PULL &, exreq &) { return pack_result::ok; }
+static inline pack_result exmdb_push(EXT_PUSH &, const exreq &) { return pack_result::ok; }
+static inline pack_result exmdb_pull(EXT_PULL &, exresp &) { return pack_result::ok; }
+static inline pack_result exmdb_push(EXT_PUSH &, const exresp &) { return pack_result::ok; }
+
 static pack_result exmdb_pull(EXT_PULL &x, exreq_connect &d)
 {
 	TRY(x.g_str(&d.prefix));
@@ -2210,134 +2215,6 @@ static pack_result exmdb_pull(EXT_PULL &x, exreq_write_delegates &d)
 	return x.g_str_a(&d.userlist);
 }
 
-#define RQ_WITH_ARGS \
-	E(get_named_propids) \
-	E(get_named_propnames) \
-	E(get_mapping_guid) \
-	E(get_mapping_replid) \
-	E(get_store_properties) \
-	E(set_store_properties) \
-	E(remove_store_properties) \
-	E(get_mbox_perm) \
-	E(get_folder_by_class) \
-	E(set_folder_by_class) \
-	E(is_folder_present) \
-	E(is_folder_deleted) \
-	E(get_folder_by_name) \
-	E(get_folder_perm) \
-	E(create_folder_v1) \
-	E(create_folder) \
-	E(get_folder_all_proptags) \
-	E(get_folder_properties) \
-	E(set_folder_properties) \
-	E(remove_folder_properties) \
-	E(delete_folder) \
-	E(empty_folder) \
-	E(is_descendant_folder) \
-	E(copy_folder_internal) \
-	E(get_search_criteria) \
-	E(set_search_criteria) \
-	E(movecopy_message) \
-	E(movecopy_messages) \
-	E(movecopy_folder) \
-	E(delete_messages) \
-	E(get_message_brief) \
-	E(sum_hierarchy) \
-	E(load_hierarchy_table) \
-	E(sum_content) \
-	E(load_content_table) \
-	E(reload_content_table) \
-	E(load_permission_table) \
-	E(load_rule_table) \
-	E(unload_table) \
-	E(sum_table) \
-	E(query_table) \
-	E(match_table) \
-	E(locate_table) \
-	E(read_table_row) \
-	E(mark_table) \
-	E(get_table_all_proptags) \
-	E(expand_table) \
-	E(collapse_table) \
-	E(store_table_state) \
-	E(restore_table_state) \
-	E(is_msg_present) \
-	E(is_msg_deleted) \
-	E(load_message_instance) \
-	E(load_embedded_instance) \
-	E(get_embedded_cn) \
-	E(reload_message_instance) \
-	E(clear_message_instance) \
-	E(read_message_instance) \
-	E(write_message_instance) \
-	E(load_attachment_instance) \
-	E(create_attachment_instance) \
-	E(read_attachment_instance) \
-	E(write_attachment_instance) \
-	E(delete_message_instance_attachment) \
-	E(flush_instance) \
-	E(unload_instance) \
-	E(get_instance_all_proptags) \
-	E(get_instance_properties) \
-	E(set_instance_properties) \
-	E(remove_instance_properties) \
-	E(is_descendant_instance) \
-	E(empty_message_instance_rcpts) \
-	E(get_message_instance_rcpts_num) \
-	E(get_message_instance_rcpts_all_proptags) \
-	E(get_message_instance_rcpts) \
-	E(update_message_instance_rcpts) \
-	E(copy_instance_rcpts) \
-	E(empty_message_instance_attachments) \
-	E(get_message_instance_attachments_num) \
-	E(get_message_instance_attachment_table_all_proptags) \
-	E(query_message_instance_attachment_table) \
-	E(copy_instance_attachments) \
-	E(set_message_instance_conflict) \
-	E(get_message_rcpts) \
-	E(get_message_properties) \
-	E(set_message_properties) \
-	E(set_message_read_state) \
-	E(remove_message_properties) \
-	E(allocate_message_id) \
-	E(mark_modified) \
-	E(try_mark_submit) \
-	E(clear_submit) \
-	E(link_message) \
-	E(unlink_message) \
-	E(rule_new_message) \
-	E(set_message_timer) \
-	E(get_message_timer) \
-	E(empty_folder_permission) \
-	E(update_folder_permission) \
-	E(empty_folder_rule) \
-	E(update_folder_rule) \
-	E(deliver_message) \
-	E(write_message) \
-	E(read_message) \
-	E(get_content_sync) \
-	E(get_hierarchy_sync) \
-	E(allocate_ids) \
-	E(subscribe_notification) \
-	E(unsubscribe_notification) \
-	E(transport_new_mail) \
-	E(check_contact_address) \
-	E(get_public_folder_unread_count) \
-	E(store_eid_to_user) \
-	E(purge_softdelete) \
-	E(autoreply_tsquery) \
-	E(autoreply_tsupdate) \
-	E(recalc_store_size) \
-	E(imapfile_read) \
-	E(imapfile_write) \
-	E(imapfile_delete) \
-	E(cgkreset) \
-	E(set_maintenance) \
-	E(autoreply_getprop) \
-	E(autoreply_setprop) \
-	E(read_delegates) \
-	E(write_delegates)
-
 /**
  * This uses *& because we do not know which request type we are going to get
  * (cf. exmdb_ext_pull_response).
@@ -2367,33 +2244,26 @@ pack_result exmdb_ext_pull_request(std::string_view pbin_in,
 
 	char *dir = nullptr;
 	TRY(ext_pull.g_str(&dir));
-	pack_result xret;
-	xret = pack_result::bad_callid;
-	switch (call_id) {
-	case exmdb_callid::connect:
-	case exmdb_callid::listen_notification:
-		break;
-	case exmdb_callid::ping_store:
-	case exmdb_callid::get_all_named_propids:
-	case exmdb_callid::get_store_all_proptags:
-	case exmdb_callid::get_folder_class_table:
-	case exmdb_callid::allocate_cn:
-	case exmdb_callid::vacuum:
-	case exmdb_callid::unload_store:
-	case exmdb_callid::purge_datafiles: {
-		prequest = std::make_unique<exreq>();
-		xret = pack_result::ok;
-		break;
-	}
-#define E(t) case exmdb_callid::t: { \
+	pack_result xret = pack_result::bad_callid;
+
+#define EDEF(t, id) case exmdb_callid::t: { \
 		auto r = std::make_unique<exreq_ ## t >(); \
 		xret = exmdb_pull(ext_pull, *r); \
 		prequest = std::move(r); \
 		break; \
 	}
-	RQ_WITH_ARGS
-#undef E
+#define EOBSOL(t, id)
+
+	switch (call_id) {
+	#include <gromox/exmdb_allcalls.hpp>
+	default:
+		xret = pack_result::bad_callid;
+		break;
 	}
+
+#undef EDEF
+#undef EOBSOL
+
 	prequest->call_id = call_id;
 	prequest->dir = dir;
 	return xret;
@@ -2418,28 +2288,22 @@ pack_result exmdb_ext_push_request(const exreq *prequest, BINARY *pbin_out)
 	} else if (prequest->call_id == exmdb_callid::listen_notification) {
 		status = exmdb_push(ext_push, *static_cast<const exreq_listen_notification *>(prequest));
 	} else {
-	status = ext_push.p_str(prequest->dir);
-	if (status != pack_result::ok)
-		return status;
-	status = pack_result::bad_callid;
-	switch (prequest->call_id) {
-	case exmdb_callid::connect:
-	case exmdb_callid::listen_notification:
-		break;
-	case exmdb_callid::ping_store:
-	case exmdb_callid::get_all_named_propids:
-	case exmdb_callid::get_store_all_proptags:
-	case exmdb_callid::get_folder_class_table:
-	case exmdb_callid::allocate_cn:
-	case exmdb_callid::vacuum:
-	case exmdb_callid::unload_store:
-	case exmdb_callid::purge_datafiles:
-		status = pack_result::ok;
-		break;
-#define E(t) case exmdb_callid::t: status = exmdb_push(ext_push, *static_cast<const exreq_ ## t::view_t *>(prequest)); break;
-	RQ_WITH_ARGS
-#undef E
-	}
+		status = ext_push.p_str(prequest->dir);
+		if (status != pack_result::ok)
+			return status;
+
+#define EDEF(t, id) case exmdb_callid::t: status = exmdb_push(ext_push, *static_cast<const exreq_ ## t::view_t *>(prequest)); break;
+#define EOBSOL(t, id)
+
+		switch (prequest->call_id) {
+		#include <gromox/exmdb_allcalls.hpp>
+		default:
+			status = pack_result::bad_callid;
+			break;
+		}
+
+#undef EDEF
+#undef EOBSOL
 	}
 	if (status != pack_result::ok)
 		return status;
@@ -3618,143 +3482,6 @@ static pack_result exmdb_push(EXT_PUSH &x, const exresp_purge_softdelete &d)
 	return x.p_uint64(d.sz_fai);
 }
 
-#define RSP_WITHOUT_ARGS \
-	E(ping_store) \
-	E(remove_store_properties) \
-	E(remove_folder_properties) \
-	E(reload_content_table) \
-	E(unload_table) \
-	E(clear_message_instance) \
-	E(delete_message_instance_attachment) \
-	E(unload_instance) \
-	E(empty_message_instance_rcpts) \
-	E(update_message_instance_rcpts) \
-	E(empty_message_instance_attachments) \
-	E(set_message_instance_conflict) \
-	E(remove_message_properties) \
-	E(mark_modified) \
-	E(clear_submit) \
-	E(unlink_message) \
-	E(rule_new_message) \
-	E(set_message_timer) \
-	E(empty_folder_permission) \
-	E(update_folder_permission) \
-	E(empty_folder_rule) \
-	E(unsubscribe_notification) \
-	E(transport_new_mail) \
-	E(vacuum) \
-	E(unload_store) \
-	E(purge_datafiles) \
-	E(autoreply_tsupdate) \
-	E(recalc_store_size) \
-	E(imapfile_write) \
-	E(imapfile_delete) \
-	E(cgkreset) \
-	E(set_maintenance) \
-	E(write_delegates)
-#define RSP_WITH_ARGS \
-	E(get_all_named_propids) \
-	E(get_named_propids) \
-	E(get_named_propnames) \
-	E(get_mapping_guid) \
-	E(get_mapping_replid) \
-	E(get_store_all_proptags) \
-	E(get_store_properties) \
-	E(set_store_properties) \
-	E(get_mbox_perm) \
-	E(get_folder_by_class) \
-	E(set_folder_by_class) \
-	E(get_folder_class_table) \
-	E(is_folder_present) \
-	E(is_folder_deleted) \
-	E(get_folder_by_name) \
-	E(get_folder_perm) \
-	E(create_folder_v1) \
-	E(create_folder) \
-	E(get_folder_all_proptags) \
-	E(get_folder_properties) \
-	E(set_folder_properties) \
-	E(delete_folder) \
-	E(empty_folder) \
-	E(is_descendant_folder) \
-	E(copy_folder_internal) \
-	E(get_search_criteria) \
-	E(set_search_criteria) \
-	E(movecopy_message) \
-	E(movecopy_messages) \
-	E(movecopy_folder) \
-	E(delete_messages) \
-	E(get_message_brief) \
-	E(sum_hierarchy) \
-	E(load_hierarchy_table) \
-	E(sum_content) \
-	E(load_content_table) \
-	E(load_permission_table) \
-	E(load_rule_table) \
-	E(sum_table) \
-	E(query_table) \
-	E(match_table) \
-	E(locate_table) \
-	E(read_table_row) \
-	E(mark_table) \
-	E(get_table_all_proptags) \
-	E(expand_table) \
-	E(collapse_table) \
-	E(store_table_state) \
-	E(restore_table_state) \
-	E(is_msg_present) \
-	E(is_msg_deleted) \
-	E(load_message_instance) \
-	E(load_embedded_instance) \
-	E(get_embedded_cn) \
-	E(reload_message_instance) \
-	E(read_message_instance) \
-	E(write_message_instance) \
-	E(load_attachment_instance) \
-	E(create_attachment_instance) \
-	E(read_attachment_instance) \
-	E(write_attachment_instance) \
-	E(flush_instance) \
-	E(get_instance_all_proptags) \
-	E(get_instance_properties) \
-	E(set_instance_properties) \
-	E(remove_instance_properties) \
-	E(is_descendant_instance) \
-	E(get_message_instance_rcpts_num) \
-	E(get_message_instance_rcpts_all_proptags) \
-	E(get_message_instance_rcpts) \
-	E(copy_instance_rcpts) \
-	E(get_message_instance_attachments_num) \
-	E(get_message_instance_attachment_table_all_proptags) \
-	E(query_message_instance_attachment_table) \
-	E(copy_instance_attachments) \
-	E(get_message_rcpts) \
-	E(get_message_properties) \
-	E(set_message_properties) \
-	E(set_message_read_state) \
-	E(allocate_message_id) \
-	E(allocate_cn) \
-	E(try_mark_submit) \
-	E(link_message) \
-	E(get_message_timer) \
-	E(update_folder_rule) \
-	E(deliver_message) \
-	E(write_message) \
-	E(read_message) \
-	E(get_content_sync) \
-	E(get_hierarchy_sync) \
-	E(allocate_ids) \
-	E(subscribe_notification) \
-	E(check_contact_address) \
-	E(get_public_folder_unread_count) \
-	E(store_eid_to_user) \
-	E(autoreply_tsquery) \
-	E(imapfile_read) \
-	E(autoreply_getprop) \
-	E(autoreply_setprop) \
-	E(purge_softdelete) \
-	E(read_delegates)
-
 /* exmdb_callid::connect, exmdb_callid::listen_notification not included */
 /*
  * This uses just *presponse, because the caller expects to receive the
@@ -3765,19 +3492,18 @@ pack_result exmdb_ext_pull_response(std::string_view pbin_in, exresp *presponse)
 	EXT_PULL ext_pull;
 	
 	ext_pull.init(pbin_in.data(), pbin_in.size(), exmdb_rpc_alloc, EXT_FLAG_WCOUNT);
+
+#define EDEF(t, id) case exmdb_callid::t: return exmdb_pull(ext_pull, *static_cast<exresp_ ## t *>(presponse));
+#define EOBSOL(t, id)
+
 	switch (presponse->call_id) {
-	case exmdb_callid::connect:
-	case exmdb_callid::listen_notification:
-		break;
-#define E(t) case exmdb_callid::t:
-	RSP_WITHOUT_ARGS
-		return pack_result::ok;
-#undef E
-#define E(t) case exmdb_callid::t: return exmdb_pull(ext_pull, *static_cast<exresp_ ## t *>(presponse));
-	RSP_WITH_ARGS
-#undef E
+	#include <gromox/exmdb_allcalls.hpp>
+	default:
+		return pack_result::bad_callid;
 	}
-	return pack_result::bad_callid;
+
+#undef EDEF
+#undef EOBSOL
 }
 
 /* exmdb_callid::connect, exmdb_callid::listen_notification not included */
@@ -3794,20 +3520,19 @@ pack_result exmdb_ext_push_response(const exresp *presponse, BINARY *pbin_out)
 	if (status != pack_result::ok)
 		return status;
 
-	status = pack_result::bad_callid;
+#define EDEF(t, idx) case exmdb_callid::t: status = exmdb_push(ext_push, *static_cast<const exresp_ ## t::view_t *>(presponse)); break;
+#define EOBSOL(t, idx)
+
 	switch (presponse->call_id) {
-	case exmdb_callid::connect:
-	case exmdb_callid::listen_notification:
+	#include <gromox/exmdb_allcalls.hpp>
+	default:
+		status = pack_result::bad_callid;
 		break;
-#define E(t) case exmdb_callid::t:
-	RSP_WITHOUT_ARGS
-		status = pack_result::ok;
-		break;
-#undef E
-#define E(t) case exmdb_callid::t: status = exmdb_push(ext_push, *static_cast<const exresp_ ## t::view_t *>(presponse)); break;
-	RSP_WITH_ARGS
-#undef E
 	}
+
+#undef EDEF
+#undef EOBSOL
+
 	if (status != pack_result::ok)
 		return status;
 	pbin_out->cb = ext_push.m_offset;
@@ -3831,145 +3556,31 @@ pack_result exmdb_ext_pull_db_notify(std::string_view pbin_in,
 	TRY(ext_pull.g_bool(&pnotify->b_table));
 	TRY(ext_pull.g_uint32_a(&pnotify->id_array));
 	TRY(ext_pull.g_uint8(&tmp_byte));
-	pnotify->db_notify.type = static_cast<db_notify_type>(tmp_byte);
-	switch (pnotify->db_notify.type) {
+	auto &n = pnotify->db_notify;
+	n.type = static_cast<db_notify_type>(tmp_byte);
+	switch (n.type) {
 	case db_notify_type::srchtbl_changed:
 	case db_notify_type::srchtbl_row_added:
 	case db_notify_type::srchtbl_row_deleted:
 	case db_notify_type::srchtbl_row_modified:
 		break;
-	case db_notify_type::new_mail: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_NEW_MAIL>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->message_id));
-		TRY(ext_pull.g_uint32(&n->message_flags));
-		return ext_pull.g_str(const_cast<char **>(&n->pmessage_class));
-	}
-	case db_notify_type::folder_created: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_CREATED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->parent_id));
-		return ext_pull.g_proptag_a(&n->proptags);
-	}
-	case db_notify_type::message_created: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_CREATED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->message_id));
-		return ext_pull.g_proptag_a(&n->proptags);
-	}
-	case db_notify_type::link_created: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_LINK_CREATED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->message_id));
-		TRY(ext_pull.g_uint64(&n->parent_id));
-		return ext_pull.g_proptag_a(&n->proptags);
-	}
-	case db_notify_type::folder_deleted: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_DELETED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		return ext_pull.g_uint64(&n->parent_id);
-	}
-	case db_notify_type::message_deleted: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_DELETED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		return ext_pull.g_uint64(&n->message_id);
-	}
-	case db_notify_type::link_deleted: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_LINK_DELETED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->message_id));
-		return ext_pull.g_uint64(&n->parent_id);
-	}
-	case db_notify_type::folder_modified: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_MODIFIED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint8(&tmp_byte));
-		if (0 == tmp_byte) {
-			n->ptotal = nullptr;
-		} else {
-			n->ptotal = cu_alloc<uint32_t>();
-			if (n->ptotal == nullptr)
-				return pack_result::alloc;	
-			TRY(ext_pull.g_uint32(n->ptotal));
-		}
-		TRY(ext_pull.g_uint8(&tmp_byte));
-		if (0 == tmp_byte) {
-			n->punread = nullptr;
-		} else {
-			n->punread = cu_alloc<uint32_t>();
-			if (n->punread == nullptr)
-				return pack_result::alloc;	
-			TRY(ext_pull.g_uint32(n->punread));
-		}
-		return ext_pull.g_proptag_a(&n->proptags);
-	}
-	case db_notify_type::message_modified: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_MODIFIED>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->message_id));
-		return ext_pull.g_proptag_a(&n->proptags);
-	}
-	case db_notify_type::folder_moved:
-	case db_notify_type::folder_copied: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_FOLDER_MVCP>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->parent_id));
-		TRY(ext_pull.g_uint64(&n->old_folder_id));
-		return ext_pull.g_uint64(&n->old_parent_id);
-	}
-	case db_notify_type::message_moved:
-	case db_notify_type::message_copied: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_MESSAGE_MVCP>();
-		TRY(ext_pull.g_uint64(&n->folder_id));
-		TRY(ext_pull.g_uint64(&n->message_id));
-		TRY(ext_pull.g_uint64(&n->old_folder_id));
-		return ext_pull.g_uint64(&n->old_message_id);
-	}
-	case db_notify_type::search_completed: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_SEARCH_COMPLETED>();
-		return ext_pull.g_uint64(&n->folder_id);
-	}
-	case db_notify_type::hiertbl_changed:
-	case db_notify_type::cttbl_changed:
-		return pack_result::ok;
-	case db_notify_type::hiertbl_row_added: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_HIERARCHY_TABLE_ROW_ADDED>();
-		TRY(ext_pull.g_uint64(&n->row_folder_id));
-		return ext_pull.g_uint64(&n->after_folder_id);
-	}
-	case db_notify_type::cttbl_row_added: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_CONTENT_TABLE_ROW_ADDED>();
-		TRY(ext_pull.g_uint64(&n->row_folder_id));
-		TRY(ext_pull.g_uint64(&n->row_message_id));
-		TRY(ext_pull.g_uint64(&n->row_instance));
-		TRY(ext_pull.g_uint64(&n->after_folder_id));
-		TRY(ext_pull.g_uint64(&n->after_row_id));
-		return ext_pull.g_uint64(&n->after_instance);
-	}
-	case db_notify_type::hiertbl_row_deleted: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_HIERARCHY_TABLE_ROW_DELETED>();
-		return ext_pull.g_uint64(&n->row_folder_id);
-	}
-	case db_notify_type::cttbl_row_deleted: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_CONTENT_TABLE_ROW_DELETED>();
-		TRY(ext_pull.g_uint64(&n->row_folder_id));
-		TRY(ext_pull.g_uint64(&n->row_message_id));
-		return ext_pull.g_uint64(&n->row_instance);
-	}
-	case db_notify_type::hiertbl_row_modified: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED>();
-		TRY(ext_pull.g_uint64(&n->row_folder_id));
-		return ext_pull.g_uint64(&n->after_folder_id);
-	}
-	case db_notify_type::cttbl_row_modified: {
-		auto n = &pnotify->db_notify.pdata.emplace<DB_NOTIFY_CONTENT_TABLE_ROW_MODIFIED>();
-		TRY(ext_pull.g_uint64(&n->row_folder_id));
-		TRY(ext_pull.g_uint64(&n->row_message_id));
-		TRY(ext_pull.g_uint64(&n->row_instance));
-		TRY(ext_pull.g_uint64(&n->after_folder_id));
-		TRY(ext_pull.g_uint64(&n->after_row_id));
-		return ext_pull.g_uint64(&n->after_instance);
-	}
+	default:
+		TRY(ext_pull.g_uint64(&n.parent_id));
+		TRY(ext_pull.g_uint64(&n.folder_id));
+		TRY(ext_pull.g_uint64(&n.message_id));
+		TRY(ext_pull.g_uint64(&n.old_parent_id));
+		TRY(ext_pull.g_uint64(&n.old_folder_id));
+		TRY(ext_pull.g_uint64(&n.old_message_id));
+		TRY(ext_pull.g_uint64(&n.row_folder_id));
+		TRY(ext_pull.g_uint64(&n.row_message_id));
+		TRY(ext_pull.g_uint64(&n.row_instance));
+		TRY(ext_pull.g_uint64(&n.after_folder_id));
+		TRY(ext_pull.g_uint64(&n.after_row_id));
+		TRY(ext_pull.g_uint64(&n.after_instance));
+		TRY(ext_pull.g_uint32(&n.message_flags));
+		TRY(ext_pull.g_str(&n.pmessage_class));
+		TRY(ext_pull.g_proptag_a(&n.proptags));
+		return pack_result::success;
 	}
 	return pack_result::bad_callid;
 } catch (const std::bad_alloc &) {
@@ -3984,159 +3595,34 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 	TRY(ext_push.p_str(pnotify->dir));
 	TRY(ext_push.p_bool(pnotify->b_table));
 	TRY(ext_push.p_uint32_a(pnotify->id_array));
-	TRY(ext_push.p_uint8(static_cast<uint8_t>(pnotify->db_notify.type)));
 	auto ret = pack_result::success;
-	switch (pnotify->db_notify.type) {
+	auto &n = pnotify->db_notify;
+	TRY(ext_push.p_uint8(static_cast<uint8_t>(n.type)));
+
+	switch (n.type) {
 	case db_notify_type::srchtbl_changed:
 	case db_notify_type::srchtbl_row_added:
 	case db_notify_type::srchtbl_row_modified:
 	case db_notify_type::srchtbl_row_deleted:
 		ret = pack_result::bad_callid;
 		break;
-	case db_notify_type::new_mail: {
-		auto n = std::any_cast<const DB_NOTIFY_NEW_MAIL>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		TRY(ext_push.p_uint32(n->message_flags));
-		TRY(ext_push.p_str(n->pmessage_class));
+	default:
+		TRY(ext_push.p_uint64(n.parent_id));
+		TRY(ext_push.p_uint64(n.folder_id));
+		TRY(ext_push.p_uint64(n.message_id));
+		TRY(ext_push.p_uint64(n.old_parent_id));
+		TRY(ext_push.p_uint64(n.old_folder_id));
+		TRY(ext_push.p_uint64(n.old_message_id));
+		TRY(ext_push.p_uint64(n.row_folder_id));
+		TRY(ext_push.p_uint64(n.row_message_id));
+		TRY(ext_push.p_uint64(n.row_instance));
+		TRY(ext_push.p_uint64(n.after_folder_id));
+		TRY(ext_push.p_uint64(n.after_row_id));
+		TRY(ext_push.p_uint64(n.after_instance));
+		TRY(ext_push.p_uint32(n.message_flags));
+		TRY(ext_push.p_str(n.pmessage_class));
+		TRY(ext_push.p_proptag_a(n.proptags));
 		break;
-	}
-	case db_notify_type::folder_created: {
-		auto n = std::any_cast<const DB_NOTIFY_FOLDER_CREATED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->parent_id));
-		TRY(ext_push.p_proptag_a(n->proptags));
-		break;
-	}
-	case db_notify_type::message_created: {
-		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_CREATED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		TRY(ext_push.p_proptag_a(n->proptags));
-		break;
-	}
-	case db_notify_type::link_created: {
-		auto n = std::any_cast<const DB_NOTIFY_LINK_CREATED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		TRY(ext_push.p_uint64(n->parent_id));
-		TRY(ext_push.p_proptag_a(n->proptags));
-		break;
-	}
-	case db_notify_type::folder_deleted: {
-		auto n = std::any_cast<const DB_NOTIFY_FOLDER_DELETED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->parent_id));
-		break;
-	}
-	case db_notify_type::message_deleted: {
-		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_DELETED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		break;
-	}
-	case db_notify_type::link_deleted: {
-		auto n = std::any_cast<const DB_NOTIFY_LINK_DELETED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		TRY(ext_push.p_uint64(n->parent_id));
-		break;
-	}
-	case db_notify_type::folder_modified: {
-		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MODIFIED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		if (n->ptotal != nullptr) {
-			TRY(ext_push.p_uint8(1));
-			TRY(ext_push.p_uint32(*n->ptotal));
-		} else {
-			TRY(ext_push.p_uint8(0));
-		}
-		if (n->punread != nullptr) {
-			TRY(ext_push.p_uint8(1));
-			TRY(ext_push.p_uint32(*n->punread));
-		} else {
-			TRY(ext_push.p_uint8(0));
-		}
-		TRY(ext_push.p_proptag_a(n->proptags));
-		break;
-	}
-	case db_notify_type::message_modified: {
-		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MODIFIED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		TRY(ext_push.p_proptag_a(n->proptags));
-		break;
-	}
-	case db_notify_type::folder_moved:
-	case db_notify_type::folder_copied: {
-		auto n = std::any_cast<const DB_NOTIFY_FOLDER_MVCP>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->parent_id));
-		TRY(ext_push.p_uint64(n->old_folder_id));
-		TRY(ext_push.p_uint64(n->old_parent_id));
-		break;
-	}
-	case db_notify_type::message_moved:
-	case db_notify_type::message_copied: {
-		auto n = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		TRY(ext_push.p_uint64(n->message_id));
-		TRY(ext_push.p_uint64(n->old_folder_id));
-		TRY(ext_push.p_uint64(n->old_message_id));
-		break;
-	}
-	case db_notify_type::search_completed: {
-		auto n = std::any_cast<const DB_NOTIFY_SEARCH_COMPLETED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->folder_id));
-		break;
-	}
-	case db_notify_type::hiertbl_changed:
-	case db_notify_type::cttbl_changed:
-		break;
-	case db_notify_type::hiertbl_row_added: {
-		auto n = std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_ADDED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->row_folder_id));
-		TRY(ext_push.p_uint64(n->after_folder_id));
-		break;
-	}
-	case db_notify_type::cttbl_row_added: {
-		auto n = std::any_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_ADDED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->row_folder_id));
-		TRY(ext_push.p_uint64(n->row_message_id));
-		TRY(ext_push.p_uint64(n->row_instance));
-		TRY(ext_push.p_uint64(n->after_folder_id));
-		TRY(ext_push.p_uint64(n->after_row_id));
-		TRY(ext_push.p_uint64(n->after_instance));
-		break;
-	}
-	case db_notify_type::hiertbl_row_deleted: {
-		auto n = std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_DELETED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->row_folder_id));
-		break;
-	}
-	case db_notify_type::cttbl_row_deleted: {
-		auto n = std::any_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_DELETED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->row_folder_id));
-		TRY(ext_push.p_uint64(n->row_message_id));
-		TRY(ext_push.p_uint64(n->row_instance));
-		break;
-	}
-	case db_notify_type::hiertbl_row_modified: {
-		auto n = std::any_cast<const DB_NOTIFY_HIERARCHY_TABLE_ROW_MODIFIED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->row_folder_id));
-		TRY(ext_push.p_uint64(n->after_folder_id));
-		break;
-	}
-	case db_notify_type::cttbl_row_modified: {
-		auto n = std::any_cast<const DB_NOTIFY_CONTENT_TABLE_ROW_MODIFIED>(&pnotify->db_notify.pdata);
-		TRY(ext_push.p_uint64(n->row_folder_id));
-		TRY(ext_push.p_uint64(n->row_message_id));
-		TRY(ext_push.p_uint64(n->row_instance));
-		TRY(ext_push.p_uint64(n->after_folder_id));
-		TRY(ext_push.p_uint64(n->after_row_id));
-		TRY(ext_push.p_uint64(n->after_instance));
-		break;
-	}
 	}
 	if (ret != pack_result::success)
 		return ret;
@@ -4163,8 +3649,8 @@ const char *exmdb_rpc_strerror(exmdb_response v)
 	case access_deny: return "Access denied";
 	case max_reached: return "Server reached maximum number of connections";
 	case lack_memory: return "Out of memory";
-	case misconfig_prefix: return "Prefix is not served";
-	case misconfig_mode: return "Prefix has type mismatch";
+	case misconfig_prefix: return "Server is not responsible for this mailbox (as identified by its directory path)";
+	case misconfig_mode: return "Client-server disagreement about the mailbox type";
 	case connect_incomplete: return "No prior CONNECT RPC made";
 	case pull_error: return "Invalid request/Server-side deserializing error";
 	case dispatch_error: return "Dispatch error/Request rejected/DB error (check gromox-http log)";

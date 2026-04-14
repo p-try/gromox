@@ -54,22 +54,21 @@ enum {
 namespace {
 
 struct NTLMSSP_SERVER_AUTH_STATE {
-	DATA_BLOB user_session_key;
-	uint8_t user_session_key_buff[32];
-	DATA_BLOB lm_session_key;
-	uint8_t lm_session_key_buff[32];
-	DATA_BLOB encrypted_session_key; /* internal variables used by KEY_EXCH */
-	uint8_t encrypted_session_key_buff[32];
-	bool doing_ntlm2;
-	uint8_t session_nonce[16]; /* internal variables used by NTLM2 */
+	DATA_BLOB user_session_key{};
+	uint8_t user_session_key_buff[32]{};
+	DATA_BLOB lm_session_key{};
+	uint8_t lm_session_key_buff[32]{};
+	DATA_BLOB encrypted_session_key{}; /* internal variables used by KEY_EXCH */
+	uint8_t encrypted_session_key_buff[32]{};
+	bool doing_ntlm2 = false;
+	uint8_t session_nonce[16]{}; /* internal variables used by NTLM2 */
 };
 
 struct NTLMSSP_VERSION {
-	uint8_t major_vers;
-	uint8_t minor_vers;
-	uint16_t product_build;
-	uint8_t reserved[3];
-	uint8_t ntlm_revers;
+	uint8_t major_vers = 0, minor_vers = 0;
+	uint16_t product_build = 0;
+	uint8_t reserved[3]{};
+	uint8_t ntlm_revers = 0;
 };
 
 struct GX_EXPORT HMACMD5_CTX {
@@ -148,56 +147,46 @@ static uint32_t crc32_calc_buffer(const uint8_t *p, size_t z)
 	return ~crc;
 }
 
-/*
- * An implementation of the arcfour algorithm
- * Copyright (C) Andrew Tridgell 1998
- */
 /* initialise the arcfour sbox with key */
-void ARCFOUR_STATE::init(const uint8_t *keydata, size_t keylen)
+ec_error_t ARCFOUR_STATE::init(const uint8_t *keydata, size_t keylen)
 {
-	auto pstate = this;
-	uint8_t tc;
-	uint8_t j = 0;
-
-	for (size_t i = 0; i < sizeof(pstate->sbox); ++i)
-		pstate->sbox[i] = (uint8_t)i;
-	for (size_t i = 0; i < sizeof(pstate->sbox); ++i) {
-		j += pstate->sbox[i] + keydata[i%keylen];
-		tc = pstate->sbox[i];
-		pstate->sbox[i] = pstate->sbox[j];
-		pstate->sbox[j] = tc;
-	}
-	pstate->index_i = 0;
-	pstate->index_j = 0;
+	auto cipher = EVP_get_cipherbyname(SN_rc4);
+	if (cipher == nullptr)
+		return ecInvalidParam;
+	ctx.reset(EVP_CIPHER_CTX_new());
+	if (ctx == nullptr)
+		return ecServerOOM;
+	return EVP_CipherInit_ex(ctx.get(), cipher, nullptr, keydata,
+	       nullptr, keylen) > 0 ? ecSuccess : ecError;
 }
 
 /* crypt the data with arcfour */
-void ARCFOUR_STATE::crypt_sbox(uint8_t *pdata, int len)
+ec_error_t ARCFOUR_STATE::crypt_sbox(uint8_t *buf, size_t len)
 {
-	auto pstate = this;
-	int i;
-	uint8_t t;
-	uint8_t tc;
-
-	for (i = 0; i < len; i++) {
-
-		pstate->index_i++;
-		pstate->index_j += pstate->sbox[pstate->index_i];
-
-		tc = pstate->sbox[pstate->index_i];
-		pstate->sbox[pstate->index_i] = pstate->sbox[pstate->index_j];
-		pstate->sbox[pstate->index_j] = tc;
-
-		t = pstate->sbox[pstate->index_i] + pstate->sbox[pstate->index_j];
-		pdata[i] = pdata[i] ^ pstate->sbox[t];
+	while (len > 0) {
+		int towrite = std::min(static_cast<size_t>(INT_MAX), len);
+		int written = 0;
+		if (EVP_CipherUpdate(ctx.get(), buf, &written, buf, towrite) <= 0)
+			return ecError;
+		/*
+		 * We rely on RC4 operating in-place and at a 1:1 ratio
+		 * and that no EVP_CipherFinal is needed...
+		 */
+		if (written < 0 || written != towrite)
+			return ecError;
+		len -= written;
+		buf += written;
 	}
+	return ecSuccess;
 }
 
-void ARCFOUR_STATE::crypt(uint8_t *pdata, const uint8_t keystr[16], int len)
+ec_error_t ARCFOUR_STATE::crypt(uint8_t *data, const uint8_t key[16], size_t datalen)
 {
-	ARCFOUR_STATE state;
-	state.init(keystr, 16);
-	state.crypt_sbox(pdata, len);
+	ARCFOUR_STATE s;
+	auto r = s.init(key, 16);
+	if (r != ecSuccess)
+		return r;
+	return s.crypt_sbox(data, datalen);
 }
 
 /* the microsoft version of hmac_md5 initialisation */
@@ -262,8 +251,6 @@ static bool des_crypt56(uint8_t out[8], const uint8_t in[8], const uint8_t key[7
 		return false;
 	std::unique_ptr<EVP_CIPHER_CTX, sslfree> ctx(EVP_CIPHER_CTX_new());
 	if (ctx == nullptr)
-		return false;
-	if (EVP_CIPHER_CTX_set_padding(ctx.get(), 0) <= 0)
 		return false;
 	static constexpr uint8_t iv[16]{};
 	uint8_t derived_key[8];
@@ -746,7 +733,7 @@ static pack_result ntlmssp_ndr_push_ntlm_version(NDR_PUSH *pndr, NTLMSSP_VERSION
 	status = pndr->p_uint16(r->product_build);
 	if (status != pack_result::success)
 		return status;
-	status = pndr->p_uint8_a(r->reserved, 3);
+	status = pndr->p_bytes(r->reserved, 3);
 	if (status != pack_result::success)
 		return status;
 	status = pndr->p_uint8(r->ntlm_revers);
@@ -823,7 +810,7 @@ static bool ntlmssp_server_negotiate(NTLMSSP_CTX *pntlmssp,
 	version_blob.cb = 0;
 	
 	if (chal_flags & NTLMSSP_NEGOTIATE_VERSION) {
-		memset(&vers, 0, sizeof(NTLMSSP_VERSION));
+		vers = {};
 		vers.major_vers = NTLMSSP_WINDOWS_MAJOR_VERSION_6;
 		vers.minor_vers = NTLMSSP_WINDOWS_MINOR_VERSION_1;
 		vers.product_build = 0;
@@ -1230,7 +1217,7 @@ static bool ntlmssp_sign_init(NTLMSSP_CTX *pntlmssp)
 			"signing in sign_init");
 		return false;
 	}
-	memset(&pntlmssp->crypt, 0, sizeof(NTLMSSP_CRYPT_STATE));
+	pntlmssp->crypt = {};
 	
 	if (pntlmssp->neg_flags & NTLMSSP_NEGOTIATE_NTLM2) {
 		weak_key = pntlmssp->session_key;
@@ -1402,7 +1389,7 @@ static bool ntlmssp_server_auth(NTLMSSP_CTX *pntlmssp,
 	
 	/* zero the outbound NTLMSSP packet */
 	pout->cb = 0;
-	memset(&auth_state, 0, sizeof(NTLMSSP_SERVER_AUTH_STATE));
+	auth_state = {};
 	if (!ntlmssp_server_preauth(pntlmssp, &auth_state, in))
 		return false;
 	auth_state.user_session_key.pb = auth_state.user_session_key_buff;

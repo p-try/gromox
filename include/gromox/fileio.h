@@ -51,30 +51,42 @@ class GX_EXPORT tmpfile {
 	int open_impl(const char *dir, unsigned int flags, unsigned int mode, bool anon);
 };
 
+/**
+ * close_rd: Regular closing routine, generally meant for read-only fds.
+ * close_wr: Preferably use this when the wrapped fd is in read-write mode.
+ *           (close() could return an error, e.g. disk full)
+ */
 class GX_EXPORT wrapfd {
 	public:
 	wrapfd() = default;
-	wrapfd(int z) : m_fd{z} {}
-	wrapfd(wrapfd &&) noexcept = delete;
-	~wrapfd() { close_rd(); }
-	int get() const { return m_fd; }
-	int release() { int t = m_fd; m_fd = -1; return t; }
-	errno_t close_rd() noexcept;
-	errno_t close_wr() noexcept __attribute__((warn_unused_result)) { return close_rd(); };
-	void operator=(wrapfd &&o) noexcept {
-		if (this == &o)
-			return;
+	wrapfd(int z) noexcept : m_fd{z} {}
+	wrapfd(wrapfd &&o) noexcept
+	{
 		close_rd();
 		m_fd = o.m_fd;
 		o.m_fd = -1;
 	}
+	~wrapfd() { close_rd(); }
+	int get() const noexcept { return m_fd; }
+	int release() noexcept { int t = m_fd; m_fd = -1; return t; }
+	errno_t close_rd() noexcept;
+	errno_t close_wr() noexcept __attribute__((warn_unused_result)) { return close_rd(); };
+	wrapfd &operator=(wrapfd &&o) noexcept {
+		if (this == &o)
+			return *this;
+		close_rd();
+		m_fd = o.m_fd;
+		o.m_fd = -1;
+		return *this;
+	}
+
 	private:
 	int m_fd = -1;
 };
 
 extern GX_EXPORT errno_t canonical_hostname(std::string &);
-extern GX_EXPORT pid_t popenfd(const char *const *, int *, int *, int *, const char *const *);
-extern GX_EXPORT int feed_w3m(std::string_view, const char *in_cset, std::string &out);
+extern GX_EXPORT pid_t popenfd(const char *, const char *const *, int *, int *, int *, const char *const *);
+extern GX_EXPORT int feed_html_renderer(std::string_view, const char *in_cset, std::string &out);
 extern GX_EXPORT DIR_mp opendir_sd(const char *, const char *);
 extern GX_EXPORT std::unique_ptr<FILE, file_deleter> fopen_sd(const char *, const char *);
 extern GX_EXPORT std::string zstd_decompress(std::string_view);
@@ -83,5 +95,9 @@ extern GX_EXPORT errno_t gx_decompress_file(const char *, BINARY &, void *(*)(si
 extern GX_EXPORT errno_t gx_compress_tofd(std::string_view, int fd, uint8_t complvl = 0);
 extern GX_EXPORT errno_t gx_compress_tofile(std::string_view, const char *outfile, uint8_t complvl = 0, unsigned int mode = FMODE_PRIVATE);
 extern GX_EXPORT int gx_mkbasedir(const char *file, unsigned int mode);
+
+extern GX_EXPORT int popenfd_keepfd_marker;
+#define POPENFD_NULL (nullptr)
+#define POPENFD_KEEP (&::gromox::popenfd_keepfd_marker)
 
 }

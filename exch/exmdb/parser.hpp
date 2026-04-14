@@ -37,7 +37,6 @@ struct ROUTER_CONNECTION {
 };
 
 extern void exmdb_parser_init(size_t max_threads, size_t max_routers);
-extern int exmdb_parser_run(const char *config_path);
 extern void exmdb_parser_stop();
 extern std::unique_ptr<EXMDB_CONNECTION> exmdb_parser_make_conn();
 extern void exmdb_parser_insert_conn(std::unique_ptr<EXMDB_CONNECTION> &&);
@@ -45,7 +44,8 @@ extern std::shared_ptr<ROUTER_CONNECTION> exmdb_parser_extract_router(const char
 extern void exmdb_parser_insert_router(std::shared_ptr<ROUTER_CONNECTION> &&);
 extern BOOL exmdb_parser_erase_router(const std::shared_ptr<ROUTER_CONNECTION> &);
 extern int exmdb_listener_init(const config_file &gxcfg, const config_file &oldcfg);
-extern int exmdb_listener_trigger_accept();
+extern int exmdb_listener_run(const char *config_path, const config_file &gxcfg);
 extern void exmdb_listener_stop();
 
 extern unsigned int g_exrpc_debug, g_enable_dam;
+extern std::string g_host_id;

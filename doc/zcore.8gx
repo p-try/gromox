@@ -17,7 +17,7 @@ functions.
 .TP
 \fB\-c\fP \fIconfig\fP
 Read configuration directives from the given file. If this option is not
-specified, /etc/gromox/zcore.cfg will be read if it exists.
+specified, /etc/gromox/gromox.cfg and /etc/gromox/zcore.cfg will be read.
 .TP
 \fB\-\-version\fP
 Output version information and exit.
@@ -90,15 +90,10 @@ The maximum number of recipients that an e-mail is allowed to have.
 .br
 Default: \fI256\fP
 .TP
-\fBnotify_stub_threads_num\fP
-For every exmdb server in exmdb_list.txt, establish and keep this many number
-of outbound connections for receiving notification RPCs.
-.br
-Default: \fI10\fP
-.TP
 \fBrpc_proxy_connection_num\fP
 For every exmdb server in exmdb_list.txt, establish and keep this many number
-of outbound connections for sending commands.
+of outbound connections for sending commands. (There is at most one additional
+connection, for async notification, alive per server.)
 .br
 Default: \fI10\fP
 .TP
@@ -191,10 +186,13 @@ The IPv6 socket address of the server running exmdb_provider(4gx). The address
 must conform to gromox(7) \(sc "Host addresses".
 .IP \(bu 4
 The TCP port number of the server
+.SH Signals
+Upon receipt of SIGHUP, configuration files are re-read, but only a few select
+directives can be changed this way, as many parts do not implement reload.
+.PP
+Upon receipt of SIGHUP, the address book cache will be dropped; the next
+regular request for the AB will cause it to be reloaded.
 .SH Files
-.IP \(bu 4
-\fIconfig_file_path\fP/exmdb_list.txt: exmdb multiserver selection map, see
-exmdb_provider(4gx) for details.
 .IP \(bu 4
 \fIdata_file_path\fP/folder_names.txt: Translations for essential folders in a
 message store.

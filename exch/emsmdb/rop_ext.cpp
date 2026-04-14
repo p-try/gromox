@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdint>
 #include <cstring>
@@ -490,7 +490,7 @@ static pack_result rop_ext_push(EXT_PUSH &x, const QUERYROWS_RESPONSE &r)
 {
 	TRY(x.p_uint8(r.seek_pos));
 	TRY(x.p_uint16(r.count));
-	return x.p_bytes(r.bin_rows.pb, r.bin_rows.cb);
+	return x.p_bytes(r.bin_rows);
 }
 
 static pack_result rop_ext_push(EXT_PUSH &x, const QUERYPOSITION_RESPONSE &r)
@@ -589,7 +589,7 @@ static pack_result rop_ext_push(EXT_PUSH &x, const EXPANDROW_RESPONSE &r)
 {
 	TRY(x.p_uint32(r.expanded_count));
 	TRY(x.p_uint16(r.count));
-	return x.p_bytes(r.bin_rows.pb, r.bin_rows.cb);
+	return x.p_bytes(r.bin_rows);
 }
 
 static pack_result rop_ext_pull(EXT_PULL &x, COLLAPSEROW_REQUEST &r)
@@ -723,7 +723,7 @@ static pack_result rop_ext_pull(EXT_PULL &x, READRECIPIENTS_REQUEST &r)
 static pack_result rop_ext_push(EXT_PUSH &x, const READRECIPIENTS_RESPONSE &r)
 {
 	TRY(x.p_uint8(r.count));
-	return x.p_bytes(r.bin_recipients.pb, r.bin_recipients.cb);
+	return x.p_bytes(r.bin_recipients);
 }
 
 static pack_result rop_ext_pull(EXT_PULL &x, RELOADCACHEDINFORMATION_REQUEST &r)
@@ -1908,7 +1908,6 @@ pack_result rop_ext_pull(EXT_PULL &x, ROP_BUFFER &r)
 	int tmp_num;
 	uint16_t size;
 	EXT_PULL subext;
-	uint32_t decompressed_len;
 	RPC_HEADER_EXT rpc_header_ext;
 	
 	TRY(x.g_rpc_header_ext(&rpc_header_ext));
@@ -1931,15 +1930,18 @@ pack_result rop_ext_pull(EXT_PULL &x, ROP_BUFFER &r)
 		common_util_obfuscate_data(deconst(pdata), rpc_header_ext.size);
 	/* lzxpress case */
 	if (rpc_header_ext.flags & RHE_FLAG_COMPRESSED) {
-		decompressed_len = lzxpress_decompress(pdata,
+		auto decompressed_len = lzxpress_decompress(pdata,
 					rpc_header_ext.size, pbuff, 0x8000);
-		if (decompressed_len < rpc_header_ext.size_actual) {
-			mlog(LV_WARN, "W-1097: lzxdecompress failed for client input (z=%u, exp=%u, got=%u)",
+		if (decompressed_len < 0 ||
+		    static_cast<size_t>(decompressed_len) < rpc_header_ext.size_actual) {
+			mlog(LV_WARN, "W-1097: lzxdecompress failed for client input (z=%u, exp=%u, got=%zd)",
 				rpc_header_ext.size, rpc_header_ext.size_actual,
 				decompressed_len);
 			return pack_result::compress;
 		}
 	} else {
+		if (rpc_header_ext.size_actual > x.m_data_size - x.m_offset)
+			return pack_result::header_size;
 		memcpy(pbuff, pdata, rpc_header_ext.size_actual);
 	}
 	subext.init(pbuff, rpc_header_ext.size_actual, common_util_alloc, EXT_FLAG_UTF16);

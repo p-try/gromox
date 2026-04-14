@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2022–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2022–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <tinyxml2.h>
 #include <unordered_set>
 #include <variant>
@@ -16,7 +15,6 @@
 #include <sys/wait.h>
 #include <gromox/ab_tree.hpp>
 #include <gromox/clock.hpp>
-#include <gromox/config_file.hpp>
 #include <gromox/eid_array.hpp>
 #include <gromox/element_data.hpp>
 #include <gromox/fileio.h>
@@ -74,36 +72,6 @@ static inline std::string &tolower_inplace(std::string &str)
 }
 
 /**
- * @brief      Read message body from reply file
- *
- * @param      path    Path to the file
- *
- * @return     Body content or empty optional on error
- */
-std::optional<std::string> readMessageBody(const std::string &path) try
-{
-	std::ifstream ifs(path, std::ios::in | std::ios::ate | std::ios::binary);
-	if (!ifs.is_open())
-		return std::nullopt;
-	size_t totalLength = ifs.tellg();
-	ifs.seekg(std::ios::beg);
-	while (!ifs.eof()) {
-		ifs.ignore(std::numeric_limits<std::streamsize>::max(), '\r');
-		if (ifs.get() == '\n' && ifs.get() == '\r' && ifs.get() == '\n')
-			break;
-	}
-	if (ifs.eof())
-		return std::nullopt;
-	size_t headerLenght = ifs.tellg();
-	std::string content(totalLength - headerLenght, 0);
-	ifs.read(content.data(), content.size());
-	return content;
-} catch (const std::exception &e) {
-	mlog(LV_ERR, "[ews] %s", e.what());
-	return std::nullopt;
-}
-
-/**
  * @brief      Derive timezone information from request headers
  *
  * Attempts to construct a SerializableTimeZone from the SOAP TimeZoneContext
@@ -116,7 +84,7 @@ std::optional<std::string> readMessageBody(const std::string &path) try
  */
 std::optional<tSerializableTimeZone> timezone_from_context(const EWSContext& ctx)
 {
-	const XMLElement* tag = ctx.request().header;
+	const XMLElement *tag = ctx.request().header;
 	if (tag == nullptr)
 		return std::nullopt;
 	/* SOAP::Envelope::clean() strips namespace prefixes from element names */
@@ -152,26 +120,6 @@ std::optional<tSerializableTimeZone> timezone_from_context(const EWSContext& ctx
 	if (negative)
 		minutes = -minutes;
 	return tSerializableTimeZone(minutes);
-}
-
-/**
- * @brief      Write message body to reply file
- *
- * If either the ReplyBody or its Message field are empty, the file is deleted instead.
- *
- * @param      path    Path to the file
- * @param      reply   Reply body
- */
-void writeMessageBody(const std::string &path, const std::optional<tReplyBody> &reply)
-{
-	if (!reply || !reply->Message)
-		return (void) unlink(path.c_str());
-	static constexpr char header[] = "Content-Type: text/html;\r\n\tcharset=\"utf-8\"\r\n\r\n";
-	auto& content = *reply->Message;
-	std::ofstream file(path, std::ios::binary); /* FMODE_PUBLIC */
-	file.write(header, std::size(header) - 1);
-	file.write(content.c_str(), content.size());
-	file.close();
 }
 
 /* Copied straight outta zcore/ab_tree.cpp */
@@ -269,7 +217,7 @@ static bool collect_rooms(unsigned int domain_id, std::vector<tRoomType>* rooms=
 {
 	std::vector<sql_user> users;
 	if (!mysql_adaptor_get_domain_users(domain_id, users))
-		throw DispatchError(E3027);
+		throw DispatchError(E3386);
 	bool found = false;
 	if (rooms) {
 		rooms->clear();
@@ -308,7 +256,7 @@ static tRoomListEntry make_room_list_entry(const sql_domain& domain)
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mConvertIdRequest&& request, XMLElement* response, EWSContext& ctx)
+void process(mConvertIdRequest &&request, XMLElement *response, EWSContext &ctx)
 {
 	response->SetName("m:ConvertIdResponse");
 	ctx.response().body->SetAttribute("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance");
@@ -323,7 +271,6 @@ void process(mConvertIdRequest&& request, XMLElement* response, EWSContext& ctx)
 		if (aid.Format == request.DestinationFormat) {
 			data.ResponseMessages.emplace_back().AlternateId = std::move(aid);
 		} else {
-			std::string dir = ctx.get_maildir(aid.Mailbox);
 			tBaseItemId id(sBase64Binary(aid.Format == Enum::HexEntryId ?
 			               hex2bin(aid.Id) : base64_decode(aid.Id)),
 			               tBaseItemId::ID_GUESS);
@@ -360,10 +307,9 @@ void process(mFindPeopleRequest &&request, XMLElement *response, const EWSContex
 
 	mFindPeopleResponse data;
 	auto &msg = data.ResponseMessages.emplace_back();
-	std::string domain = znul(ctx.auth_info().username);
-	auto at = domain.find('@');
-	if (at != std::string::npos)
-		domain.erase(0, at + 1);
+	const char *user = znul(ctx.auth_info().username);
+	const char *at = strchr(user, '@');
+	std::string domain = at ? at + 1 : user;
 
 	std::vector<ab_tree::minid> results;
 	try {
@@ -411,28 +357,96 @@ void process(mFindPeopleRequest &&request, XMLElement *response, const EWSContex
 	data.serialize(response);
 }
 
+void process(mGetPersonaRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:GetPersonaResponseMessage");
+
+	mGetPersonaResponseMessage data;
+
+	if (!request.EmailAddress || !request.EmailAddress->EmailAddress) {
+		data.error("ErrorInvalidArgument", "EmailAddress is required");
+		data.serialize(response);
+		return;
+	}
+	const auto &target = *request.EmailAddress->EmailAddress;
+	const char *user = znul(ctx.auth_info().username);
+	const char *at = strchr(user, '@');
+	std::string domain = at ? at + 1 : user;
+
+	try {
+		uint32_t domId = ctx.getAccountId(domain, true);
+		auto base = ab_tree::AB.get(-static_cast<int32_t>(domId));
+		if (base) {
+			for (auto it = base->ubegin(); it != base->uend(); ++it) {
+				ab_tree::ab_node node(it);
+				if (node.hidden() & AB_HIDE_RESOLVE)
+					continue;
+				std::string val;
+				if (node.fetch_prop(PR_SMTP_ADDRESS, val) != ecSuccess)
+					continue;
+				if (strcasecmp(val.c_str(), target.c_str()) != 0)
+					continue;
+				tPersona persona;
+				persona.EmailAddress = std::move(val);
+				if (node.fetch_prop(PR_DISPLAY_NAME, val) == ecSuccess)
+					persona.DisplayName = std::move(val);
+				if (node.fetch_prop(PR_TITLE, val) == ecSuccess)
+					persona.Title = std::move(val);
+				if (node.fetch_prop(PR_NICKNAME, val) == ecSuccess)
+					persona.Nickname = std::move(val);
+				if (node.fetch_prop(PR_PRIMARY_TELEPHONE_NUMBER, val) == ecSuccess)
+					persona.BusinessPhoneNumber = std::move(val);
+				if (node.fetch_prop(PR_MOBILE_TELEPHONE_NUMBER, val) == ecSuccess)
+					persona.MobilePhoneNumber = std::move(val);
+				if (node.fetch_prop(PR_HOME_ADDRESS_STREET, val) == ecSuccess)
+					persona.HomeAddress = std::move(val);
+				if (node.fetch_prop(PR_COMMENT, val) == ecSuccess)
+					persona.Comment = std::move(val);
+				data.Persona = std::move(persona);
+				break;
+			}
+		}
+	} catch (const EWSError &err) {
+		mGetPersonaResponseMessage errdata(err);
+		errdata.serialize(response);
+		return;
+	}
+
+	if (!data.Persona) {
+		data.error("ErrorPersonNotFound", "No persona found for the specified email address");
+		data.serialize(response);
+		return;
+	}
+
+	data.success();
+	data.serialize(response);
+}
+
 /**
  * @brief      Process GetDelegate
  *
  * Reads the delegate configuration of a mailbox and returns the delegates
- * stored in the delegates.txt file. Only basic information (primary SMTP
- * address) is returned for each delegate.
+ * stored in the delegates.txt file.
  *
  * @param      request   Request data
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
-*/
-void process(mGetDelegateRequest&& request, XMLElement* response, const EWSContext& ctx)
+ */
+void process(mGetDelegateRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetDelegateResponse");
 
 	ctx.normalize(request.Mailbox);
+	std::string dir = request.Mailbox.EmailAddress? ctx.get_maildir(*request.Mailbox.EmailAddress) : ctx.auth_info().maildir;
+	if (dir != ctx.auth_info().maildir)
+		throw EWSError::AccessDenied(E3312);
 
 	mGetDelegateResponse data;
 
 	std::vector<std::string> delegate_list;
-	if (!ctx.plugin().exmdb.read_delegates(ctx.get_maildir(request.Mailbox).c_str(),
+	if (!ctx.plugin().exmdb.read_delegates(dir.c_str(),
 	    0, &delegate_list)) {
+		data.success();
 		data.serialize(response);
 		return;
 	}
@@ -445,12 +459,19 @@ void process(mGetDelegateRequest&& request, XMLElement* response, const EWSConte
 
 	std::unordered_set<std::string> found;
 	for (const auto &deleg : delegate_list) {
-		if (requested.empty() || requested.contains(deleg)) {
-			auto &msg = data.ResponseMessages.emplace_back();
-			msg.success();
-			msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(deleg);
-			found.insert(deleg);
-		}
+		if (!requested.empty() && !requested.contains(deleg))
+			continue;
+		auto &msg = data.ResponseMessages.emplace_back();
+		msg.success();
+		msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(deleg);
+		std::string dispname;
+		if (mysql_adaptor_get_user_displayname(deleg.c_str(),
+		    dispname) && !dispname.empty())
+			msg.DelegateUser.UserId.DisplayName.emplace(
+			    std::move(dispname));
+		if (request.IncludePermissions && *request.IncludePermissions)
+			msg.DelegateUser.DelegatePermissions.emplace(ctx.readDelegatePermissions(dir, deleg));
+		found.insert(deleg);
 	}
 
 	if (!requested.empty()) {
@@ -463,6 +484,149 @@ void process(mGetDelegateRequest&& request, XMLElement* response, const EWSConte
 		}
 	}
 
+	data.success();
+	data.serialize(response);
+}
+
+/**
+ * @brief      Process AddDelegate
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mAddDelegateRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:AddDelegateResponse");
+
+	ctx.normalize(request.Mailbox);
+	std::string dir = request.Mailbox.EmailAddress? ctx.get_maildir(*request.Mailbox.EmailAddress) : ctx.auth_info().maildir;
+	if (dir != ctx.auth_info().maildir)
+		throw EWSError::AccessDenied(E3313);
+
+	std::vector<std::string> delegate_list;
+	if (!ctx.plugin().exmdb.read_delegates(dir.c_str(), 0, &delegate_list))
+		throw EWSError::InternalServerError(E3316);
+	std::unordered_set<std::string> existing(delegate_list.begin(), delegate_list.end());
+
+	mGetDelegateResponse data;
+	for (const auto &du : request.DelegateUsers) {
+		auto &msg = data.ResponseMessages.emplace_back();
+		if (!du.UserId.PrimarySmtpAddress ||
+		    du.UserId.PrimarySmtpAddress->empty()) {
+			msg.error("ErrorDelegateNoUser", "No user specified");
+			continue;
+		}
+		const auto &addr = *du.UserId.PrimarySmtpAddress;
+		if (existing.contains(addr)) {
+			msg.error("ErrorDelegateAlreadyExists", "Delegate already exists");
+			msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
+			continue;
+		}
+		delegate_list.emplace_back(addr);
+		existing.emplace(addr);
+		if (du.DelegatePermissions)
+			ctx.writeDelegatePermissions(dir, addr, *du.DelegatePermissions);
+		msg.success();
+		msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
+	}
+
+	if (!ctx.plugin().exmdb.write_delegates(dir.c_str(), 0, delegate_list))
+		throw EWSError::InternalServerError(E3317);
+
+	data.success();
+	data.serialize(response);
+}
+
+/**
+ * @brief      Process RemoveDelegate
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mRemoveDelegateRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:RemoveDelegateResponse");
+
+	ctx.normalize(request.Mailbox);
+	std::string dir = request.Mailbox.EmailAddress? ctx.get_maildir(*request.Mailbox.EmailAddress) : ctx.auth_info().maildir;
+	if (dir != ctx.auth_info().maildir)
+		throw EWSError::AccessDenied(E3314);
+
+	std::vector<std::string> delegate_list;
+	if (!ctx.plugin().exmdb.read_delegates(dir.c_str(), 0, &delegate_list))
+		throw EWSError::InternalServerError(E3318);
+
+	mGetDelegateResponse data;
+	for (const auto &uid : request.UserIds) {
+		auto &msg = data.ResponseMessages.emplace_back();
+		if (!uid.PrimarySmtpAddress ||
+		    uid.PrimarySmtpAddress->empty()) {
+			msg.error("ErrorDelegateNoUser", "No user specified");
+			continue;
+		}
+		const auto &addr = *uid.PrimarySmtpAddress;
+		auto it = std::find(delegate_list.begin(), delegate_list.end(), addr);
+		if (it == delegate_list.end()) {
+			msg.error("ErrorDelegateNotFound", "Delegate not found");
+			msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
+			continue;
+		}
+		delegate_list.erase(it);
+		msg.success();
+		msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
+	}
+
+	if (!ctx.plugin().exmdb.write_delegates(dir.c_str(), 0, delegate_list))
+		throw EWSError::InternalServerError(E3319);
+
+	data.success();
+	data.serialize(response);
+}
+
+/**
+ * @brief      Process UpdateDelegate
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mUpdateDelegateRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:UpdateDelegateResponse");
+
+	ctx.normalize(request.Mailbox);
+	std::string dir = request.Mailbox.EmailAddress? ctx.get_maildir(*request.Mailbox.EmailAddress) : ctx.auth_info().maildir;
+	if (dir != ctx.auth_info().maildir)
+		throw EWSError::AccessDenied(E3315);
+
+	std::vector<std::string> delegate_list;
+	if (!ctx.plugin().exmdb.read_delegates(dir.c_str(), 0, &delegate_list))
+		throw EWSError::InternalServerError(E3320);
+	std::unordered_set<std::string> existing(delegate_list.begin(), delegate_list.end());
+
+	mGetDelegateResponse data;
+	for (const auto &du : request.DelegateUsers) {
+		auto &msg = data.ResponseMessages.emplace_back();
+		if (!du.UserId.PrimarySmtpAddress ||
+		    du.UserId.PrimarySmtpAddress->empty()) {
+			msg.error("ErrorDelegateNoUser", "No user specified");
+			continue;
+		}
+		const auto &addr = *du.UserId.PrimarySmtpAddress;
+		if (!existing.contains(addr)) {
+			msg.error("ErrorDelegateNotFound", "Delegate not found");
+			msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
+			continue;
+		}
+		if (du.DelegatePermissions)
+			ctx.writeDelegatePermissions(dir, addr, *du.DelegatePermissions);
+		msg.success();
+		msg.DelegateUser.UserId.PrimarySmtpAddress.emplace(addr);
+	}
+
+	data.success();
 	data.serialize(response);
 }
 
@@ -473,7 +637,7 @@ void process(mGetDelegateRequest&& request, XMLElement* response, const EWSConte
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mCreateFolderRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mCreateFolderRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:CreateFolderResponse");
 
@@ -503,7 +667,7 @@ void process(mCreateFolderRequest&& request, XMLElement* response, const EWSCont
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mCreateItemRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mCreateItemRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:CreateItemResponse");
 
@@ -561,7 +725,7 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 			PROBLEM_ARRAY problems;
 			if (!ctx.plugin().exmdb.set_message_properties(rdir.c_str(), username, CP_ACP,
 				mid.messageId(), &proplist, &problems))
-				throw EWSError::ItemSave(E3092);
+				throw EWSError::ItemSave(E3409);
 			if (resp == respAccepted || resp == respTentative)
 				ctx.createCalendarItemFromMeetingRequest(refId, resp);
 		};
@@ -575,6 +739,20 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 			if (dec->ReferenceItemId)
 				updateRef(*dec->ReferenceItemId, respDeclined);
 		}
+		if (send_message) {
+			const tItemId *responseRef = nullptr;
+			if (auto acc = std::get_if<tAcceptItem>(&item))
+				responseRef = acc->ReferenceItemId ?
+				              &*acc->ReferenceItemId : nullptr;
+			else if (auto tent = std::get_if<tTentativelyAcceptItem>(&item))
+				responseRef = tent->ReferenceItemId ?
+				              &*tent->ReferenceItemId : nullptr;
+			else if (auto dec2 = std::get_if<tDeclineItem>(&item))
+				responseRef = dec2->ReferenceItemId ?
+				              &*dec2->ReferenceItemId : nullptr;
+			if (responseRef != nullptr)
+				ctx.sendMeetingResponse(*responseRef, *content);
+		}
 		if (persist)
 			msg.Items.emplace_back(ctx.create(dir, *targetFolder, *content));
 		if (std::holds_alternative<tCalendarItem>(item) &&
@@ -583,13 +761,13 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 			uint64_t newMid;
 			if (!ctx.plugin().exmdb.allocate_message_id(dir.c_str(),
 				sentitems.folderId, &newMid))
-				throw EWSError::InternalServerError(E3132);
+				throw EWSError::InternalServerError(E3424);
 			BOOL result;
 			auto messageId = *content->proplist.get<const uint64_t>(PidTagMid);
 			if (!ctx.plugin().exmdb.movecopy_message(dir.c_str(), CP_ACP,
 				messageId, sentitems.folderId, newMid, false, &result)
 				|| !result)
-				throw EWSError::InternalServerError(E3301);
+				throw EWSError::InternalServerError(E3427);
 			const char* username = ctx.effectiveUser(sentitems);
 			auto now = EWSContext::construct<uint64_t>(rop_util_current_nttime());
 			static constexpr uint8_t proptrue = 1;
@@ -603,17 +781,24 @@ void process(mCreateItemRequest&& request, XMLElement* response, const EWSContex
 			PROBLEM_ARRAY problems;
 			if (!ctx.plugin().exmdb.set_message_properties(dir.c_str(),
 				username, CP_ACP, newMid, &proplist, &problems))
-				throw EWSError::ItemSave(E3092);
+				throw EWSError::ItemSave(E3410);
 			MESSAGE_CONTENT *sendcontent = nullptr;
 			if (!ctx.plugin().exmdb.read_message(dir.c_str(),
 				username, CP_ACP, newMid, &sendcontent)
 				|| sendcontent == nullptr)
-				throw EWSError::ItemNotFound(E3143);
+				throw EWSError::ItemNotFound(E3391);
 			ctx.send(dir, messageId, *sendcontent);
 		}
-		if ((std::holds_alternative<tMessage>(item) && send_message) ||
-		    (std::holds_alternative<tCalendarItem>(item) && request.SendMeetingInvitations == Enum::SendOnlyToAll))
+		if (std::holds_alternative<tMessage>(item) && send_message)
 			ctx.send(dir, 0, *content);
+		if (std::holds_alternative<tCalendarItem>(item) &&
+		    request.SendMeetingInvitations == Enum::SendOnlyToAll) {
+			auto now = EWSContext::construct<uint64_t>(rop_util_current_nttime());
+			content->proplist.set(PR_MESSAGE_CLASS, "IPM.Schedule.Meeting.Request");
+			content->proplist.set(PR_CLIENT_SUBMIT_TIME, now);
+			content->proplist.set(PR_MESSAGE_DELIVERY_TIME, now);
+			ctx.send(dir, 0, *content);
+		}
 		msg.success();
 		data.ResponseMessages.emplace_back(std::move(msg));
 	} catch(const EWSError& err) {
@@ -666,7 +851,7 @@ void process(mCreateAttachmentRequest &&request, XMLElement *response,
 			PROBLEM_ARRAY initProblems;
 			if (!ctx.plugin().exmdb.set_instance_properties(dir.c_str(),
 			    aInstId, &initList, &initProblems))
-				throw EWSError::ItemSave(E3094);
+				throw EWSError::ItemSave(E3429);
 
 			ATTACHMENT_CONTENT ac{};
 			std::vector<TAGGED_PROPVAL> props;
@@ -695,11 +880,11 @@ void process(mCreateAttachmentRequest &&request, XMLElement *response,
 			PROBLEM_ARRAY problems;
 			if (!ctx.plugin().exmdb.write_attachment_instance(dir.c_str(),
 			    aInstId, &ac, false, &problems))
-				throw EWSError::ItemSave(E3094);
+				throw EWSError::ItemSave(E3430);
 			ec_error_t err;
 			if (!ctx.plugin().exmdb.flush_instance(dir.c_str(),
 			    aInstId, &err) || err != ecSuccess)
-				throw EWSError::ItemSave(E3094);
+				throw EWSError::ItemSave(E3431);
 
 			sShape shape;
 			ctx.updated(dir, mid, shape);
@@ -708,7 +893,7 @@ void process(mCreateAttachmentRequest &&request, XMLElement *response,
 			if (!ctx.plugin().exmdb.set_message_properties(dir.c_str(),
 			    ctx.effectiveUser(parentFolder), CP_ACP, mid.messageId(),
 			    &msgProps, &msgProblems))
-				throw EWSError::ItemSave(E3092);
+				throw EWSError::ItemSave(E3411);
 
 			mCreateAttachmentResponseMessage msg;
 			sAttachmentId aid(ctx.getItemEntryId(dir, mid.messageId()), aNum);
@@ -726,13 +911,77 @@ void process(mCreateAttachmentRequest &&request, XMLElement *response,
 }
 
 /**
+ * @brief      Process DeleteAttachment
+ *
+ * Delete one or more attachments from existing items.
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mDeleteAttachmentRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:DeleteAttachmentResponse");
+
+	mDeleteAttachmentResponse data;
+	data.ResponseMessages.reserve(request.AttachmentIds.size());
+	for (const tRequestAttachmentId &raid : request.AttachmentIds) try {
+		sAttachmentId aid(raid.Id.data(), raid.Id.size());
+		sFolderSpec parentFolder = ctx.resolveFolder(aid);
+		std::string dir = ctx.getDir(parentFolder);
+		ctx.validate(dir, aid);
+		// XXX: Permission check is wrong; we must check whether message can be modified
+		if (!(ctx.permissions(dir, parentFolder.folderId) & frightsEditAny))
+			throw EWSError::AccessDenied(E3444);
+
+		auto mInst = ctx.plugin().loadMessageInstance(dir,
+		             aid.folderId(), aid.messageId());
+		if (!ctx.plugin().exmdb.delete_message_instance_attachment(dir.c_str(),
+		    mInst->instanceId, aid.attachment_num))
+			throw EWSError::ItemSave(E3432);
+		ec_error_t err;
+		if (!ctx.plugin().exmdb.flush_instance(dir.c_str(),
+		    mInst->instanceId, &err) || err != ecSuccess)
+			throw EWSError::ItemSave(E3433);
+
+		sShape shape;
+		ctx.updated(dir, aid, shape);
+		TPROPVAL_ARRAY msgProps = shape.write();
+		PROBLEM_ARRAY msgProblems;
+		if (!ctx.plugin().exmdb.set_message_properties(dir.c_str(),
+		    ctx.effectiveUser(parentFolder), CP_ACP, aid.messageId(),
+		    &msgProps, &msgProblems))
+			throw EWSError::ItemSave(E3412);
+
+		static constexpr proptag_t propids[] = {PR_ENTRYID, PR_CHANGE_KEY};
+		static constexpr PROPTAG_ARRAY proptags = {std::size(propids), deconst(propids)};
+		TPROPVAL_ARRAY props = ctx.getItemProps(dir, aid.messageId(), proptags);
+		auto entryId   = props.get<const BINARY>(PR_ENTRYID);
+		auto changeKey = props.get<const BINARY>(PR_CHANGE_KEY);
+
+		mDeleteAttachmentResponseMessage msg;
+		if(entryId && changeKey) {
+			auto &rootItemId = msg.RootItemId.emplace();
+			rootItemId.RootItemId = sMessageEntryId(entryId->pv, entryId->cb).serialize();
+			rootItemId.RootItemChangeKey = sBase64Binary(changeKey);
+		}
+		msg.success();
+		data.ResponseMessages.emplace_back(std::move(msg));
+	} catch (const EWSError &err) {
+		data.ResponseMessages.emplace_back(err);
+	}
+
+	data.serialize(response);
+}
+
+/**
  * @brief      Process DeleteFolder
  *
  * @param      request   Request data
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mDeleteFolderRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mDeleteFolderRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:DeleteFolderResponse");
 
@@ -782,7 +1031,7 @@ void process(mDeleteFolderRequest&& request, XMLElement* response, const EWSCont
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mDeleteItemRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mDeleteItemRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:DeleteItemResponse");
 
@@ -790,21 +1039,40 @@ void process(mDeleteItemRequest&& request, XMLElement* response, const EWSContex
 	data.ResponseMessages.reserve(request.ItemIds.size());
 	auto& exmdb = ctx.plugin().exmdb;
 
-	for (const tItemId &itemId : request.ItemIds) try {
-		ctx.assertIdType(itemId.type, tItemId::ID_ITEM);
+	for (const auto &id : request.ItemIds) try {
+		tItemId itemId = id.itemId();
+		if (id.holds_alternative<tRecurringMasterItemId>())
+			throw EWSError::InvalidId(E3451);  // currently not supported
 		sMessageEntryId meid(itemId.Id.data(), itemId.Id.size());
 		sFolderSpec parent = ctx.resolveFolder(meid);
 		std::string dir = ctx.getDir(parent);
 		ctx.validate(dir, meid);
 		if (!(ctx.permissions(dir, parent.folderId) & frightsDeleteAny))
 			throw EWSError::AccessDenied(E3131);
-		if (request.DeleteType == Enum::MoveToDeletedItems) {
-			uint64_t newMid;
+
+		if (id.holds_alternative<tOccurrenceItemId>()) {
+			if (request.SendMeetingCancellations && *request.SendMeetingCancellations != Enum::SendToNone)
+				ctx.sendMeetingCancellation(dir, meid, parent,
+					                        *request.SendMeetingCancellations == Enum::SendToAllAndSaveCopy);
+			/* OccurrenceItemId: delete a single occurrence */
+			tOccurrenceItemId occurrenceId = std::get<tOccurrenceItemId>(id.asVariant());
+			auto mid = meid.messageId();
+			auto basedate = ctx.resolveOccurrenceIndex(dir, mid,
+			                occurrenceId.InstanceIndex);
+			ctx.deleteOccurrence(dir, mid, basedate);
+			data.ResponseMessages.emplace_back().success();
+		} else if (itemId.type == tItemId::ID_OCCURRENCE) {
+			sOccurrenceId oid(itemId.Id.data(), itemId.Id.size());
+			ctx.deleteOccurrence(dir,
+				meid.messageId(), oid.basedate);
+			data.ResponseMessages.emplace_back().success();
+		} else if (request.DeleteType == Enum::MoveToDeletedItems) {
+			uint64_t newMid = 0;
 			if (!exmdb.allocate_message_id(dir.c_str(), parent.folderId, &newMid))
-				throw EWSError::MoveCopyFailed(E3132);
+				throw EWSError::MoveCopyFailed(E3425);
 
 			sFolderSpec deletedItems = ctx.resolveFolder(tDistinguishedFolderId(Enum::deleteditems));
-			BOOL result;
+			BOOL result = false;
 			if (!exmdb.movecopy_message(dir.c_str(), CP_ACP,
 			    meid.messageId(), deletedItems.folderId, newMid,
 			    TRUE, &result) || !result)
@@ -816,7 +1084,7 @@ void process(mDeleteItemRequest&& request, XMLElement* response, const EWSContex
 			auto fid = rop_util_make_eid_ex(1, meid.folderId());
 			EID_ARRAY eids{1, &eid};
 			BOOL hardDelete = request.DeleteType == Enum::HardDelete ? TRUE : false;
-			BOOL partial;
+			BOOL partial = false;
 			if (!ctx.plugin().exmdb.delete_messages(dir.c_str(),
 			    CP_ACP, ctx.effectiveUser(parent), fid, &eids,
 			    hardDelete, &partial) || partial)
@@ -838,7 +1106,7 @@ void process(mDeleteItemRequest&& request, XMLElement* response, const EWSContex
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mEmptyFolderRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mEmptyFolderRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:EmptyFolderResponse");
 
@@ -876,7 +1144,7 @@ void process(mEmptyFolderRequest&& request, XMLElement* response, const EWSConte
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mFindFolderRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mFindFolderRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:FindFolderResponse");
 
@@ -953,7 +1221,7 @@ void process(mFindFolderRequest&& request, XMLElement* response, const EWSContex
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mFindItemRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mFindItemRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:FindItemResponse");
 
@@ -1048,7 +1316,7 @@ void process(mFindItemRequest&& request, XMLElement* response, const EWSContext&
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetAppManifestsRequest&&, XMLElement* response, const EWSContext&)
+void process(mGetAppManifestsRequest&&, XMLElement *response, const EWSContext&)
 {
 	response->SetName("m:GetAppManifestsResponse");
 
@@ -1064,7 +1332,7 @@ void process(mGetAppManifestsRequest&&, XMLElement* response, const EWSContext&)
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetAttachmentRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetAttachmentRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetAttachmentResponse");
 
@@ -1095,7 +1363,7 @@ void process(mGetAttachmentRequest&& request, XMLElement* response, const EWSCon
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetEventsRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetEventsRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetEventsResponse");
 
@@ -1126,7 +1394,7 @@ void process(mGetEventsRequest&& request, XMLElement* response, const EWSContext
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetFolderRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetFolderRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetFolderResponse");
 
@@ -1167,7 +1435,7 @@ void process(mGetFolderRequest&& request, XMLElement* response, const EWSContext
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetInboxRulesRequest&&, XMLElement* response, const EWSContext&)
+void process(mGetInboxRulesRequest&&, XMLElement *response, const EWSContext&)
 {
 	response->SetName("m:GetInboxRulesResponse");
 
@@ -1191,7 +1459,7 @@ void process(mGetInboxRulesRequest&&, XMLElement* response, const EWSContext&)
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetMailTipsRequest&& request, XMLElement* response, const EWSContext&)
+void process(mGetMailTipsRequest &&request, XMLElement *response, const EWSContext&)
 {
 	response->SetName("m:GetMailTipsResponse");
 
@@ -1216,7 +1484,7 @@ void process(mGetMailTipsRequest&& request, XMLElement* response, const EWSConte
 /**
  * @brief      Process GetRoomListsRequest
  */
-void process(mGetRoomListsRequest&&, XMLElement* response, const EWSContext& ctx)
+void process(mGetRoomListsRequest&&, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetRoomListsResponse");
 
@@ -1230,7 +1498,7 @@ void process(mGetRoomListsRequest&&, XMLElement* response, const EWSContext& ctx
 
 	std::vector<unsigned int> domain_ids;
 	if (!mysql_adaptor_get_org_domains(org_id, domain_ids))
-		throw DispatchError(E3027);
+		throw DispatchError(E3387);
 
 	mGetRoomListsResponse data;
 	std::vector<tRoomListEntry> lists;
@@ -1239,7 +1507,7 @@ void process(mGetRoomListsRequest&&, XMLElement* response, const EWSContext& ctx
 	for (unsigned int domain_id : domain_ids) {
 		sql_domain info;
 		if (!mysql_adaptor_get_domain_info(domain_id, info))
-			throw DispatchError(E3027);
+			throw DispatchError(E3388);
 		if (!collect_rooms(domain_id))
 			continue;
 		lists.emplace_back(make_room_list_entry(info));
@@ -1254,23 +1522,23 @@ void process(mGetRoomListsRequest&&, XMLElement* response, const EWSContext& ctx
 /**
  * @brief      Process GetRoomsRequest
  */
-void process(mGetRoomsRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetRoomsRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetRoomsResponse");
 
 	ctx.normalize(request.RoomList);
 	if (!request.RoomList.EmailAddress)
-		throw DispatchError(E3090("RoomList"));
+		throw DispatchError(E3441("RoomList"));
 
 	auto user_domain = extract_domain(ctx.auth_info().username);
 	if (user_domain.empty())
-		throw DispatchError(E3090(ctx.auth_info().username));
+		throw DispatchError(E3442(ctx.auth_info().username));
 	unsigned int user_domain_id = 0, user_org_id = 0;
 	resolve_domain_ids(user_domain, user_domain_id, user_org_id);
 
 	auto target_domain = extract_domain(request.RoomList.EmailAddress->c_str());
 	if (target_domain.empty())
-		throw DispatchError(E3090(*request.RoomList.EmailAddress));
+		throw DispatchError(E3443(*request.RoomList.EmailAddress));
 	unsigned int target_domain_id = 0, target_org_id = 0;
 	resolve_domain_ids(target_domain, target_domain_id, target_org_id);
 
@@ -1299,7 +1567,7 @@ void process(mGetRoomsRequest&& request, XMLElement* response, const EWSContext&
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetServiceConfigurationRequest&&, XMLElement* response, const EWSContext&)
+void process(mGetServiceConfigurationRequest&&, XMLElement *response, const EWSContext&)
 {
 	response->SetName("m:GetServiceConfigurationResponse");
 
@@ -1323,7 +1591,7 @@ void process(mGetServiceConfigurationRequest&&, XMLElement* response, const EWSC
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetUserAvailabilityRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetUserAvailabilityRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetUserAvailabilityResponse");
 
@@ -1388,7 +1656,7 @@ void process(mGetUserAvailabilityRequest&& request, XMLElement* response, const 
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetStreamingEventsRequest&& request, XMLElement* response, EWSContext& ctx)
+void process(mGetStreamingEventsRequest &&request, XMLElement *response, EWSContext &ctx)
 {
 	response->SetName("m:GetStreamingEventsResponse");
 
@@ -1409,19 +1677,116 @@ void process(mGetStreamingEventsRequest&& request, XMLElement* response, EWSCont
 }
 
 /**
- * @brief      Process GetUserConfigurationRequest
+ * @brief      Process CreateUserConfiguration
  *
- * Provides the functionality of GetUserConfiguration
- *
- * In its current state it does nothing more than sending not found response.
- *
- * @todo       This function lacks most of its functionality and is practically worthless.
+ * Create a new FAI message to hold user configuration data.
  *
  * @param      request   Request data
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetUserConfigurationRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mCreateUserConfigurationRequest &&request, XMLElement *response,
+    const EWSContext &ctx)
+{
+	response->SetName("m:CreateUserConfigurationResponse");
+
+	mCreateUserConfigurationResponse data;
+	try {
+		auto &exmdb = ctx.plugin().exmdb;
+		const auto &reqName  = request.UserConfiguration.UserConfigurationName;
+		const auto &folderId = reqName.FolderId;
+		sFolderSpec folder;
+
+		if (auto raw = std::get_if<tFolderId>(&folderId))
+			folder = ctx.resolveFolder(*raw);
+		else if (auto dist = std::get_if<tDistinguishedFolderId>(&folderId))
+			folder = ctx.resolveFolder(*dist);
+		else
+			throw EWSError::InvalidFolderId(E3420);
+
+		if (!folder.target)
+			folder.target = ctx.auth_info().username;
+		std::string dir = ctx.getDir(folder);
+		if (!(ctx.permissions(dir, folder.folderId) & frightsCreate))
+			throw EWSError::AccessDenied(E3434);
+
+		uint64_t messageId, changeNumber;
+		if (!exmdb.allocate_message_id(dir.c_str(),
+		    folder.folderId, &messageId))
+			throw EWSError::ItemSave(E3413);
+		if (!exmdb.allocate_cn(dir.c_str(), &changeNumber))
+			throw EWSError::ItemSave(E3414);
+
+		bool isPublic = folder.location == folder.PUBLIC;
+		uint32_t accountId = ctx.getAccountId(*folder.target, isPublic);
+		XID xid{isPublic ?
+			rop_util_make_domain_guid(accountId) :
+			rop_util_make_user_guid(accountId),
+			changeNumber};
+		BINARY ckeyBin = ctx.serialize(xid);
+		auto pclBin = ctx.mkPCL(xid);
+
+		std::string configClass = "IPM.Configuration." + reqName.Name;
+		static constexpr uint8_t trueVal = TRUE;
+
+		std::vector<TAGGED_PROPVAL> props;
+		props.push_back({PidTagMid, &messageId});
+		props.push_back({PidTagChangeNumber, &changeNumber});
+		props.push_back({PR_CHANGE_KEY, &ckeyBin});
+		props.push_back({PR_PREDECESSOR_CHANGE_LIST, pclBin.get()});
+		props.push_back({PR_ASSOCIATED, deconst(&trueVal)});
+		props.push_back({PR_MESSAGE_CLASS, deconst(configClass.c_str())});
+		props.push_back({PR_READ, deconst(&trueVal)});
+		auto modtime = rop_util_current_nttime();
+		props.push_back({PR_LAST_MODIFICATION_TIME, &modtime});
+
+		auto& userConfiguration = request.UserConfiguration;
+		if (userConfiguration.XmlData) {
+			auto bin = EWSContext::construct<BINARY>(BINARY{
+			           static_cast<uint32_t>(userConfiguration.XmlData->size()),
+			           {EWSContext::alloc<uint8_t>(userConfiguration.XmlData->size())}});
+			memcpy(bin->pv, userConfiguration.XmlData->data(),
+			       userConfiguration.XmlData->size());
+			props.push_back({PR_ROAMING_XMLSTREAM, bin});
+		}
+		if (userConfiguration.BinaryData) {
+			auto bin = EWSContext::construct<BINARY>(BINARY{
+			           static_cast<uint32_t>(userConfiguration.BinaryData->size()),
+			           {EWSContext::alloc<uint8_t>(userConfiguration.BinaryData->size())}});
+			memcpy(bin->pv, userConfiguration.BinaryData->data(),
+			       userConfiguration.BinaryData->size());
+			props.push_back({PR_ROAMING_BINARYSTREAM, bin});
+		}
+
+		MESSAGE_CONTENT content{};
+		content.proplist.count = props.size();
+		content.proplist.ppropval = props.data();
+
+		ec_error_t err;
+		uint64_t outmid = 0, outcn = 0;
+		if (!exmdb.write_message(dir.c_str(), CP_ACP,
+		    folder.folderId, &content, {}, &outmid,
+		    &outcn, &err) || err != ecSuccess)
+			throw EWSError::ItemSave(E3415);
+
+		mCreateUserConfigurationResponseMessage msg;
+		msg.success();
+		data.ResponseMessages.emplace_back(std::move(msg));
+	} catch (const EWSError &err) {
+		data.ResponseMessages.clear();
+		data.ResponseMessages.emplace_back(err);
+	}
+	data.serialize(response);
+}
+
+/**
+ * @brief      Process GetUserConfigurationRequest
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mGetUserConfigurationRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetUserConfigurationResponse");
 
@@ -1436,12 +1801,12 @@ void process(mGetUserConfigurationRequest&& request, XMLElement* response, const
 			folder = ctx.resolveFolder(*raw);
 		else if (auto dist = std::get_if<tDistinguishedFolderId>(&folderId))
 			folder = ctx.resolveFolder(*dist);
-		else if (reqName.FolderId.valueless_by_exception())
-			throw EWSError::InvalidFolderId(E3252);
+		else
+			throw EWSError::InvalidFolderId(E3421);
 
 		std::string dir = ctx.getDir(folder);
 		if (!(ctx.permissions(dir, folder.folderId) & frightsVisible))
-			throw EWSError::AccessDenied(E3218);
+			throw EWSError::AccessDenied(E3435);
 
 		std::string configClass = "IPM.Configuration." + reqName.Name;
 		RESTRICTION_PROPERTY resProp{RELOP_EQ, PR_MESSAGE_CLASS,
@@ -1452,20 +1817,20 @@ void process(mGetUserConfigurationRequest&& request, XMLElement* response, const
 		const char *username = ctx.effectiveUser(folder);
 		if (!exmdb.load_content_table(dir.c_str(), CP_UTF8, folder.folderId, username,
 		    TABLE_FLAG_ASSOCIATED, &res, nullptr, &tableId, &rowCount))
-			throw EWSError::ItemPropertyRequestFailed(E3245);
+			throw EWSError::ItemPropertyRequestFailed(E3438);
 		auto unloadTable = HX::make_scope_exit([&, tableId]{exmdb.unload_table(dir.c_str(), tableId);});
 		if (rowCount == 0)
-			throw EWSError::ItemNotFound(E3143);
+			throw EWSError::ItemNotFound(E3392);
 
 		static constexpr proptag_t midTag = PidTagMid;
 		TARRAY_SET rows;
 		exmdb.query_table(dir.c_str(), username, CP_UTF8, tableId,
 			{&midTag, 1}, 0, 1, &rows);
 		if (rows.count == 0 || rows.pparray[0] == nullptr)
-			throw EWSError::ItemNotFound(E3143);
+			throw EWSError::ItemNotFound(E3393);
 		auto mid = rows.pparray[0]->get<const uint64_t>(PidTagMid);
 		if (mid == nullptr)
-			throw EWSError::ItemNotFound(E3143);
+			throw EWSError::ItemNotFound(E3394);
 
 		static constexpr proptag_t propTags[] = {
 			PR_ENTRYID, PR_CHANGE_KEY, PR_ROAMING_XMLSTREAM, PR_ROAMING_BINARYSTREAM,
@@ -1474,9 +1839,8 @@ void process(mGetUserConfigurationRequest&& request, XMLElement* response, const
 		TPROPVAL_ARRAY propvals = ctx.getItemProps(dir, *mid, props);
 
 		mGetUserConfigurationResponseMessage& msg = data.ResponseMessages.emplace_back();
-		msg.UserConfiguration.emplace(tUserConfigurationType{reqName});
+		msg.UserConfiguration.emplace(reqName);
 		auto &config = *msg.UserConfiguration;
-		config.UserConfigurationName = reqName;
 
 		auto propType = request.UserConfigurationProperties;
 		bool includeAll = propType == Enum::All;
@@ -1509,6 +1873,179 @@ void process(mGetUserConfigurationRequest&& request, XMLElement* response, const
 }
 
 /**
+ * @brief      Process UpdateUserConfiguration
+ *
+ * Update XmlData and/or BinaryData properties on an existing
+ * user configuration object (FAI message).
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mUpdateUserConfigurationRequest &&request, XMLElement *response,
+    const EWSContext &ctx)
+{
+	response->SetName("m:UpdateUserConfigurationResponse");
+
+	mUpdateUserConfigurationResponse data;
+	try {
+		auto &exmdb = ctx.plugin().exmdb;
+		const auto &reqName  = request.UserConfiguration.UserConfigurationName;
+		const auto &folderId = reqName.FolderId;
+		sFolderSpec folder;
+
+		if (auto raw = std::get_if<tFolderId>(&folderId))
+			folder = ctx.resolveFolder(*raw);
+		else if (auto dist = std::get_if<tDistinguishedFolderId>(&folderId))
+			folder = ctx.resolveFolder(*dist);
+		else
+			throw EWSError::InvalidFolderId(E3422);
+
+		std::string dir = ctx.getDir(folder);
+		if (!(ctx.permissions(dir, folder.folderId) & frightsEditAny))
+			throw EWSError::AccessDenied(E3436);
+
+		std::string configClass = "IPM.Configuration." + reqName.Name;
+		const RESTRICTION_PROPERTY resProp =
+			{RELOP_EQ, PR_MESSAGE_CLASS,
+			 {PR_MESSAGE_CLASS, deconst(configClass.c_str())}};
+		const RESTRICTION res = {RES_PROPERTY, {deconst(&resProp)}};
+
+		uint32_t tableId = 0, rowCount = 0;
+		const char *username = ctx.effectiveUser(folder);
+		if (!exmdb.load_content_table(dir.c_str(), CP_UTF8,
+		    folder.folderId, username, TABLE_FLAG_ASSOCIATED,
+		    &res, nullptr, &tableId, &rowCount))
+			throw EWSError::ItemPropertyRequestFailed(E3439);
+		auto unloadTable = HX::make_scope_exit([&] { exmdb.unload_table(dir.c_str(), tableId); });
+		if (rowCount == 0)
+			throw EWSError::ItemNotFound(E3395);
+
+		static constexpr proptag_t midTag = PidTagMid;
+		TARRAY_SET rows;
+		if (!exmdb.query_table(dir.c_str(), username, CP_UTF8,
+		    tableId, {&midTag, 1}, 0, 1, &rows))
+			throw EWSError::ItemNotFound(E3396);
+		if (rows.count == 0 || rows.pparray[0] == nullptr)
+			throw EWSError::ItemNotFound(E3397);
+		auto mid = rows.pparray[0]->get<const uint64_t>(PidTagMid);
+		if (mid == nullptr)
+			throw EWSError::ItemNotFound(E3398);
+
+		std::vector<TAGGED_PROPVAL> props;
+		auto& userConfiguration = request.UserConfiguration;
+		if (userConfiguration.XmlData) {
+			auto bin = EWSContext::construct<BINARY>(BINARY{
+			           static_cast<uint32_t>(userConfiguration.XmlData->size()),
+			           {EWSContext::alloc<uint8_t>(userConfiguration.XmlData->size())}});
+			memcpy(bin->pv, userConfiguration.XmlData->data(), userConfiguration.XmlData->size());
+			props.push_back({PR_ROAMING_XMLSTREAM, bin});
+		}
+		if (userConfiguration.BinaryData) {
+			auto bin = EWSContext::construct<BINARY>(BINARY{
+			           static_cast<uint32_t>(userConfiguration.BinaryData->size()),
+			           {EWSContext::alloc<uint8_t>(userConfiguration.BinaryData->size())}});
+			memcpy(bin->pv, userConfiguration.BinaryData->data(),
+			       userConfiguration.BinaryData->size());
+			props.push_back({PR_ROAMING_BINARYSTREAM, bin});
+		}
+
+		if (!props.empty()) {
+			const TPROPVAL_ARRAY propArray = {static_cast<uint16_t>(props.size()), props.data()};
+			PROBLEM_ARRAY problems;
+			if (!exmdb.set_message_properties(dir.c_str(),
+			    username, CP_ACP, *mid, &propArray, &problems))
+				throw EWSError::ItemSave(E3416);
+		}
+
+		mUpdateUserConfigurationResponseMessage msg;
+		msg.success();
+		data.ResponseMessages.emplace_back(std::move(msg));
+	} catch (const EWSError &err) {
+		data.ResponseMessages.clear();
+		data.ResponseMessages.emplace_back(err);
+	}
+	data.serialize(response);
+}
+
+/**
+ * @brief      Process DeleteUserConfigurationRequest
+ *
+ * Delete a user configuration object (FAI message) from a folder.
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mDeleteUserConfigurationRequest &&request,
+    XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:DeleteUserConfigurationResponse");
+
+	mDeleteUserConfigurationResponse data;
+	try {
+		auto &exmdb = ctx.plugin().exmdb;
+		const auto &reqName  = request.UserConfigurationName;
+		const auto &folderId = reqName.FolderId;
+		sFolderSpec folder;
+
+		if (auto raw = std::get_if<tFolderId>(&folderId))
+			folder = ctx.resolveFolder(*raw);
+		else if (auto dist = std::get_if<tDistinguishedFolderId>(&folderId))
+			folder = ctx.resolveFolder(*dist);
+		else
+			throw EWSError::InvalidFolderId(E3423);
+
+		std::string dir = ctx.getDir(folder);
+		if (!(ctx.permissions(dir, folder.folderId) & frightsDeleteAny))
+			throw EWSError::AccessDenied(E3437);
+
+		std::string configClass = "IPM.Configuration." + reqName.Name;
+		const RESTRICTION_PROPERTY resProp =
+			{RELOP_EQ, PR_MESSAGE_CLASS,
+			 {PR_MESSAGE_CLASS, deconst(configClass.c_str())}};
+		const RESTRICTION res = {RES_PROPERTY, {deconst(&resProp)}};
+
+		uint32_t tableId = 0, rowCount = 0;
+		const char *username = ctx.effectiveUser(folder);
+		if (!exmdb.load_content_table(dir.c_str(), CP_UTF8,
+		    folder.folderId, username, TABLE_FLAG_ASSOCIATED,
+		    &res, nullptr, &tableId, &rowCount))
+			throw EWSError::ItemPropertyRequestFailed(E3440);
+		auto unloadTable = HX::make_scope_exit([&] { exmdb.unload_table(dir.c_str(), tableId); });
+		if (rowCount == 0)
+			throw EWSError::ItemNotFound(E3399);
+
+		static constexpr proptag_t midTag = PidTagMid;
+		TARRAY_SET rows;
+		if (!exmdb.query_table(dir.c_str(), username, CP_UTF8,
+		    tableId, {&midTag, 1}, 0, 1, &rows))
+			throw EWSError::ItemNotFound(E3400);
+		if (rows.count == 0 || rows.pparray[0] == nullptr)
+			throw EWSError::ItemNotFound(E3401);
+		auto mid = rows.pparray[0]->get<const uint64_t>(PidTagMid);
+		if (mid == nullptr)
+			throw EWSError::ItemNotFound(E3402);
+
+		eid_t eid = *mid;
+		EID_ARRAY eids{1, &eid};
+		BOOL partial;
+		if (!exmdb.delete_messages(dir.c_str(), CP_ACP,
+		    username, folder.folderId, &eids, TRUE,
+		    &partial) || partial)
+			throw EWSError::CannotDeleteObject(E3447);
+
+		mDeleteUserConfigurationResponseMessage msg;
+		msg.success();
+		data.ResponseMessages.emplace_back(std::move(msg));
+	} catch (const EWSError &err) {
+		data.ResponseMessages.clear();
+		data.ResponseMessages.emplace_back(err);
+	}
+	data.serialize(response);
+}
+
+/**
  * @brief      Process GetUserOofSettingsRequest
  *
  * Provides the functionality of GetUserOofSettingsRequest
@@ -1520,7 +2057,7 @@ void process(mGetUserConfigurationRequest&& request, XMLElement* response, const
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetUserOofSettingsRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetUserOofSettingsRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	//Set name of the response node
 	response->SetName("m:GetUserOofSettingsResponse");
@@ -1538,19 +2075,18 @@ void process(mGetUserOofSettingsRequest&& request, XMLElement* response, const E
 	data.OofSettings.emplace();
 
 	//Get OOF state
-	static constexpr struct cfg_directive oof_defaults[] = {
-		{"allow_external_oof", "0", CFG_BOOL},
-		{"external_audience", "0", CFG_BOOL},
-		{"oof_state", "0"},
-		CFG_TABLE_END,
-	};
 	std::string maildir = ctx.get_maildir(request.Mailbox);
-	auto configPath = maildir + "/config/autoreply.cfg";
-	auto configFile = config_file_init(configPath.c_str(), oof_defaults);
-	unsigned int oof_state  = configFile != nullptr ? configFile->get_ll("oof_state") : 0;
-	bool allow_external_oof = configFile != nullptr ? configFile->get_ll("allow_external_oof") : false;
-	bool external_audience  = configFile != nullptr ? configFile->get_ll("external_audience") : false;
-	switch (oof_state) {
+	static constexpr proptag_t oof_tags[] = {
+		PR_EC_OUTOFOFFICE, PR_EC_ALLOW_EXTERNAL, PR_EC_EXTERNAL_AUDIENCE,
+		PR_EC_OUTOFOFFICE_FROM, PR_EC_OUTOFOFFICE_UNTIL,
+		PR_EC_OUTOFOFFICE_MSG, PR_EC_EXTERNAL_REPLY,
+	};
+	TPROPVAL_ARRAY props{};
+	if (!ctx.plugin().exmdb.autoreply_getprop(maildir.c_str(), CP_UTF8,
+	    {oof_tags, std::size(oof_tags)}, &props))
+		throw DispatchError(E3011);
+	auto oof_state = props.get<const uint32_t>(PR_EC_OUTOFOFFICE);
+	switch (oof_state != nullptr ? *oof_state : 0) {
 	case 1:
 		data.OofSettings->OofState = "Enabled"; break;
 	case 2:
@@ -1558,28 +2094,35 @@ void process(mGetUserOofSettingsRequest&& request, XMLElement* response, const E
 	default:
 		data.OofSettings->OofState = "Disabled"; break;
 	}
-	if (allow_external_oof)
-		data.OofSettings->ExternalAudience = external_audience ? "Known" : "All";
+	auto allow_ext = props.get<const uint8_t>(PR_EC_ALLOW_EXTERNAL);
+	auto ext_audience = props.get<const uint8_t>(PR_EC_EXTERNAL_AUDIENCE);
+	if (allow_ext != nullptr && *allow_ext)
+		data.OofSettings->ExternalAudience = (ext_audience != nullptr && *ext_audience) ? "Known" : "All";
 	else
 		data.OofSettings->ExternalAudience = "None";
-	auto start_time = configFile != nullptr ? configFile->get_value("start_time") : nullptr;
-	auto end_time   = configFile != nullptr ? configFile->get_value("end_time") : nullptr;
+	auto start_time = props.get<const mapitime_t>(PR_EC_OUTOFOFFICE_FROM);
+	auto end_time = props.get<const mapitime_t>(PR_EC_OUTOFOFFICE_UNTIL);
 	if (start_time != nullptr && end_time != nullptr) {
-		tDuration& Duration = data.OofSettings->Duration.emplace();
-		Duration.StartTime = clock::from_time_t(strtoll(start_time, nullptr, 0));
-		Duration.EndTime = clock::from_time_t(strtoll(end_time, nullptr, 0));
+		auto &Duration = data.OofSettings->Duration.emplace();
+		Duration.StartTime = rop_util_nttime_to_unix2(*start_time);
+		Duration.EndTime = rop_util_nttime_to_unix2(*end_time);
+#if 0
+	// XXX: Normally we need this else branch, see reasoning in commit
+	// message gromox-2.46-99-g716671da5
 	} else {
 		auto &dur = data.OofSettings->Duration.emplace();
 		dur.StartTime = clock::now();
 		dur.EndTime = dur.StartTime + std::chrono::days(1);
+#endif
 	}
-	auto reply = readMessageBody(maildir + "/config/internal-reply");
-	if (reply)
-		data.OofSettings->InternalReply.emplace(std::move(reply));
+	auto int_reply = props.get<const char>(PR_EC_OUTOFOFFICE_MSG);
+	if (int_reply != nullptr)
+		data.OofSettings->InternalReply.emplace(std::string(int_reply));
 	else
 		data.OofSettings->InternalReply.emplace(std::string{});
-	if ((reply = readMessageBody(maildir + "/config/external-reply")))
-		data.OofSettings->ExternalReply.emplace(std::move(reply));
+	auto ext_reply = props.get<const char>(PR_EC_EXTERNAL_REPLY);
+	if (ext_reply != nullptr)
+		data.OofSettings->ExternalReply.emplace(std::string(ext_reply));
 	else
 		data.OofSettings->ExternalReply.emplace(std::string{});
 
@@ -1595,7 +2138,7 @@ void process(mGetUserOofSettingsRequest&& request, XMLElement* response, const E
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mGetUserPhotoRequest&& request, XMLElement* response, EWSContext& ctx)
+void process(mGetUserPhotoRequest &&request, XMLElement *response, EWSContext &ctx)
 {
 	response->SetName("m:GetUserPhotoResponse");
 
@@ -1631,7 +2174,7 @@ void process(mGetUserPhotoRequest&& request, XMLElement* response, EWSContext& c
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(const mBaseMoveCopyFolder& request, XMLElement* response, const EWSContext& ctx)
+void process(const mBaseMoveCopyFolder &request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName(request.copy ? "m:CopyFolderResponse" : "m:MoveFolderResponse");
 
@@ -1674,7 +2217,7 @@ void process(const mBaseMoveCopyFolder& request, XMLElement* response, const EWS
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(const mBaseMoveCopyItem& request, XMLElement* response, const EWSContext& ctx)
+void process(const mBaseMoveCopyItem &request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName(request.copy ? "m:CopyItemResponse" : "m:MoveItemResponse");
 
@@ -1690,7 +2233,8 @@ void process(const mBaseMoveCopyItem& request, XMLElement* response, const EWSCo
 
 	sShape shape = sShape(tItemResponseShape());
 
-	for (const tItemId &itemId : request.ItemIds) try {
+	for (const auto &id : request.ItemIds) try {
+		tItemId itemId = id.itemId();
 		if (!dstAccess)
 			throw EWSError::AccessDenied(E3184);
 		ctx.assertIdType(itemId.type, tItemId::ID_ITEM);
@@ -1726,7 +2270,7 @@ void process(const mBaseMoveCopyItem& request, XMLElement* response, const EWSCo
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mSetUserOofSettingsRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mSetUserOofSettingsRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:SetUserOofSettingsResponse");
 
@@ -1740,30 +2284,38 @@ void process(mSetUserOofSettingsRequest&& request, XMLElement* response, const E
 	std::string maildir = ctx.get_maildir(request.Mailbox);
 
 	tUserOofSettings& OofSettings = request.UserOofSettings;
-	int oof_state, allow_external_oof, external_audience;
 
-	oof_state = OofSettings.OofState;
-
+	uint32_t oof_state = OofSettings.OofState;
 	std::string externalAudience = OofSettings.ExternalAudience;
-	allow_external_oof = tolower_inplace(externalAudience) != "none";
+	uint8_t allow_external_oof = tolower_inplace(externalAudience) != "none";
 	//Note: counterintuitive but intentional: known -> 1, all -> 0
-	external_audience = externalAudience == "known";
+	uint8_t external_audience = externalAudience == "known";
 	if (allow_external_oof && !external_audience && externalAudience != "all")
 		throw DispatchError(E3009(OofSettings.ExternalAudience));
 
-	std::string filename = maildir+"/config/autoreply.cfg";
-	std::ofstream file(filename); /* FMODE_PUBLIC */
-	file << "oof_state = " << oof_state << "\n"
-	     << "allow_external_oof = " << allow_external_oof << "\n";
-	if (allow_external_oof)
-		file << "external_audience = " << external_audience << "\n";
-	if (OofSettings.Duration)
-		file << "start_time = " << clock::to_time_t(OofSettings.Duration->StartTime) << "\n"
-		     << "end_time = " << clock::to_time_t(OofSettings.Duration->EndTime) << "\n";
-	file.close();
-
-	writeMessageBody(maildir+"/config/internal-reply", OofSettings.InternalReply);
-	writeMessageBody(maildir+"/config/external-reply", OofSettings.ExternalReply);
+	std::vector<TAGGED_PROPVAL> pvs;
+	pvs.push_back(TAGGED_PROPVAL{PR_EC_OUTOFOFFICE, &oof_state});
+	pvs.push_back(TAGGED_PROPVAL{PR_EC_ALLOW_EXTERNAL, &allow_external_oof});
+	pvs.push_back(TAGGED_PROPVAL{PR_EC_EXTERNAL_AUDIENCE, &external_audience});
+	mapitime_t nt_start{}, nt_end{};
+	if (OofSettings.Duration) {
+		nt_start = rop_util_unix_to_nttime(OofSettings.Duration->StartTime);
+		nt_end = rop_util_unix_to_nttime(OofSettings.Duration->EndTime);
+		pvs.push_back(TAGGED_PROPVAL{PR_EC_OUTOFOFFICE_FROM, &nt_start});
+		pvs.push_back(TAGGED_PROPVAL{PR_EC_OUTOFOFFICE_UNTIL, &nt_end});
+	}
+	std::string int_msg, ext_msg;
+	if (OofSettings.InternalReply && OofSettings.InternalReply->Message)
+		int_msg = *OofSettings.InternalReply->Message;
+	pvs.push_back(TAGGED_PROPVAL{PR_EC_OUTOFOFFICE_MSG, deconst(int_msg.c_str())});
+	if (OofSettings.ExternalReply && OofSettings.ExternalReply->Message)
+		ext_msg = *OofSettings.ExternalReply->Message;
+	pvs.push_back(TAGGED_PROPVAL{PR_EC_EXTERNAL_REPLY, deconst(ext_msg.c_str())});
+	TPROPVAL_ARRAY vals = {static_cast<uint16_t>(pvs.size()), pvs.data()};
+	PROBLEM_ARRAY problems{};
+	if (!ctx.plugin().exmdb.autoreply_setprop(maildir.c_str(), CP_UTF8,
+	    &vals, &problems))
+		throw DispatchError(E3012);
 
 	mSetUserOofSettingsResponse data;
 	data.ResponseMessage.success();
@@ -1779,7 +2331,7 @@ void process(mSetUserOofSettingsRequest&& request, XMLElement* response, const E
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mSyncFolderHierarchyRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mSyncFolderHierarchyRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:SyncFolderHierarchyResponse");
 
@@ -1847,7 +2399,7 @@ void process(mSyncFolderHierarchyRequest&& request, XMLElement* response, const 
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mSyncFolderItemsRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mSyncFolderItemsRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:SyncFolderItemsResponse");
 
@@ -1912,10 +2464,15 @@ void process(mSyncFolderItemsRequest&& request, XMLElement* response, const EWSC
 			auto changeNum = ctx.getItemProp<const uint64_t>(dir, mid, PidTagChangeNumber);
 			if (!changeNum)
 				continue;
-			if (eid_array_check(&updated_mids, mid))
-				msg.Changes.emplace_back(tSyncFolderItemsUpdate{{{}, ctx.loadItem(dir, folder.folderId, mid, shape)}});
-			else
-				msg.Changes.emplace_back(tSyncFolderItemsCreate{{{}, ctx.loadItem(dir, folder.folderId, mid, shape)}});
+			try {
+				if (eid_array_check(&updated_mids, mid))
+					msg.Changes.emplace_back(tSyncFolderItemsUpdate{{{}, ctx.loadItem(dir, folder.folderId, mid, shape)}});
+				else
+					msg.Changes.emplace_back(tSyncFolderItemsCreate{{{}, ctx.loadItem(dir, folder.folderId, mid, shape)}});
+			} catch (const std::exception &e) {
+				mlog(LV_WARN, "[ews] skipping mid %llxh in sync: %s",
+					static_cast<unsigned long long>(mid), e.what());
+			}
 			if (!syncState.given.append(mid) || !syncState.seen.append(*changeNum))
 				throw DispatchError(E3065);
 		}
@@ -1943,7 +2500,7 @@ void process(mSyncFolderItemsRequest&& request, XMLElement* response, const EWSC
 					throw DispatchError(E3066);
 			}
 			if (last_readcn && !syncState.read.append_range(1, 1, rop_util_get_gc_value(last_readcn)))
-				throw DispatchError(E3066);
+				throw DispatchError(E3448);
 			syncState.readOffset = 0;
 		} else {
 			syncState.readOffset = readSynced + unread_mids.count - skip;
@@ -1967,16 +2524,17 @@ void process(mSyncFolderItemsRequest&& request, XMLElement* response, const EWSC
  *
  * @todo optimize shape generation
  */
-void process(mGetItemRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mGetItemRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:GetItemResponse");
 
 	mGetItemResponse data;
 	data.ResponseMessages.reserve(request.ItemIds.size());
 	sShape shape(request.ItemShape);
-	for (auto &itemId : request.ItemIds) try {
-		if (itemId.type != tItemId::ID_ITEM && itemId.type != tItemId::ID_OCCURRENCE)
-			ctx.assertIdType(itemId.type, tItemId::ID_ITEM);
+	for (const auto &id : request.ItemIds) try {
+		if (id.holds_alternative<tRecurringMasterItemId>())
+			throw EWSError::InvalidId(E3452);
+		tItemId itemId = id.itemId();
 		sMessageEntryId eid(itemId.Id.data(), itemId.Id.size());
 		sFolderSpec parentFolder = ctx.resolveFolder(eid);
 		std::string dir = ctx.getDir(parentFolder);
@@ -1985,7 +2543,11 @@ void process(mGetItemRequest&& request, XMLElement* response, const EWSContext& 
 			throw EWSError::AccessDenied(E3139);
 		mGetItemResponseMessage msg;
 		auto mid = eid.messageId();
-		if (itemId.type == tItemId::ID_OCCURRENCE) {
+		if (id.holds_alternative<tOccurrenceItemId>()) {
+			const tOccurrenceItemId& occurrenceId = std::get<tOccurrenceItemId>(id.asVariant());
+			auto basedate = ctx.resolveOccurrenceIndex(dir, mid, occurrenceId.InstanceIndex);
+			msg.Items.emplace_back(ctx.loadOccurrence(dir, parentFolder.folderId, mid, basedate, shape));
+		} else if (itemId.type == tItemId::ID_OCCURRENCE) {
 			sOccurrenceId oid(itemId.Id.data(), itemId.Id.size());
 			msg.Items.emplace_back(ctx.loadOccurrence(dir, parentFolder.folderId, mid, oid.basedate, shape));
 		} else {
@@ -1995,6 +2557,8 @@ void process(mGetItemRequest&& request, XMLElement* response, const EWSContext& 
 		data.ResponseMessages.emplace_back(std::move(msg));
 	} catch(const EWSError& err) {
 		data.ResponseMessages.emplace_back(err);
+	} catch (const std::exception &) {
+		data.ResponseMessages.emplace_back(EWSError::ItemCorrupt(E3303));
 	}
 
 	data.serialize(response);
@@ -2010,7 +2574,7 @@ void process(mGetItemRequest&& request, XMLElement* response, const EWSContext& 
  * @todo consider attributes
  * @todo support contacts
  */
-void process(mResolveNamesRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mResolveNamesRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:ResolveNamesResponse");
 
@@ -2020,6 +2584,58 @@ void process(mResolveNamesRequest&& request, XMLElement* response, const EWSCont
 	unres = unres ? unres + 1 : request.UnresolvedEntry.c_str();
 	request.UnresolvedEntry = gx_utf8_to_punycode(unres);
 
+	/* Try partial matching via address book tree first */
+	const char *user = znul(ctx.auth_info().username);
+	const char *at = strchr(user, '@');
+	std::string domain = at ? at + 1 : user;
+
+	std::vector<ab_tree::minid> results;
+	uint32_t domId = ctx.getAccountId(domain, true);
+	auto base = ab_tree::AB.get(-static_cast<int32_t>(domId));
+	if (base)
+		ab_tree_resolvename(*base, request.UnresolvedEntry.c_str(), results);
+	if (!results.empty()) {
+		auto &msg = data.ResponseMessages.emplace_back();
+		auto &resolutionSet = msg.ResolutionSet.emplace();
+		for (auto mid : results) {
+			ab_tree::ab_node node(base.get(), mid);
+			auto email = node.user_info(ab_tree::userinfo::mail_address);
+			if (email == nullptr || *email == '\0')
+				continue;
+			auto &resol = resolutionSet.Resolution.emplace_back();
+			resol.Mailbox.EmailAddress = email;
+			resol.Mailbox.Name = node.displayname();
+			resol.Mailbox.RoutingType = "SMTP";
+			resol.Mailbox.MailboxType = Enum::Mailbox;
+			TPROPVAL_ARRAY userProps{};
+			if (mysql_adaptor_get_user_properties(email, userProps) &&
+			    userProps.count != 0) {
+				resol.Contact.emplace(sShape(userProps));
+				tpropval_array_free_internal(&userProps);
+			}
+		}
+		if (resolutionSet.Resolution.empty()) {
+			/*
+			 * All ab_tree results lacked SMTP addresses, fall
+			 * through to exact match.
+			 */
+			data.ResponseMessages.pop_back();
+		} else {
+			resolutionSet.TotalItemsInView = resolutionSet.Resolution.size();
+			resolutionSet.IncludesLastItemInRange = true;
+			if (resolutionSet.Resolution.size() > 1) {
+				msg.ResponseClass = "Warning";
+				msg.ResponseCode  = "ErrorNameResolutionMultipleResults";
+				msg.MessageText   = "Multiple results were found.";
+			} else {
+				msg.success();
+			}
+			data.serialize(response);
+			return;
+		}
+	}
+
+	/* Fall back to exact match */
 	TPROPVAL_ARRAY userProps{};
 	if (!mysql_adaptor_get_user_properties(request.UnresolvedEntry.c_str(), userProps))
 		throw DispatchError(E3067);
@@ -2036,7 +2652,7 @@ void process(mResolveNamesRequest&& request, XMLElement* response, const EWSCont
 	resol.Mailbox.Name = displayName ? static_cast<const char *>(displayName->pvalue) : request.UnresolvedEntry;
 	resol.Mailbox.EmailAddress = request.UnresolvedEntry;
 	resol.Mailbox.RoutingType = "SMTP";
-	resol.Mailbox.MailboxType = Enum::Mailbox; // Currently the only supported
+	resol.Mailbox.MailboxType = Enum::Mailbox;
 
 	tContact& cnt = resol.Contact.emplace(sShape(userProps));
 	tpropval_array_free_internal(&userProps);
@@ -2062,13 +2678,85 @@ void process(mResolveNamesRequest&& request, XMLElement* response, const EWSCont
 }
 
 /**
+ * @brief      Process ExpandDL
+ *
+ * @param      request   Request data
+ * @param      response  XMLElement to store response in
+ * @param      ctx       Request context
+ */
+void process(mExpandDLRequest &&request, XMLElement *response, const EWSContext &ctx)
+{
+	response->SetName("m:ExpandDLResponse");
+
+	mExpandDLResponse data;
+	mExpandDLResponseMessage &msg = data.ResponseMessages.emplace_back();
+
+	ctx.normalize(request.Mailbox);
+	if (!request.Mailbox.EmailAddress.has_value() ||
+	    request.Mailbox.EmailAddress->empty()) {
+		msg = mExpandDLResponseMessage(EWSError::NameResolutionNoResults(E3310));
+		data.serialize(response);
+		return;
+	}
+
+	const auto &address = *request.Mailbox.EmailAddress;
+	std::vector<std::string> member_list;
+	int result = 0;
+	if (!mysql_adaptor_get_mlist_memb(address.c_str(), address.c_str(),
+	    &result, member_list) || result != 0) {
+		msg = mExpandDLResponseMessage(EWSError::NameResolutionNoResults(E3311));
+		data.serialize(response);
+		return;
+	}
+
+	auto &dlexp = msg.DLExpansion.emplace();
+	auto domain = extract_domain(ctx.auth_info().username);
+	uint32_t domId = 0;
+	ab_tree::ab::const_base_ref base;
+	if (!domain.empty()) {
+		domId = ctx.getAccountId(domain, true);
+		base  = ab_tree::AB.get(-static_cast<int32_t>(domId));
+	}
+
+	for (const auto &member : member_list) {
+		auto &mbx = dlexp.Mailbox.emplace_back();
+		mbx.EmailAddress = member;
+		mbx.RoutingType  = "SMTP";
+
+		unsigned int user_id = 0, domain_id = 0;
+		enum display_type dt = DT_MAILUSER;
+		if (base && mysql_adaptor_get_user_ids(member.c_str(),
+		    &user_id, &domain_id, &dt)) {
+			ab_tree::minid mid(ab_tree::minid::address, user_id);
+			ab_tree::ab_node node(base, mid);
+			if (node.valid()) {
+				mbx.Name = node.displayname();
+				mbx.MailboxType = node.type() == ab_tree::abnode_type::mlist ?
+				                  Enum::MailboxTypeType(Enum::PublicDL) :
+				                  Enum::MailboxTypeType(Enum::Mailbox);
+				continue;
+			}
+		}
+		mbx.Name = member;
+		mbx.MailboxType = dt == DT_DISTLIST ?
+		                  Enum::MailboxTypeType(Enum::PublicDL) :
+		                  Enum::MailboxTypeType(Enum::Mailbox);
+	}
+
+	dlexp.TotalItemsInView = dlexp.Mailbox.size();
+	dlexp.IncludesLastItemInRange = true;
+	msg.success();
+	data.serialize(response);
+}
+
+/**
  * @brief      Process SendItem
  *
  * @param      request   Request data
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mSendItemRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mSendItemRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:SendItemResponse");
 
@@ -2090,7 +2778,8 @@ void process(mSendItemRequest&& request, XMLElement* response, const EWSContext&
 	}
 
 	data.Responses.reserve(request.ItemIds.size());
-	for (tItemId &itemId : request.ItemIds) try {
+	for (const auto &id: request.ItemIds) try {
+		tItemId itemId = id.itemId();
 		ctx.assertIdType(itemId.type, tItemId::ID_ITEM);
 		sMessageEntryId meid(itemId.Id.data(), itemId.Id.size());
 		sFolderSpec folder = ctx.resolveFolder(meid);
@@ -2102,7 +2791,7 @@ void process(mSendItemRequest&& request, XMLElement* response, const EWSContext&
 		if (!ctx.plugin().exmdb.read_message(dir.c_str(),
 		    ctx.effectiveUser(folder), CP_ACP, meid.messageId(),
 		    &content) || content == nullptr)
-			throw EWSError::ItemNotFound(E3143);
+			throw EWSError::ItemNotFound(E3403);
 		ctx.send(dir, rop_util_get_gc_value(meid.messageId()), *content);
 
 		if (request.SaveItemToFolder)
@@ -2123,7 +2812,7 @@ void process(mSendItemRequest&& request, XMLElement* response, const EWSContext&
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mUpdateFolderRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mUpdateFolderRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:UpdateFolderResponse");
 
@@ -2173,7 +2862,7 @@ void process(mUpdateFolderRequest&& request, XMLElement* response, const EWSCont
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mSubscribeRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mSubscribeRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:SubscribeResponse");
 
@@ -2192,7 +2881,7 @@ void process(mSubscribeRequest&& request, XMLElement* response, const EWSContext
  * @param      response  XMLElement to store response in
  * @param      ctx       Request context
  */
-void process(mUnsubscribeRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mUnsubscribeRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:UnsubscribeResponse");
 
@@ -2215,7 +2904,7 @@ void process(mUnsubscribeRequest&& request, XMLElement* response, const EWSConte
  *
  * @todo check whether instances should rathe be used
  */
-void process(mUpdateItemRequest&& request, XMLElement* response, const EWSContext& ctx)
+void process(mUpdateItemRequest &&request, XMLElement *response, const EWSContext &ctx)
 {
 	response->SetName("m:UpdateItemResponse");
 
@@ -2224,15 +2913,31 @@ void process(mUpdateItemRequest&& request, XMLElement* response, const EWSContex
 
 	sShape idOnly;
 	idOnly.add(PR_ENTRYID, sShape::FL_FIELD).add(PR_CHANGE_KEY, sShape::FL_FIELD).add(PR_MESSAGE_CLASS);
+	idOnly.add(PR_START_DATE, sShape::FL_FIELD);
+	idOnly.add(NtAppointmentRecur, PT_BINARY, sShape::FL_FIELD);
+	idOnly.add(NtRecurring, PT_BOOLEAN, sShape::FL_FIELD);
+	idOnly.add(NtExceptionReplaceTime, PT_SYSTIME, sShape::FL_FIELD);
 	for (const auto &change : request.ItemChanges) try {
-		ctx.assertIdType(change.ItemId.type, tFolderId::ID_ITEM);
-		sMessageEntryId mid(change.ItemId.Id.data(), change.ItemId.Id.size());
+		if (change.ItemId.holds_alternative<tRecurringMasterItemId>())
+			throw EWSError::InvalidId(E3450);  // currently not supported
+		tItemId itemId = change.ItemId.itemId();
+		sMessageEntryId mid(itemId.Id.data(), itemId.Id.size());
 		sFolderSpec parentFolder = ctx.resolveFolder(mid);
 		std::string dir = ctx.getDir(parentFolder);
 		ctx.validate(dir, mid);
 		if (!(ctx.permissions(dir, parentFolder.folderId) & frightsEditAny))
-			throw EWSError::AccessDenied(E3190);
+			throw EWSError::AccessDenied(E3445);
 		sShape shape(change);
+		/*
+		 * Pre-register timezone properties that setDatetimeFields may
+		 * write, so they are included in the named property
+		 * resolution.
+		 */
+		shape.add(NtAppointmentTimeZoneDefinitionStartDisplay, PT_BINARY);
+		shape.add(NtAppointmentTimeZoneDefinitionEndDisplay, PT_BINARY);
+		shape.add(NtAppointmentTimeZoneDefinitionRecur, PT_BINARY);
+		shape.add(NtTimeZoneStruct, PT_BINARY);
+		shape.add(NtPrivate, PT_BOOLEAN);
 		ctx.getNamedTags(dir, shape, true);
 		for (const auto &update : change.Updates) {
 			if (std::holds_alternative<tSetItemField>(update))
@@ -2240,10 +2945,28 @@ void process(mUpdateItemRequest&& request, XMLElement* response, const EWSContex
 		}
 		tContact::genFields(shape);
 		tCalendarItem::setDatetimeFields(shape);
+		if (shape.recurrence)
+			ctx.applyRecurrence(dir, mid.messageId(), shape.recurrence, shape);
 		const char* username = ctx.effectiveUser(parentFolder);
-		ctx.updated(dir, mid, shape);
 		mUpdateItemResponseMessage msg;
-		if (shape.mimeContent) {
+		uint32_t occ_basedate = 0;
+		if (change.ItemId.holds_alternative<tOccurrenceItemId>()) {
+			const auto& occurrence  = std::get<tOccurrenceItemId>(change.ItemId.asVariant());
+			occ_basedate = ctx.resolveOccurrenceIndex(dir,
+			               mid.messageId(), occurrence.InstanceIndex);
+			TPROPVAL_ARRAY props = shape.write();
+			const auto &tagsRm = shape.remove_vec();
+			ctx.updateOccurrence(dir, parentFolder.folderId,
+				mid.messageId(), occ_basedate, props, tagsRm);
+		} else if (itemId.type == tItemId::ID_OCCURRENCE) {
+			sOccurrenceId oid(itemId.Id.data(), itemId.Id.size());
+			occ_basedate = oid.basedate;
+			TPROPVAL_ARRAY props = shape.write();
+			const auto &tagsRm = shape.remove_vec();
+			ctx.updateOccurrence(dir, parentFolder.folderId,
+				mid.messageId(), occ_basedate, props, tagsRm);
+		} else if (shape.mimeContent) {
+			ctx.updated(dir, mid, shape);
 			EWSContext::MCONT_PTR content = ctx.toContent(dir, *shape.mimeContent);
 			for (auto tag : shape.remove())
 				content->proplist.erase(tag);
@@ -2254,27 +2977,117 @@ void process(mUpdateItemRequest&& request, XMLElement* response, const EWSContex
 			}
 			auto error = content->proplist.set(PidTagMid, EWSContext::construct<uint64_t>(rop_util_make_eid(1, mid.message_gc)));
 			if (error == ecServerOOM)
-				throw EWSError::ItemSave(E3035);
+				throw EWSError::ItemSave(E3449);
 			if (!content->proplist.has(PidTagChangeNumber))
 				throw EWSError::ItemSave(E3255);
 			uint64_t outmid = 0, outcn = 0;
 			if (!ctx.plugin().exmdb.write_message(dir.c_str(),
 			    CP_ACP, parentFolder.folderId, content.get(), {},
 			    &outmid, &outcn, &error) || error != ecSuccess)
-				throw EWSError::ItemSave(E3255);
+				throw EWSError::ItemSave(E3446);
 		} else {
+			ctx.updated(dir, mid, shape);
 			TPROPVAL_ARRAY props = shape.write();
 			const auto &tagsRm = shape.remove_vec();
 			PROBLEM_ARRAY problems;
 			if (!ctx.plugin().exmdb.remove_message_properties(dir.c_str(),
 			    CP_ACP, mid.messageId(), tagsRm))
 				throw EWSError::ItemSave(E3093);
-			if (!ctx.plugin().exmdb.set_message_properties(dir.c_str(),
+			auto readprop = props.find(PR_READ);
+			if (readprop != nullptr) {
+				uint8_t mark_as_read = *static_cast<uint8_t *>(readprop->pvalue);
+				uint64_t read_cn;
+				if (!ctx.plugin().exmdb.set_message_read_state(dir.c_str(),
+				    username, mid.messageId(), mark_as_read, &read_cn))
+					throw EWSError::ItemSave(E3417);
+				/*
+				 * props is a shallow view onto ndr_stack-alloc-backed data, so
+				 * props.erase() must not be used.
+				 */
+				readprop->proptag = PR_NULL;
+				if (mark_as_read != 0 &&
+				    !request.SuppressReadReceipts.value_or(false))
+					ctx.notifyReadReceipt(dir, mid.messageId());
+			}
+			/* Filter out e.g. neutralized PR_READ entries */
+			props.count = std::remove_if(props.ppropval, props.ppropval + props.count,
+			              [](const TAGGED_PROPVAL &v) { return PROP_TYPE(v.proptag) == PT_NULL; }) -
+			              props.ppropval;
+			if (props.count > 0 &&
+			    !ctx.plugin().exmdb.set_message_properties(dir.c_str(),
 			    username, CP_ACP, mid.messageId(), &props, &problems))
-				throw EWSError::ItemSave(E3092);
+				throw EWSError::ItemSave(E3418);
 			msg.ConflictResults.Count = problems.count;
+			if (shape.requiredAttendees || shape.optionalAttendees ||
+			    shape.resourceAttendees)
+				ctx.updateAttendees(dir, parentFolder,
+				    mid.messageId(), shape);
 		}
-		msg.Items.emplace_back(ctx.loadItem(dir, mid.folderId(), mid.messageId(), idOnly));
+		if (occ_basedate != 0)
+			msg.Items.emplace_back(ctx.loadOccurrence(dir, parentFolder.folderId, mid.messageId(), occ_basedate, idOnly));
+		else
+			msg.Items.emplace_back(ctx.loadItem(dir, mid.folderId(), mid.messageId(), idOnly));
+		if (occ_basedate == 0 &&
+		    request.SendMeetingInvitationsOrCancellations &&
+		    *request.SendMeetingInvitationsOrCancellations != Enum::SendToNone) {
+			MESSAGE_CONTENT *sendcontent = nullptr;
+			if (!ctx.plugin().exmdb.read_message(dir.c_str(),
+			    username, CP_ACP, mid.messageId(), &sendcontent) ||
+			    sendcontent == nullptr)
+				throw EWSError::ItemNotFound(E3404);
+			auto cls = sendcontent->proplist.get<const char>(PR_MESSAGE_CLASS);
+			if (cls != nullptr &&
+			    class_match_prefix(cls, "IPM.Appointment") == 0 &&
+			    sendcontent->children.prcpts != nullptr &&
+			    sendcontent->children.prcpts->count > 0) {
+				if (*request.SendMeetingInvitationsOrCancellations == Enum::SendToAllAndSaveCopy ||
+				    *request.SendMeetingInvitationsOrCancellations == Enum::SendToChangedAndSaveCopy) {
+					sFolderSpec sentitems = ctx.resolveFolder(tDistinguishedFolderId(Enum::sentitems));
+					uint64_t newMid = 0;
+					if (!ctx.plugin().exmdb.allocate_message_id(dir.c_str(),
+					    sentitems.folderId, &newMid))
+						throw EWSError::InternalServerError(E3426);
+					BOOL result = false;
+					if (!ctx.plugin().exmdb.movecopy_message(dir.c_str(), CP_ACP,
+					    mid.messageId(), sentitems.folderId, newMid, false, &result) ||
+					    !result)
+						throw EWSError::InternalServerError(E3428);
+					const char *sentuser = ctx.effectiveUser(sentitems);
+					auto now = EWSContext::construct<uint64_t>(rop_util_current_nttime());
+					const TAGGED_PROPVAL sprops[] = {
+						{PR_MESSAGE_CLASS, deconst("IPM.Schedule.Meeting.Request")},
+						{PR_CLIENT_SUBMIT_TIME, now},
+						{PR_MESSAGE_DELIVERY_TIME, now},
+					};
+					const TPROPVAL_ARRAY sproplist = {std::size(sprops), deconst(sprops)};
+					PROBLEM_ARRAY sproblems;
+					if (!ctx.plugin().exmdb.set_message_properties(dir.c_str(),
+					    sentuser, CP_ACP, newMid, &sproplist, &sproblems))
+						throw EWSError::ItemSave(E3419);
+					MESSAGE_CONTENT *sentcontent = nullptr;
+					if (!ctx.plugin().exmdb.read_message(dir.c_str(),
+					    sentuser, CP_ACP, newMid, &sentcontent) ||
+					    sentcontent == nullptr)
+						throw EWSError::ItemNotFound(E3405);
+					ctx.send(dir, mid.messageId(), *sentcontent);
+				} else {
+					/*
+					 * read_message returns pointers backed by ndr_stack
+					 * regions. Calling cancelcontent->set() invokes
+					 * propval_free() and tpropval_array_append(), which use
+					 * incompatible malloc/realloc/free. Thus, dup() first.
+					 */
+					EWSContext::MCONT_PTR dupcontent(sendcontent->dup());
+					if (!dupcontent)
+						throw EWSError::NotEnoughMemory(E3408);
+					dupcontent->proplist.set(PR_MESSAGE_CLASS, "IPM.Schedule.Meeting.Request");
+					auto now = EWSContext::construct<uint64_t>(rop_util_current_nttime());
+					dupcontent->proplist.set(PR_CLIENT_SUBMIT_TIME, now);
+					dupcontent->proplist.set(PR_MESSAGE_DELIVERY_TIME, now);
+					ctx.send(dir, mid.messageId(), *dupcontent);
+				}
+			}
+		}
 		msg.success();
 		data.ResponseMessages.emplace_back(std::move(msg));
 	} catch(const EWSError& err) {

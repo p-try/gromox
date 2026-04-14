@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <climits>
 #include <cstdint>
@@ -885,6 +885,10 @@ static pack_result ext_buffer_pull_movecopy_action(EXT_PULL *pext, MOVECOPY_ACTI
 	TRY(pext->g_uint8(&r->same_store));
 	TRY(pext->g_uint16(&eid_size));
 	CLAMP16(eid_size);
+	/*
+	 * Office-Inspectors-for-Fiddler uses if (eid_size > 0), citing EXC
+	 * server behavior not matching MS-OXORULE v23 §2.2.5.1.2.1.
+	 */
 	if (r->same_store) {
 		r->pstore_eid = NULL;
 		TRY(pext->advance(eid_size));
@@ -2263,7 +2267,7 @@ pack_result EXT_PUSH::p_rpchdr(const RPC_HEADER_EXT &r)
 }
 
 /* FALSE: overflow, TRUE: not overflow */
-BOOL EXT_PUSH::check_ovf(uint32_t extra_size)
+bool EXT_PUSH::make_room(uint32_t extra_size)
 {
 	auto alloc_size = extra_size + m_offset;
 	if (m_alloc_size >= alloc_size)
@@ -2283,7 +2287,7 @@ BOOL EXT_PUSH::check_ovf(uint32_t extra_size)
 
 pack_result EXT_PUSH::advance(uint32_t size)
 {
-	if (!check_ovf(size))
+	if (!make_room(size))
 		return pack_result::bufsize;
 	m_offset += size;
 	return pack_result::ok;
@@ -2297,16 +2301,23 @@ pack_result EXT_PUSH::p_bytes(const void *pdata, uint32_t n)
 		 * pdata==nullptr and n>0, memcpy/ASAN will usually crash/exit.
 		 */
 		return pack_result::ok;
-	if (!check_ovf(n))
+	if (!make_room(n))
 		return pack_result::bufsize;
 	memcpy(&m_udata[m_offset], pdata, n);
 	m_offset += n;
 	return pack_result::ok;
 }
 
+pack_result EXT_PUSH::p_bytes(std::string_view sv)
+{
+	if (sv.size() > UINT32_MAX)
+		return pack_result::format;
+	return p_bytes(sv.data(), sv.size());
+}
+
 pack_result EXT_PUSH::p_uint8(uint8_t v)
 {
-	if (!check_ovf(sizeof(uint8_t)))
+	if (!make_room(sizeof(uint8_t)))
 		return pack_result::bufsize;
 	m_udata[m_offset] = v;
 	m_offset += sizeof(uint8_t);
@@ -2315,7 +2326,7 @@ pack_result EXT_PUSH::p_uint8(uint8_t v)
 
 pack_result EXT_PUSH::p_uint16(uint16_t v)
 {
-	if (!check_ovf(sizeof(uint16_t)))
+	if (!make_room(sizeof(uint16_t)))
 		return pack_result::bufsize;
 	cpu_to_le16p(&m_udata[m_offset], v);
 	m_offset += sizeof(uint16_t);
@@ -2324,7 +2335,7 @@ pack_result EXT_PUSH::p_uint16(uint16_t v)
 
 pack_result EXT_PUSH::p_uint32(uint32_t v)
 {
-	if (!check_ovf(sizeof(uint32_t)))
+	if (!make_room(sizeof(uint32_t)))
 		return pack_result::bufsize;
 	cpu_to_le32p(&m_udata[m_offset], v);
 	m_offset += sizeof(uint32_t);
@@ -2333,7 +2344,7 @@ pack_result EXT_PUSH::p_uint32(uint32_t v)
 
 pack_result EXT_PUSH::p_uint64(uint64_t v)
 {
-	if (!check_ovf(sizeof(uint64_t)))
+	if (!make_room(sizeof(uint64_t)))
 		return pack_result::bufsize;
 	cpu_to_le64p(&m_udata[m_offset], v);
 	m_offset += sizeof(uint64_t);
@@ -2342,7 +2353,7 @@ pack_result EXT_PUSH::p_uint64(uint64_t v)
 
 pack_result EXT_PUSH::p_float(float v)
 {
-	if (!check_ovf(sizeof(float)))
+	if (!make_room(sizeof(float)))
 		return pack_result::bufsize;
 	float_cpu_to_le32p(&m_udata[m_offset], v);
 	m_offset += sizeof(float);
@@ -2351,7 +2362,7 @@ pack_result EXT_PUSH::p_float(float v)
 
 pack_result EXT_PUSH::p_double(double v)
 {
-	if (!check_ovf(sizeof(double)))
+	if (!make_room(sizeof(double)))
 		return pack_result::bufsize;
 	float_cpu_to_le64p(&m_udata[m_offset], v);
 	m_offset += sizeof(double);
@@ -2360,7 +2371,7 @@ pack_result EXT_PUSH::p_double(double v)
 
 pack_result EXT_PUSH::p_bool(BOOL v)
 {
-	if (!check_ovf(sizeof(uint8_t)))
+	if (!make_room(sizeof(uint8_t)))
 		return pack_result::bufsize;
 	m_udata[m_offset] = !!v;
 	m_offset += sizeof(uint8_t);
@@ -2393,7 +2404,7 @@ pack_result EXT_PUSH::p_bin(std::string_view r)
 			return pack_result::format;
 		TRY(p_uint16(r.size()));
 	}
-	return r.size() != 0 ? p_bytes(r.data(), r.size()) : pack_result::ok;
+	return r.size() != 0 ? p_bytes(r) : pack_result::ok;
 }
 
 pack_result EXT_PUSH::p_bin_s(const BINARY &r)
@@ -2403,7 +2414,7 @@ pack_result EXT_PUSH::p_bin_s(const BINARY &r)
 	TRY(p_uint16(r.cb));
 	if (r.cb == 0)
 		return pack_result::ok;
-	return p_bytes(r.pb, r.cb);
+	return p_bytes(r);
 }
 
 pack_result EXT_PUSH::p_bin_ex(const BINARY &r)
@@ -2411,7 +2422,7 @@ pack_result EXT_PUSH::p_bin_ex(const BINARY &r)
 	TRY(p_uint32(r.cb));
 	if (r.cb == 0)
 		return pack_result::ok;
-	return p_bytes(r.pb, r.cb);
+	return p_bytes(r);
 }
 
 pack_result EXT_PUSH::p_guid(const GUID &r)
@@ -2599,7 +2610,7 @@ pack_result EXT_PUSH::p_svreid(const SVREID &r)
 	if (r.pbin != nullptr) {
 		TRY(p_uint16(r.pbin->cb + 1));
 		TRY(p_uint8(0));
-		return p_bytes(r.pbin->pb, r.pbin->cb);
+		return p_bytes(*r.pbin);
 	}
 	TRY(p_uint16(21));
 	TRY(p_uint8(1));
@@ -3357,7 +3368,7 @@ pack_result EXT_PUSH::p_goid(const GLOBALOBJECTID &r)
 	TRY(p_uint64(r.creationtime));
 	TRY(p_bytes(r.x, 8));
 	if (r.unparsed)
-		return p_bytes(r.data.pb, r.data.cb);
+		return p_bytes(r.data);
 	return p_bin_ex(r.data);
 }
 

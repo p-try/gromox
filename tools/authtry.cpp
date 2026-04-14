@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2024–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2024–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdio>
 #include <cstdlib>
@@ -29,8 +29,6 @@ static constexpr struct HXoption g_options_table[] = {
 	HXOPT_TABLEEND,
 };
 static constexpr generic_module g_dfl_svc_plugins[] = {
-	{"libgxs_mysql_adaptor.so", SVC_mysql_adaptor},
-	{"libgromox_auth.so/ldap", SVC_ldap_adaptor},
 	{"libgromox_auth.so/mgr", SVC_authmgr},
 };
 static constexpr cfg_directive no_defaults[] = {
@@ -125,10 +123,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE; /* permission error */
 	service_init({std::move(cfg), g_dfl_svc_plugins, 0, "authtest"});
 	auto cl_1 = HX::make_scope_exit(service_stop);
-	if (service_run_early() != 0) {
-		fprintf(stderr, "service_run_early failed\n");
-		return EXIT_FAILURE;
-	} else if (service_run() != 0) { 
+	if (service_run() != 0) {
 		fprintf(stderr, "service_run failed\n");
 		return EXIT_FAILURE;
 	}

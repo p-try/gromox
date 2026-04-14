@@ -39,7 +39,6 @@
 #include <gromox/util.hpp>
 #include "cmd_parser.hpp"
 #include "common_util.hpp"
-#include "exmdb_client.hpp"
 #include "mail_engine.hpp"
 #include "system_services.hpp"
 
@@ -54,7 +53,6 @@ static const char *opt_config_file;
 static unsigned int opt_show_version;
 static gromox::atomic_bool g_hup_signalled;
 static std::vector<std::string> g_acl_list;
-static void (*exmdb_client_event_proc)(const char *dir, BOOL table, uint32_t notify_id, const DB_NOTIFY *);
 
 static constexpr HXoption g_options_table[] = {
 	{nullptr, 'c', HXTYPE_STRING, {}, {}, {}, 0, "Config file to read", "FILE"},
@@ -66,8 +64,6 @@ static constexpr HXoption g_options_table[] = {
 static constexpr generic_module g_dfl_svc_plugins[] = {
 	{"libgxs_event_proxy.so", SVC_event_proxy},
 	{"libgxs_mysql_adaptor.so", SVC_mysql_adaptor},
-	{"libgromox_auth.so/ldap", SVC_ldap_adaptor},
-	{"libgromox_auth.so/mgr", SVC_authmgr},
 };
 
 static constexpr cfg_directive gromox_cfg_defaults[] = {
@@ -89,7 +85,6 @@ static constexpr cfg_directive midb_cfg_defaults[] = {
 	{"midb_schema_upgrades", "auto"},
 	{"midb_table_size", "5000", CFG_SIZE, "100", "50000"},
 	{"midb_threads_num", "100", CFG_SIZE, "20", "1000"},
-	{"notify_stub_threads_num", "10", CFG_SIZE, "1", "200"},
 	{"rpc_proxy_connection_num", "10", CFG_SIZE, "1", "200"},
 	{"sqlite_debug", "0"},
 	{"x500_org_name", "Gromox default"},
@@ -134,23 +129,11 @@ static void buildenv(bool pvt)
 	cu_build_environment("");
 }
 
-static void event_proc(const char *dir, BOOL thing,
-    uint32_t notify_id, const DB_NOTIFY *notify)
-{
-	cu_set_maildir(dir);
-	exmdb_client_event_proc(dir, thing, notify_id, notify);
-}
-
 static int exmdb_client_run_front(const char *dir)
 {
 	return exmdb_client_run(dir, EXMDB_CLIENT_SKIP_PUBLIC |
 	       EXMDB_CLIENT_SKIP_REMOTE, buildenv,
-	       cu_free_environment, event_proc);
-}
-
-void exmdb_client_register_proc(void *pproc)
-{
-	exmdb_client_event_proc = reinterpret_cast<decltype(exmdb_client_event_proc)>(pproc);
+	       cu_free_environment);
 }
 
 static int system_services_run()
@@ -302,9 +285,6 @@ int main(int argc, char **argv)
 	int proxy_num = pconfig->get_ll("rpc_proxy_connection_num");
 	mlog(LV_INFO, "system: exmdb proxy connection number is %d", proxy_num);
 	
-	int stub_num = pconfig->get_ll("notify_stub_threads_num");
-	mlog(LV_INFO, "system: exmdb notify stub threads number is %d", stub_num);
-	
 	unsigned int threads_num = pconfig->get_ll("midb_threads_num");
 	mlog(LV_INFO, "system: connection threads number is %d", threads_num);
 
@@ -322,7 +302,8 @@ int main(int argc, char **argv)
 	service_init({g_config_file, g_dfl_svc_plugins, threads_num});
 	auto cl_0 = HX::make_scope_exit(service_stop);
 	
-	exmdb_client.emplace(proxy_num, stub_num);
+	exmdb_client.emplace(proxy_num);
+	exmdb_client->set_async_notif(midb_notif_handler);
 	auto cl_6 = HX::make_scope_exit([]() { exmdb_client.reset(); });
 	me_init(g_config_file->get_value("x500_org_name"), table_size);
 	auto cl_5 = HX::make_scope_exit(me_stop);
@@ -330,10 +311,6 @@ int main(int argc, char **argv)
 	cmd_parser_init(threads_num, SOCKET_TIMEOUT, cmd_debug);
 	auto cl_4 = HX::make_scope_exit(cmd_parser_stop);
 
-	if (service_run_early() != 0) {
-		mlog(LV_ERR, "system: failed to run PLUGIN_EARLY_INIT");
-		return EXIT_FAILURE;
-	}
 	listener_ctx listen_ctx;
 	if (listener_init(listen_ctx, *gxconfig, *g_config_file) != 0)
 		return EXIT_FAILURE;

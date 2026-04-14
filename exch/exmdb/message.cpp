@@ -283,7 +283,6 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 {
 	BOOL b_check, b_owner, b_result;
 	uint32_t permission, folder_type;
-	char sql_string[256];
 	
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
@@ -325,11 +324,12 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 	bool b_update = true, b_softdel = false;
 	xstmt stm_del;
 	if (!b_copy) {
+		const char *sql_string = nullptr;
 		if (exmdb_server::is_private()) {
-			strcpy(sql_string, "DELETE FROM messages WHERE message_id=?");
+			sql_string = "DELETE FROM messages WHERE message_id=?";
 			b_update = FALSE;
 		} else {
-			strcpy(sql_string, "UPDATE messages SET is_deleted=1 WHERE message_id=?");
+			sql_string = "UPDATE messages SET is_deleted=1 WHERE message_id=?";
 			b_softdel = true;
 		}
 		stm_del = pdb->prep(sql_string);
@@ -416,6 +416,7 @@ BOOL exmdb_server::movecopy_messages(const char *dir, cpid_t cpid, BOOL b_guest,
 		mlog(LV_NOTICE, "exmdb-audit: moved(mmv) message %s:f%llu:m%llu to f%llu:m%llu",
 			dir, LLU{src_val}, LLU{tmp_val}, LLU{dst_val}, LLU{tmp_val1});
 		if (!exmdb_server::is_private()) {
+			char sql_string[63];
 			snprintf(sql_string, std::size(sql_string), "DELETE FROM read_states"
 			         " WHERE message_id=%llu", LLU{tmp_val});
 			if (pdb->exec(sql_string) != SQLITE_OK)
@@ -1033,8 +1034,9 @@ BOOL exmdb_server::set_message_read_state(const char *dir,
 	if (!exmdb_server::is_private()) {
 		exmdb_server::set_public_username(username);
 		auto cl_0 = HX::make_scope_exit([]() { exmdb_server::set_public_username(nullptr); });
-		common_util_set_message_read(pdb->psqlite,
-			mid_val, mark_as_read);
+		if (cu_set_message_read(pdb->psqlite,
+		    mid_val, mark_as_read) != SQLITE_OK)
+			return false;
 		char sql_string[128];
 		snprintf(sql_string, std::size(sql_string), "REPLACE INTO "
 				"read_cns VALUES (%llu, ?, %llu)",
@@ -1046,8 +1048,9 @@ BOOL exmdb_server::set_message_read_state(const char *dir,
 		if (pstmt.step() != SQLITE_DONE)
 			return FALSE;
 	} else {
-		common_util_set_message_read(pdb->psqlite,
-			mid_val, mark_as_read);
+		if (cu_set_message_read(pdb->psqlite,
+		    mid_val, mark_as_read) != SQLITE_OK)
+			return false;
 		char sql_string[128];
 		snprintf(sql_string, std::size(sql_string), "UPDATE messages SET "
 			"read_cn=%llu WHERE message_id=%llu",
@@ -3714,7 +3717,7 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 		partial ? " (partial only)" : "");
 
 	seen.msg.emplace_back(fid_val, message_id);
-	if (dlflags & DELIVERY_DO_RULES) {
+	if (dlflags & DELIVERY_DO_RULES_SV) {
 		auto ec = message_rule_new_message({from_address, account.c_str(), cpid, b_oof,
 		          *pdb, pdb->psqlite, fid_val, message_id, std::move(digest)}, seen);
 		if (ec != ecSuccess) {
@@ -3735,7 +3738,7 @@ BOOL exmdb_server::deliver_message(const char *dir, const char *from_address,
 		 */
 		pdb->notify_message_creation(mn.folder_id,
 			mn.message_id, *dbase, notifq);
-		if (message_id == mn.message_id && dlflags & DELIVERY_DO_NOTIF)
+		if (message_id == mn.message_id && dlflags & DELIVERY_DO_NOTIF_SV)
 			pdb->notify_new_mail(mn.folder_id,
 				mn.message_id, *dbase, notifq);
 	}

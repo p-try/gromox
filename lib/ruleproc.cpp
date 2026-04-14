@@ -123,6 +123,7 @@ struct rxparam {
 	rxparam(message_node &&in);
 	NOMOVE(rxparam);
 	ec_error_t run();
+	ec_error_t run_rules();
 	ec_error_t is_oof(bool *out) const;
 	ec_error_t load_std_rules(bool oof, std::vector<rule_node> &out) const;
 	ec_error_t load_ext_rules(bool oof, std::vector<rule_node> &out) const;
@@ -131,7 +132,9 @@ struct rxparam {
 	const char *ev_from = nullptr, *ev_to = nullptr;
 	message_node cur;
 	message_content *ctnt = nullptr;
-	bool del = false, exit = false, do_autoproc = true;
+	std::string orig_dir; /* rule table origin */
+	unsigned int flags = ~0U;
+	bool del = false, exit = false;
 };
 
 }
@@ -684,11 +687,15 @@ static ec_error_t op_copy_other(rxparam &par, const rule_node &rule,
 	 * loop. However, as we only ever load one rule table, namely from the
 	 * Envelope-To INBOX folder, we know the execution is finite.
 	 */
-	uint32_t permission = 0;
-	if (!exmdb_client->get_folder_perm(newdir, dst_fid, par.ev_to, &permission))
-		return ecRpcFailed;
-	if (!(permission & (frightsOwner | frightsCreate)))
-		return ecAccessDenied;
+
+	bool owner_mode = par.orig_dir == newdir;
+	if (!owner_mode) {
+		uint32_t permission = 0;
+		if (!exmdb_client->get_folder_perm(newdir, dst_fid, par.ev_to, &permission))
+			return ecRpcFailed;
+		if (!(permission & (frightsOwner | frightsCreate)))
+			return ecAccessDenied;
+	}
 
 	/* Prepare write */
 	message_content_ptr dst(par.ctnt->dup());
@@ -1248,6 +1255,117 @@ static ec_error_t mr_do_request(rxparam &par, const PROPID_ARRAY &propids,
 }
 
 /**
+ * Process an incoming meeting response (Resp.Pos/Tent/Neg) by updating the
+ * matching recipient's track status on the organizer's calendar item.
+ */
+static ec_error_t mr_do_response(rxparam &par, const PROPID_ARRAY &propids)
+{
+	auto &rsp_prop = par.ctnt->proplist;
+	auto rsp_class = mr_get_class(rsp_prop);
+
+	/* Determine response type from message class */
+	uint32_t track_status;
+	if (class_match_prefix(rsp_class, "IPM.Schedule.Meeting.Resp.Pos") == 0)
+		track_status = respAccepted;
+	else if (class_match_prefix(rsp_class, "IPM.Schedule.Meeting.Resp.Tent") == 0)
+		track_status = respTentative;
+	else if (class_match_prefix(rsp_class, "IPM.Schedule.Meeting.Resp.Neg") == 0)
+		track_status = respDeclined;
+	else
+		return ecSuccess;
+
+	/* Get responder's SMTP address */
+	auto responder = rsp_prop.get<const char>(PR_SENDER_SMTP_ADDRESS);
+	if (responder == nullptr)
+		responder = rsp_prop.get<const char>(PR_SENT_REPRESENTING_SMTP_ADDRESS);
+	if (responder == nullptr) {
+		mlog(LV_WARN, "mr_do_response: no sender SMTP address on response");
+		return ecSuccess;
+	}
+
+	/* Look up calendar item by CleanGlobalObjectId */
+	auto cgoid_tag = PROP_TAG(PT_BINARY, propids[l_cleangoid]);
+	auto cgoid = rsp_prop.get<const BINARY>(cgoid_tag);
+	if (cgoid == nullptr || cgoid->cb == 0) {
+		mlog(LV_WARN, "mr_do_response: no CleanGlobalObjectId on response");
+		return ecSuccess;
+	}
+
+	auto cal_fid = rop_util_make_eid_ex(1, PRIVATE_FID_CALENDAR);
+	const RESTRICTION_PROPERTY rprop = {RELOP_EQ, cgoid_tag, {cgoid_tag, deconst(cgoid)}};
+	const RESTRICTION rst = {RES_PROPERTY, {deconst(&rprop)}};
+	uint32_t table_id = 0, row_count = 0;
+	if (!exmdb_client->load_content_table(par.cur.dirc(), CP_ACP,
+	    cal_fid, nullptr, TABLE_FLAG_NONOTIFICATIONS,
+	    &rst, nullptr, &table_id, &row_count))
+		return ecRpcFailed;
+	auto cl_tbl = HX::make_scope_exit([&]() {
+		exmdb_client->unload_table(par.cur.dirc(), table_id);
+	});
+	if (row_count == 0) {
+		mlog(LV_DEBUG, "mr_do_response: no matching calendar item for response from %s", responder);
+		return ecSuccess;
+	}
+	static constexpr proptag_t mid_tag = PidTagMid;
+	TARRAY_SET rows{};
+	if (!exmdb_client->query_table(par.cur.dirc(), nullptr, CP_ACP,
+	    table_id, {&mid_tag, 1}, 0, 1, &rows))
+		return ecRpcFailed;
+	if (rows.count == 0 || rows.pparray[0] == nullptr)
+		return ecSuccess;
+	auto cal_mid_p = rows.pparray[0]->get<const uint64_t>(PidTagMid);
+	if (cal_mid_p == nullptr)
+		return ecSuccess;
+	auto cal_mid = *cal_mid_p;
+
+	/* Read the calendar item and duplicate it so we own the memory */
+	MESSAGE_CONTENT *cal_raw = nullptr;
+	if (!exmdb_client->read_message(par.cur.dirc(), nullptr, CP_ACP,
+	    cal_mid, &cal_raw) || cal_raw == nullptr)
+		return ecSuccess;
+	message_content_ptr cal_ctnt(cal_raw->dup());
+	if (cal_ctnt == nullptr)
+		return ecServerOOM;
+
+	/* Find matching recipient by SMTP address and update track status */
+	bool updated = false;
+	if (cal_ctnt->children.prcpts != nullptr) {
+		auto nt_time = rop_util_current_nttime();
+		for (auto &rcpt : *cal_ctnt->children.prcpts) {
+			auto smtp = rcpt.get<const char>(PR_SMTP_ADDRESS);
+			if (smtp == nullptr) {
+				auto atype = rcpt.get<const char>(PR_ADDRTYPE);
+				if (atype != nullptr && strcasecmp(atype, "SMTP") == 0)
+					smtp = rcpt.get<const char>(PR_EMAIL_ADDRESS);
+			}
+			if (smtp == nullptr || strcasecmp(smtp, responder) != 0)
+				continue;
+			rcpt.set(PR_RECIPIENT_TRACKSTATUS, &track_status);
+			rcpt.set(PR_RECIPIENT_TRACKSTATUS_TIME, &nt_time);
+			updated = true;
+			break;
+		}
+	}
+	if (!updated) {
+		mlog(LV_DEBUG, "mr_do_response: recipient %s not found on calendar item", responder);
+		return ecSuccess;
+	}
+
+	/* Write back the modified calendar item */
+	auto &props = cal_ctnt->proplist;
+	props.erase(PidTagChangeNumber);
+	props.erase(PR_CHANGE_KEY);
+	props.erase(PR_PREDECESSOR_CHANGE_LIST);
+	props.set(PidTagMid, &cal_mid);
+	ec_error_t err = ecSuccess;
+	uint64_t out_mid = cal_mid, out_cn = 0;
+	if (!exmdb_client->write_message(par.cur.dirc(), CP_ACP,
+	    cal_fid, cal_ctnt.get(), {}, &out_mid, &out_cn, &err))
+		return ecRpcFailed;
+	return err;
+}
+
+/**
  * @par.mprop:	message properties of meeting request
  * @ev_from:	sender
  * @policy:	metadata of user ev_to
@@ -1297,18 +1415,25 @@ static ec_error_t mr_start(rxparam &par, const mr_policy &policy)
 	auto rq_class = mr_get_class(rq_prop);
 	if (class_match_prefix(rq_class, "IPM.Schedule.Meeting.Request") == 0)
 		return mr_do_request(par, propids, policy);
+	if (class_match_prefix(rq_class, "IPM.Schedule.Meeting.Resp") == 0) {
+		auto err = mr_do_response(par, propids);
+		if (err != ecSuccess)
+			return err;
+		return mr_mark_done(par);
+	}
 	return ecSuccess;
 }
 
 rxparam::rxparam(message_node &&x) : cur(std::move(x))
 {}
 
-ec_error_t rxparam::run()
+ec_error_t rxparam::run_rules()
 {
 	bool oof = false;
 	auto err = is_oof(&oof);
 	if (err != ecSuccess)
 		return err;
+	orig_dir = cur.dir; /* remember where the rule table came from */
 	std::vector<rule_node> rule_list;
 	err = load_std_rules(oof, rule_list);
 	if (err != ecSuccess)
@@ -1341,12 +1466,21 @@ ec_error_t rxparam::run()
 		if (!exmdb_client->delete_messages(cur.dirc(), CP_ACP, nullptr,
 		    cur.fid, &ids, true/*hard*/, &partial))
 			mlog(LV_DEBUG, "ruleproc: deletion unsuccessful");
-		return ecSuccess;
+	}
+	return ecSuccess;
+}
+
+ec_error_t rxparam::run()
+{
+	if (flags & DELIVERY_DO_RULES_CL) {
+		auto err = run_rules();
+		if (err != ecSuccess)
+			return err;
 	}
 
-	if (do_autoproc) {
+	if (flags & DELIVERY_DO_MRAUTOPROC) {
 		mr_policy res_policy;
-		err = mr_get_policy(ev_to, res_policy);
+		auto err = mr_get_policy(ev_to, res_policy);
 		if (err != ecSuccess)
 			return err;
 		err = mr_start(*this, res_policy);
@@ -1354,7 +1488,8 @@ ec_error_t rxparam::run()
 			return err;
 	}
 
-	notify();
+	if (flags & DELIVERY_DO_NOTIF_CL)
+		notify();
 	return ecSuccess;
 }
 
@@ -1383,7 +1518,7 @@ static ec_error_t exmdb_local_rules_execute(const char *dir, const char *ev_from
 	rxparam p({dir, folder_id, msg_id});
 	p.ev_from = ev_from;
 	p.ev_to   = ev_to;
-	p.do_autoproc = flags & DELIVERY_DO_MRAUTOPROC;
+	p.flags   = flags;
 	return std::move(p).run();
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);

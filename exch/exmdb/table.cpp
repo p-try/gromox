@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021-2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021-2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cerrno>
@@ -249,6 +249,10 @@ BOOL exmdb_server::load_hierarchy_table(const char *dir, uint64_t folder_id,
 	ptnode->folder_id = fid_val;
 	ptnode->table_flags = table_flags;
 	if (table_flags & TABLE_FLAG_SUPPRESSNOTIFICATIONS) {
+		/*
+		 * XXX: Because of how get_handle is implemented,
+		 * suppression only works for EMSMDB LPC.
+		 */
 		auto phandle_guid = exmdb_server::get_handle();
 		if (phandle_guid == nullptr)
 			memset(&ptnode->handle_guid, 0, sizeof(GUID));
@@ -3076,8 +3080,9 @@ BOOL exmdb_server::store_table_state(const char *dir, uint32_t table_id,
 			return FALSE;
 		}
 		sqlite3_busy_timeout(psqlite, g_sqlite_busy_timeout_ns / 1000000);
-		gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF");
-		gx_sql_exec(psqlite, "PRAGMA synchronous=OFF");
+		if (gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF") != SQLITE_OK ||
+		    gx_sql_exec(psqlite, "PRAGMA synchronous=OFF") != SQLITE_OK)
+			/* keep going with existing mode */;
 		const char *sql_string = (
 			"CREATE TABLE state_info "
 			"(state_id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -3108,8 +3113,9 @@ BOOL exmdb_server::store_table_state(const char *dir, uint32_t table_id,
 			return FALSE;
 		}
 		sqlite3_busy_timeout(psqlite, g_sqlite_busy_timeout_ns / 1000000);
-		gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF");
-		gx_sql_exec(psqlite, "PRAGMA synchronous=OFF");
+		if (gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF") != SQLITE_OK ||
+		    gx_sql_exec(psqlite, "PRAGMA synchronous=OFF") != SQLITE_OK)
+			/* keep going with existing mode */;
 	} else {
 		mlog(LV_ERR, "E-1943: open %s: %s", state_path.c_str(), strerror(errno));
 		return false;
@@ -3353,8 +3359,9 @@ BOOL exmdb_server::restore_table_state(const char *dir, uint32_t table_id,
 	}
 	auto cl_0 = HX::make_scope_exit([&]() { sqlite3_close_v2(psqlite); });
 	sqlite3_busy_timeout(psqlite, g_sqlite_busy_timeout_ns / 1000000);
-	gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF");
-	gx_sql_exec(psqlite, "PRAGMA synchronous=OFF");
+	if (gx_sql_exec(psqlite, "PRAGMA journal_mode=OFF") != SQLITE_OK ||
+	    gx_sql_exec(psqlite, "PRAGMA synchronous=OFF") != SQLITE_OK)
+		/* keep going with existing mode */;
 	snprintf(sql_string, std::size(sql_string), "SELECT folder_id, table_flags,"
 			" sorts, message_id, inst_num, header_id, header_stat"
 			" FROM state_info WHERE state_id=%u", state_id);

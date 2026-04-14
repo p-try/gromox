@@ -36,6 +36,7 @@
 #include <gromox/list_file.hpp>
 #include <gromox/listener_ctx.hpp>
 #include <gromox/mapi_types.hpp>
+#include <gromox/mysql_adaptor.hpp>
 #include <gromox/process.hpp>
 #include <gromox/util.hpp>
 #include "notification_agent.hpp"
@@ -47,7 +48,6 @@
 using namespace gromox;
 
 static size_t g_max_threads, g_max_routers;
-static std::vector<EXMDB_ITEM> g_local_list;
 static std::unordered_set<std::shared_ptr<ROUTER_CONNECTION>> g_router_list;
 static std::unordered_set<std::shared_ptr<EXMDB_CONNECTION>> g_connection_list;
 static std::mutex g_router_lock, g_connection_lock;
@@ -55,6 +55,7 @@ static gromox::atomic_bool g_exmdblisten_stop;
 static std::vector<std::string> g_acl_list;
 static listener_ctx exmdb_listen_ctx;
 unsigned int g_enable_dam;
+std::string g_host_id;
 
 ROUTER_CONNECTION::~ROUTER_CONNECTION()
 {
@@ -84,16 +85,29 @@ std::unique_ptr<EXMDB_CONNECTION> exmdb_parser_make_conn()
 	return nullptr;
 }
 
-static bool exmdb_parser_is_local(const char *prefix, BOOL *pb_private)
+/**
+ * Indicate whether this machine is responsible for serving a mailbox
+ *
+ * @prefix:  a mailbox directory
+ * @pvt:     returns whether the directory refers to a private or public store
+ */
+static bool exmdb_parser_is_local(const char *prefix, bool *pvt)
 {
 	if (*prefix == '\0')
 		return true;
-	auto i = std::find_if(g_local_list.cbegin(), g_local_list.cend(),
-	         [&](const EXMDB_ITEM &s) { return strncmp(s.prefix.c_str(), prefix, s.prefix.size()) == 0; });
-	if (i == g_local_list.cend())
+	std::string hostname;
+	auto err = mysql_adaptor_get_homeserver_for_dir(prefix, pvt, hostname);
+	if (err == ENOENT)
 		return false;
-	*pb_private = i->type == EXMDB_ITEM::EXMDB_PRIVATE ? TRUE : false;
-	return true;
+	if (err != 0) {
+		mlog(LV_ERR, "%s: %s: %s", __func__, prefix, strerror(err));
+		return false;
+	}
+	if (hostname == g_host_id || hostname.empty())
+		return true;
+	mlog(LV_ERR, "exmdb: is_local: %s not served here (%s) (but by %s)",
+		prefix, g_host_id.c_str(), hostname.c_str());
+	return false;
 }
 
 static BOOL exmdb_parser_dispatch3(const exreq *q0, std::unique_ptr<exresp> &r0)
@@ -184,7 +198,6 @@ static bool max_routers_reached()
 static void *request_parser_thread(void *pparam)
 {
 	void *pbuff;
-	BOOL b_private;
 	BINARY tmp_bin;
 	uint32_t offset;
 	int written_len;
@@ -194,7 +207,6 @@ static void *request_parser_thread(void *pparam)
 	uint8_t resp_buff[5]{};
 	struct pollfd pfd_read;
 	
-	b_private = FALSE; /* whatever for connect request */
 	auto connraw = static_cast<EXMDB_CONNECTION *>(pparam);
 	std::shared_ptr<EXMDB_CONNECTION> pconnection;
 	try {
@@ -218,6 +230,8 @@ static void *request_parser_thread(void *pparam)
 	buff_len = 0;
 	is_writing = FALSE;
 	is_connected = FALSE;
+	bool b_private = false; /* whatever for connect request */
+
 	while (!pconnection->b_stop) {
 		if (is_writing) {
 			written_len = write(pconnection->sockd,
@@ -289,7 +303,7 @@ static void *request_parser_thread(void *pparam)
 				auto &q = *static_cast<const exreq_connect *>(request.get());
 				if (!exmdb_parser_is_local(q.prefix, &b_private)) {
 					tmp_byte = exmdb_response::misconfig_prefix;
-				} else if (b_private != q.b_private) {
+				} else if (!!b_private != !!q.b_private) {
 					tmp_byte = exmdb_response::misconfig_mode;
 				} else {
 					pconnection->remote_id = q.remote_id;
@@ -405,18 +419,6 @@ BOOL exmdb_parser_erase_router(const std::shared_ptr<ROUTER_CONNECTION> &pconnec
 	return TRUE;
 }
 
-int exmdb_parser_run(const char *config_path)
-{
-	auto ret = list_file_read_exmdb("exmdb_list.txt", config_path, g_local_list);
-	if (ret != 0) {
-		mlog(LV_ERR, "exmdb_provider: list_file_read_exmdb: %s", strerror(ret));
-		return 1;
-	}
-	std::erase_if(g_local_list,
-		[&](const EXMDB_ITEM &s) { return !HX_ipaddr_is_local(s.host.c_str(), AI_V4MAPPED); });
-	return 0;
-}
-
 void exmdb_parser_stop()
 {
 	std::vector<pthread_t> pthr_ids;
@@ -511,10 +513,6 @@ int exmdb_listener_init(const config_file &gxcfg, const config_file &oldcfg)
 {
 	auto &ctx = exmdb_listen_ctx;
 	ctx.m_thread_name = "exmdb_accept";
-	auto ret = exmdb_acl_read(oldcfg.get_value("config_file_path"),
-	           oldcfg.get_value("exmdb_hosts_allow"));
-	if (ret != 0)
-		return ret;
 	auto line = gxcfg.get_value("exmdb_listen");
 	if (line != nullptr)
 		return ctx.add_bunch(line);
@@ -536,14 +534,17 @@ int exmdb_listener_init(const config_file &gxcfg, const config_file &oldcfg)
 	return 0;
 }
 
-int exmdb_listener_trigger_accept()
+int exmdb_listener_run(const char *config_path, const config_file &oldcfg)
 {
+	auto ret = exmdb_acl_read(config_path, oldcfg.get_value("exmdb_hosts_allow"));
+	if (ret != 0)
+		return ret;
 	if (exmdb_listen_ctx.empty())
 		return 0;
 	g_exmdblisten_stop = false;
-	auto ret = exmdb_listen_ctx.watch_start(g_exmdblisten_stop, sockaccept_thread);
-	if (ret != 0) {
-		mlog(LV_ERR, "exmdb_provider: failed to create exmdb listener thread: %s", strerror(ret));
+	auto err = exmdb_listen_ctx.watch_start(g_exmdblisten_stop, sockaccept_thread);
+	if (err != 0) {
+		mlog(LV_ERR, "exmdb_provider: failed to create exmdb listener thread: %s", strerror(err));
 		return -1;
 	}
 	return 0;

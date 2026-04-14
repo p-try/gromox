@@ -32,7 +32,7 @@ If set to \fI1\fP, an alternate rule processor codebase will be used which
 supports cross-store moves and OOF condition but (at this time) no delegation,
 or autoreply.
 .br
-Default: \fI1\fP
+Default: \fI0\fP
 .TP
 \fBresponse_audit_capacity\fP
 Keep track of at most this many {From address, To address} pairs for bounce
@@ -54,9 +54,6 @@ Default: \fI30\fP
 \fBx500_org_name\fP
 Default: (unspecified)
 .SH Files
-.IP \(bu 4
-\fIconfig_file_path\fP/exmdb_list.txt: exmdb multiserver selection map, see
-exmdb_provider(4gx) for details.
 .IP \(bu 4
 \fIdata_file_path\fP/local_bounce/: response templates for when mail cannot be
 delivered

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2022–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2022–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cstdint>
@@ -15,12 +15,14 @@
 #include <fmt/core.h>
 #include <libHX/scope.hpp>
 #include <vmime/utility/url.hpp>
+#include <gromox/bounce_gen.hpp>
 #include <gromox/config_file.hpp>
 #include <gromox/exmdb_client.hpp>
 #include <gromox/hpm_common.h>
 #include <gromox/notify_types.hpp>
 #include <gromox/paths.h>
 #include <gromox/rop_util.hpp>
+#include <gromox/svc_loader.hpp>
 #include "exceptions.hpp"
 #include "hash.hpp"
 #include "requests.hpp"
@@ -220,7 +222,7 @@ void* EWSContext::alloc(size_t count)
  * @tparam     T         Request data type
  */
 template<typename T>
-static void process(const XMLElement* request, XMLElement* response, EWSContext& context)
+static void process(const XMLElement *request, XMLElement *response, EWSContext& context)
 {
 	Requests::process(T(request), response, context);
 }
@@ -229,15 +231,20 @@ static void process(const XMLElement* request, XMLElement* response, EWSContext&
  * Mapping of request names to handler functions.
  */
 const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap = {
+	{"AddDelegate", process<Structures::mAddDelegateRequest>},
 	{"ConvertId", process<Structures::mConvertIdRequest>},
 	{"CopyFolder", process<Structures::mCopyFolderRequest>},
 	{"CopyItem", process<Structures::mCopyItemRequest>},
 	{"CreateAttachment", process<Structures::mCreateAttachmentRequest>},
 	{"CreateFolder", process<Structures::mCreateFolderRequest>},
 	{"CreateItem", process<Structures::mCreateItemRequest>},
+	{"CreateUserConfiguration", process<Structures::mCreateUserConfigurationRequest>},
+	{"DeleteAttachment", process<Structures::mDeleteAttachmentRequest>},
 	{"DeleteFolder", process<Structures::mDeleteFolderRequest>},
 	{"DeleteItem", process<Structures::mDeleteItemRequest>},
+	{"DeleteUserConfiguration", process<Structures::mDeleteUserConfigurationRequest>},
 	{"EmptyFolder", process<Structures::mEmptyFolderRequest>},
+	{"ExpandDL", process<Structures::mExpandDLRequest>},
 	{"FindFolder", process<Structures::mFindFolderRequest>},
 	{"FindItem", process<Structures::mFindItemRequest>},
 	{"FindPeople", process<Structures::mFindPeopleRequest>},
@@ -249,6 +256,7 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"GetInboxRules", process<Structures::mGetInboxRulesRequest>},
 	{"GetItem", process<Structures::mGetItemRequest>},
 	{"GetMailTips", process<Structures::mGetMailTipsRequest>},
+	{"GetPersona", process<Structures::mGetPersonaRequest>},
 	{"GetRoomLists", process<Structures::mGetRoomListsRequest>},
 	{"GetRooms", process<Structures::mGetRoomsRequest>},
 	{"GetServiceConfiguration", process<Structures::mGetServiceConfigurationRequest>},
@@ -259,7 +267,9 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"GetUserPhoto", process<Structures::mGetUserPhotoRequest>},
 	{"MoveFolder", process<Structures::mMoveFolderRequest>},
 	{"MoveItem", process<Structures::mMoveItemRequest>},
+	{"RemoveDelegate", process<Structures::mRemoveDelegateRequest>},
 	{"ResolveNames", process<Structures::mResolveNamesRequest>},
+	{"UpdateDelegate", process<Structures::mUpdateDelegateRequest>},
 	{"SendItem", process<Structures::mSendItemRequest>},
 	{"SetUserOofSettingsRequest", process<Structures::mSetUserOofSettingsRequest>},
 	{"Subscribe", process<Structures::mSubscribeRequest>},
@@ -268,6 +278,7 @@ const std::unordered_map<std::string, EWSPlugin::Handler> EWSPlugin::requestMap 
 	{"Unsubscribe", process<Structures::mUnsubscribeRequest>},
 	{"UpdateFolder", process<Structures::mUpdateFolderRequest>},
 	{"UpdateItem", process<Structures::mUpdateItemRequest>},
+	{"UpdateUserConfiguration", process<Structures::mUpdateUserConfigurationRequest>},
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -297,7 +308,7 @@ http_status EWSPlugin::fault(detail::ContextKey ctx_id, http_status code,
 }
 
 /**
- * @brief      Proccess request
+ * @brief      Process request
  *
  * Checks if an authentication context exists, dispatches the request and
  * writes the response.
@@ -359,7 +370,7 @@ http_status EWSPlugin::dispatch(detail::ContextKey ctx_id, HTTP_AUTH_INFO &auth_
 	           std::make_unique<EWSContext>(ctx_id,
 	           auth_info, static_cast<const char *>(data), len, *this);
 	EWSContext& context = *pc;
-	const XMLElement* request = context.request().body->FirstChildElement();
+	const XMLElement *request = context.request().body->FirstChildElement();
 	if (!request)
 		return fault(ctx_id, http_status::bad_request, "Missing request node");
 	if (request->NextSibling())
@@ -372,7 +383,7 @@ http_status EWSPlugin::dispatch(detail::ContextKey ctx_id, HTTP_AUTH_INFO &auth_
 		mlog(LV_DEBUG, "[ews#%d]%s Incoming data: %.*s", ctx_id, timestamp().c_str(),
 		     len > INT_MAX ? INT_MAX : static_cast<int>(len), static_cast<const char *>(data));
 
-	XMLElement* responseContainer = context.response().body->InsertNewChildElement(request->Name());
+	XMLElement *responseContainer = context.response().body->InsertNewChildElement(request->Name());
 	responseContainer->SetAttribute("xmlns:m", Structures::NS_EWS_Messages::NS_URL);
 	responseContainer->SetAttribute("xmlns:t", Structures::NS_EWS_Types::NS_URL);
 	if (enableLog && request_logging)
@@ -556,8 +567,14 @@ static std::unique_ptr<EWSPlugin> g_ews_plugin; ///< Current plugin
  */
 static BOOL ews_init(const struct dlfuncs &apidata)
 {
-	auto fail = [](auto&&... args){mlog(LV_ERR, args...); return false;};
 	LINK_HPM_API(apidata)
+	if (service_run_library({"libgxs_mysql_adaptor.so", SVC_mysql_adaptor}) != PLUGIN_LOAD_OK)
+		return false;
+	if (bounce_gen_init(get_config_path(), get_data_path(),
+	    "notify_bounce") != 0) {
+		mlog(LV_ERR, "[ews] failed to start bounce producer");
+		return false;
+	}
 	HPM_INTERFACE ifc{};
 	ifc.preproc = &EWSPlugin::preproc;
 	ifc.proc    = [](detail::ContextKey ctx, const void *cont, uint64_t len) { return g_ews_plugin->proc(ctx, cont, len); };
@@ -568,7 +585,8 @@ static BOOL ews_init(const struct dlfuncs &apidata)
 	try {
 		g_ews_plugin.reset(new EWSPlugin());
 	} catch (const std::exception &e) {
-		return fail("[ews] failed to initialize plugin: %s", e.what());
+		mlog(LV_ERR, "[ews] failed to initialize plugin: %s", e.what());
+		return false;
 	}
 	return TRUE;
 }
@@ -578,7 +596,7 @@ static BOOL ews_init(const struct dlfuncs &apidata)
  *
  * Used for (de-)initializing the plugin
  *
- * @param      reason  Reason the function is calles
+ * @param      reason  Reason the function is called
  * @param      data    Additional, reason specific data
  *
  * @return     TRUE if successful, false otherwise
@@ -643,7 +661,7 @@ int EWSContext::notify()
 	mGetStreamingEventsResponse data;
 	mGetStreamingEventsResponseMessage& msg = data.ResponseMessages.emplace_back();
 	SOAP::Envelope envelope(m_plugin.server_version(), SOAP::Envelope::WITHOUT_DECL);
-	tinyxml2::XMLElement* response = envelope.body->InsertNewChildElement("m:GetStreamingEventsResponse");
+	tinyxml2::XMLElement *response = envelope.body->InsertNewChildElement("m:GetStreamingEventsResponse");
 	response->SetAttribute("xmlns:m", Structures::NS_EWS_Messages::NS_URL);
 	response->SetAttribute("xmlns:t", Structures::NS_EWS_Types::NS_URL);
 	auto flush = [&]() {
@@ -808,51 +826,54 @@ void EWSPlugin::event(const char* dir, BOOL, uint32_t ID, const DB_NOTIFY* notif
 		       rop_util_make_eid_ex(1, fid),
 		       rop_util_make_eid_ex(1, mid)).serialize());
 	};
-	switch (notification->type) {
+	const auto &evt = *notification;
+	switch (evt.type) {
 	case db_notify_type::new_mail: {
-		auto &evt = std::any_cast<const DB_NOTIFY_NEW_MAIL &>(notification->pdata);
 		mgr->events.emplace_back(aNewMailEvent(now,
 			mkMid(evt.folder_id, evt.message_id), mkFid(evt.folder_id)));
 		break;
 	}
 	case db_notify_type::folder_created: {
-		auto &evt = std::any_cast<const DB_NOTIFY_FOLDER_CREATED &>(notification->pdata);
 		mgr->events.emplace_back(aCreatedEvent(now, mkFid(evt.folder_id),
 			mkFid(evt.parent_id)));
 		break;
 	}
 	case db_notify_type::message_created: {
-		auto &evt = std::any_cast<const DB_NOTIFY_MESSAGE_CREATED &>(notification->pdata);
 		mgr->events.emplace_back(aCreatedEvent(now,
 			mkMid(evt.folder_id, evt.message_id), mkFid(evt.folder_id)));
 		break;
 	}
 	case db_notify_type::folder_deleted: {
-		auto &evt = std::any_cast<const DB_NOTIFY_FOLDER_DELETED &>(notification->pdata);
 		mgr->events.emplace_back(aDeletedEvent(now,
 			mkFid(evt.folder_id), mkFid(evt.parent_id)));
 		break;
 	}
 	case db_notify_type::message_deleted: {
-		auto &evt = std::any_cast<const DB_NOTIFY_MESSAGE_DELETED &>(notification->pdata);
 		mgr->events.emplace_back(aDeletedEvent(now,
 			mkMid(evt.folder_id, evt.message_id), mkFid(evt.folder_id)));
 		break;
 	}
 	case db_notify_type::folder_modified: {
-		auto &evt = std::any_cast<const DB_NOTIFY_FOLDER_MODIFIED &>(notification->pdata);
+		/*
+		 * Do not call exmdb.get_folder_properties() here to fetch
+		 * PR_CONTENT_UNREAD.  This handler runs on the exmdb parser
+		 * thread inside dg_notify → event_proc, where an env_context
+		 * is already active.  The exmdb_client_local LPC wrapper
+		 * calls build_env/free_env, which destroys the arena owning
+		 * the current request's dir pointer (use-after-free).
+		 * UnreadCount is optional in EWS ModifiedEvent.
+		 * If really required, the count must be included in the event generated by exmdb.
+		 */
 		mgr->events.emplace_back(tModifiedEvent(now,
 			mkFid(evt.folder_id), mkFid(evt.parent_id)));
 		break;
 	}
 	case db_notify_type::message_modified: {
-		auto &evt = std::any_cast<const DB_NOTIFY_MESSAGE_MODIFIED &>(notification->pdata);
 		mgr->events.emplace_back(tModifiedEvent(now,
 			mkMid(evt.folder_id, evt.message_id), mkFid(evt.folder_id)));
 		break;
 	}
 	case db_notify_type::folder_moved: {
-		auto &evt = std::any_cast<const DB_NOTIFY_FOLDER_MVCP &>(notification->pdata);
 		mgr->events.emplace_back(aMovedEvent(now, mkFid(evt.folder_id),
 			mkFid(evt.parent_id),
 			static_cast<aOldFolderId &&>(mkFid(evt.old_folder_id)),
@@ -860,7 +881,6 @@ void EWSPlugin::event(const char* dir, BOOL, uint32_t ID, const DB_NOTIFY* notif
 		break;
 	}
 	case db_notify_type::message_moved: {
-		auto &evt = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP &>(notification->pdata);
 		mgr->events.emplace_back(aMovedEvent(now,
 			mkMid(evt.folder_id, evt.message_id), mkFid(evt.folder_id),
 			static_cast<aOldItemId &&>(mkMid(evt.old_folder_id, evt.old_message_id)),
@@ -868,7 +888,6 @@ void EWSPlugin::event(const char* dir, BOOL, uint32_t ID, const DB_NOTIFY* notif
 		break;
 	}
 	case db_notify_type::folder_copied: {
-		auto &evt = std::any_cast<const DB_NOTIFY_FOLDER_MVCP &>(notification->pdata);
 		mgr->events.emplace_back(aCopiedEvent(now, mkFid(evt.folder_id),
 			mkFid(evt.parent_id),
 			static_cast<aOldFolderId &&>(mkFid(evt.old_folder_id)),
@@ -876,7 +895,6 @@ void EWSPlugin::event(const char* dir, BOOL, uint32_t ID, const DB_NOTIFY* notif
 		break;
 	}
 	case db_notify_type::message_copied: {
-		auto &evt = std::any_cast<const DB_NOTIFY_MESSAGE_MVCP &>(notification->pdata);
 		mgr->events.emplace_back(aCopiedEvent(now,
 			mkMid(evt.folder_id, evt.message_id),
 			mkFid(evt.folder_id),

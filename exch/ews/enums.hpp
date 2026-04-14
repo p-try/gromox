@@ -188,6 +188,7 @@ struct Enum {
 	STR(FreeBusyTimeOnly);
 	STR(Friday);
 	STR(FullDetails);
+	STR(FullUpdate);
 	STR(Good);
 	STR(GroupMailbox);
 	STR(HTML);
@@ -200,7 +201,11 @@ struct Enum {
 	STR(HomePhone2);
 	STR(Id);
 	STR(IdOnly);
+	STR(ImAddress1);
+	STR(ImAddress2);
+	STR(ImAddress3);
 	STR(ImplicitContact);
+	STR(InformationalUpdate);
 	STR(InProgress);
 	STR(Integer);
 	STR(IntegerArray);
@@ -250,6 +255,7 @@ struct Enum {
 	STR(MovedEvent);
 	STR(Msn);
 	STR(NewMailEvent);
+	STR(NewMeetingRequest);
 	STR(NoData);
 	STR(NoResponseReceived);
 	STR(NoneditingAuthor);
@@ -274,6 +280,7 @@ struct Enum {
 	STR(Other);
 	STR(OtherFax);
 	STR(OtherTelephone);
+	STR(Outdated);
 	STR(OutOfOfficeMessage);
 	STR(OwaId);
 	STR(Owned);
@@ -285,6 +292,7 @@ struct Enum {
 	STR(Poor);
 	STR(PreferAccessibleContent);
 	STR(PrimaryPhone);
+	STR(PrincipalWantsCopy);
 	STR(Private);
 	STR(PrivateDL);
 	STR(ProtectionRules);
@@ -308,7 +316,9 @@ struct Enum {
 	STR(SendAndSaveCopy);
 	STR(SendOnly);
 	STR(SendOnlyToAll);
+	STR(SendOnlyToChanged);
 	STR(SendToAllAndSaveCopy);
+	STR(SendToChangedAndSaveCopy);
 	STR(SendToNone);
 	STR(September);
 	STR(Shallow);
@@ -316,6 +326,7 @@ struct Enum {
 	STR(Sharing); //=Caring
 	STR(Short);
 	STR(ShortArray);
+	STR(SilentUpdate);
 	STR(Single);
 	STR(SoftDelete);
 	STR(SoftDeleted);
@@ -426,6 +437,7 @@ struct Enum {
 	using BodyTypeResponseType = StrEnum<Best, HTML, Text>; ///< Types.xsd:1265
 	using BodyTypeType = StrEnum<HTML, Text>; ///< Types.xsd:1717
 	using CalendarItemCreateOrDeleteOperationType = StrEnum<SendToNone, SendOnlyToAll, SendToAllAndSaveCopy>; ///<< Types.xsd:4005
+	using CalendarItemUpdateOperationType = StrEnum<SendToNone, SendOnlyToAll, SendOnlyToChanged, SendToAllAndSaveCopy, SendToChangedAndSaveCopy>; ///< Types.xsd:4010
 	using CalendarItemTypeType = StrEnum<Single, Occurrence, Exception, RecurringMaster>; ///< Types.xsd:4363
 	using CalendarPermissionLevelType = StrEnum<None, Owner, PublishingEditor, Editor, PublishingAuthor, Author, NoneditingAuthor, Reviewer, Contributor, FreeBusyTimeOnly, FreeBusyTimeAndSubjectAndLocation, Custom>; ///< Types.xsd
 	using CalendarPermissionReadAccessType = StrEnum<None, TimeOnly, TimeAndSubjectAndLocation, FullDetails>; ///< Types.xsd:6764
@@ -435,11 +447,13 @@ struct Enum {
 	using DayOfWeekIndexType = StrEnum<First, Second, Third, Fourth, Last>; ///<Types.xsd:4500
 	using DefaultShapeNamesType = StrEnum<IdOnly, Default, AllProperties, PcxPeopleSearch>; ///< Types.xsd:1255
 	using DisposalType = StrEnum<HardDelete, SoftDelete, MoveToDeletedItems>; ///< Types.xsd:1321
+	using DelegateFolderPermissionLevelType = StrEnum<None, Editor, Reviewer, Author, Custom>; ///< Types.xsd:6901
 	using DistinguishedFolderIdNameType = StrEnum<calendar, contacts, deleteditems, drafts, inbox, journal, notes, outbox, sentitems, tasks, msgfolderroot, publicfoldersroot, root, junkemail, searchfolders, voicemail, recoverableitemsroot, recoverableitemsdeletions, recoverableitemsversions, recoverableitemspurges, recoverableitemsdiscoveryholds, archiveroot, archivemsgfolderroot, archivedeleteditems, archiveinbox, archiverecoverableitemsroot, archiverecoverableitemsdeletions, archiverecoverableitemsversions, archiverecoverableitemspurges, archiverecoverableitemsdiscoveryholds, syncissues, conflicts, localfailures, serverfailures, recipientcache, quickcontacts, conversationhistory, adminauditlogs, todosearch, mycontacts, directory, imcontactlist, peopleconnect, favorites, mecontact, personmetadata, teamspaceactivity, teamspacemessaging, teamspaceworkitems, scheduled, orionnotes, tagitems, alltaggeditems, allcategorizeditems, externalcontacts, teamchat, teamchathistory, yammerdata, yammerroot, yammerinbound, yammeroutbound, yammerfeeds, kaizaladata, messageingestion, onedriveroot, onedriverecylebin, onedrivesystem, onedrivevolume, important, starred, archive>; //Types.xsd:1768
 	using DistinguishedPropertySetType = StrEnum<Meeting, Appointment, Common, PublicStrings, Address, InternetHeaders, CalendarAssistant, UnifiedMessaging, Task, Sharing>; ///< Types.xsd:1040
 	using DistinguishedUserType = StrEnum<Default, Anonymous>; ///< Types.xsd:6732
 	using EmailAddressKeyType = StrEnum<EmailAddress1, EmailAddress2, EmailAddress3>; ///< Types.xsd:5205
 	using ExternalAudience = StrEnum<None, Known, All>; ///< Types.xsd:6530
+	using ImAddressKeyType = StrEnum<ImAddress1, ImAddress2, ImAddress3>; ///< Types.xsd:5222
 	using FileAsMappingType = StrEnum<None, LastCommaFirst, FirstSpaceLast, Company, LastCommaFirstCompany, CompanyLastFirst, LastFirst, LastFirstCompany, CompanyLastCommaFirst, LastFirstSuffix, LastSpaceFirstCompany, CompanyLastSpaceFirst, LastSpaceFirst, DisplayName, FirstName, LastFirstMiddleSuffix, LastName, Empty>; ///< Types.xsd:5283
 	using FlagStatusType = StrEnum<NotFlagged, Flagged, Complete>; ///< Types.xsd:2445
 	using FolderQueryTraversalType = StrEnum<Shallow, Deep, SoftDeleted>; ///< Types.xsd:1212
@@ -453,6 +467,7 @@ struct Enum {
 	using MailTipTypes = StrEnum<All, OutOfOfficeMessage, MailboxFullStatus, CustomMailTip, ExternalMemberCount, TotalMemberCount, MaxMessageSize, DeliveryRestriction, ModerationStatus, InvalidRecipient, Scope, RecipientSuggestions, PreferAccessibleContent>; ///< Types.xsd:6947
 	using MapiPropertyTypeType = StrEnum<ApplicationTime, ApplicationTimeArray, Binary, BinaryArray, Boolean, CLSID, CLSIDArray, Currency, CurrencyArray, Double, DoubleArray, Error, Float, FloatArray, Integer, IntegerArray, Long, LongArray, Null, Object, ObjectArray, Short, ShortArray, SystemTime, SystemTimeArray, String, StringArray>; ///< Types.xsd:1060
 	using MeetingAttendeeType = StrEnum<Organizer, Required, Optional, Room, Resource>; ///< Types.xsd:6278
+	using MeetingRequestTypeType = StrEnum<None, FullUpdate, InformationalUpdate, NewMeetingRequest, Outdated, SilentUpdate, PrincipalWantsCopy>; ///< Types.xsd:4310
 	using MessageDispositionType = StrEnum<SaveOnly, SendOnly, SendAndSaveCopy>; ///< Types.xsd:3997
 	using MonthNamesType = StrEnum<January, February, March, April, May, June, July, August, September, October, November, December>; ///< Types.xsd:4510
 	using NotificationEventType = StrEnum<CopiedEvent, CreatedEvent, DeletedEvent, ModifiedEvent, MovedEvent, NewMailEvent, FreeBusyChangedEvent>; ///< Types.xsd:6085

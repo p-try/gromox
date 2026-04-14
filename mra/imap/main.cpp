@@ -73,7 +73,6 @@ static constexpr generic_module g_dfl_svc_plugins[] = {
 	{"libgxs_event_stub.so", SVC_event_stub},
 	{"libgxs_midb_agent.so", SVC_midb_agent},
 	{"libgxs_mysql_adaptor.so", SVC_mysql_adaptor},
-	{"libgromox_auth.so/ldap", SVC_ldap_adaptor},
 	{"libgromox_auth.so/mgr", SVC_authmgr},
 	{"libgromox_authz.so/dnsbl", SVC_dnsbl_filter},
 	{"libgromox_authz.so/user", SVC_user_filter},
@@ -450,10 +449,6 @@ int main(int argc, char **argv)
 
 	filedes_limit_bump(gxconfig->get_ll("imap_fd_limit"));
 	service_init({g_config_file, g_dfl_svc_plugins, context_num});
-	if (service_run_early() != 0) {
-		printf("[system]: failed to run PLUGIN_EARLY_INIT\n");
-		return EXIT_FAILURE;
-	}
 	if (switch_user_exec(*g_config_file, argv) != 0)
 		return EXIT_FAILURE;
 	textmaps_init();
@@ -495,10 +490,10 @@ int main(int argc, char **argv)
 
 	exmdb_rpc_alloc = imrpc_alloc;
 	exmdb_rpc_free = [](void *) {};
-	exmdb_client.emplace(UINT_MAX, UINT_MAX);
+	exmdb_client.emplace(UINT_MAX);
 	auto cl_0 = HX::make_scope_exit([]() { exmdb_client.reset(); });
 	if (exmdb_client_run(g_config_file->get_value("config_file_path"),
-	    EXMDB_CLIENT_NO_FLAGS, imrpc_build_env1, imrpc_free_env, nullptr) != 0) {
+	    EXMDB_CLIENT_NO_FLAGS, imrpc_build_env1, imrpc_free_env) != 0) {
 		mlog(LV_ERR, "Failed to start exmdb_client");
 		return EXIT_FAILURE;
 	}

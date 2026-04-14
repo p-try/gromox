@@ -14,6 +14,7 @@
 #include <fmt/core.h>
 #include <libHX/defs.h>
 #include <libHX/scope.hpp>
+#include <libHX/string.h>
 #include <sys/stat.h>
 #include <gromox/database.h>
 #include <gromox/exmdb_common_util.hpp>
@@ -941,17 +942,9 @@ static BOOL instance_read_message(const MESSAGE_CONTENT *src,
 		pnormalized_subject = wtf->get<char>(PR_NORMALIZED_SUBJECT_A);
 		if (NULL != pnormalized_subject) {
 			psubject_prefix = wtf->get<char>(PR_SUBJECT_PREFIX_A);
-			if (psubject_prefix == nullptr)
-				psubject_prefix = "";
-			length = strlen(pnormalized_subject)
-					+ strlen(psubject_prefix) + 1;
+			auto pvalue = std::string(znul(psubject_prefix)) + znul(pnormalized_subject);
+			dst->proplist.ppropval[i].pvalue = common_util_dup(pvalue);
 			dst->proplist.ppropval[i].proptag = PR_SUBJECT_A;
-			dst->proplist.ppropval[i].pvalue =
-						common_util_alloc(length);
-			if (dst->proplist.ppropval[i].pvalue == nullptr)
-				return FALSE;
-			sprintf(static_cast<char *>(dst->proplist.ppropval[i].pvalue),
-				"%s%s", psubject_prefix, pnormalized_subject);
 			++dst->proplist.count;
 		} else {
 			psubject_prefix = wtf->get<char>(PR_SUBJECT_PREFIX);
@@ -972,17 +965,9 @@ static BOOL instance_read_message(const MESSAGE_CONTENT *src,
 		}
 	} else {
 		psubject_prefix = wtf->get<char>(PR_SUBJECT_PREFIX);
-		if (psubject_prefix == nullptr)
-			psubject_prefix = "";
-		length = strlen(pnormalized_subject)
-					+ strlen(psubject_prefix) + 1;
+		auto pvalue = std::string(znul(psubject_prefix)) + znul(pnormalized_subject);
+		dst->proplist.ppropval[i].pvalue = common_util_dup(pvalue);
 		dst->proplist.ppropval[i].proptag = PR_SUBJECT;
-		dst->proplist.ppropval[i].pvalue =
-					common_util_alloc(length);
-		if (dst->proplist.ppropval[i].pvalue == nullptr)
-			return FALSE;
-		sprintf(static_cast<char *>(dst->proplist.ppropval[i].pvalue),
-			"%s%s", psubject_prefix, pnormalized_subject);
 		++dst->proplist.count;
 	}
 	if (src->children.prcpts == nullptr) {
@@ -1041,7 +1026,6 @@ static BOOL instance_read_message(const MESSAGE_CONTENT *src,
 		auto pattachment = cu_alloc<ATTACHMENT_CONTENT>();
 		if (pattachment == nullptr)
 			return FALSE;
-		memset(pattachment, 0 ,sizeof(ATTACHMENT_CONTENT));
 		dst->children.pattachments->pplist[i++] = pattachment;
 		if (!instance_read_attachment(&attachment1, pattachment))
 			return FALSE;
@@ -1055,12 +1039,13 @@ BOOL exmdb_server::read_message_instance(const char *dir,
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
 		return FALSE;
+	*pmsgctnt = {};
 	/* No database access, so no transaction. */
-	memset(pmsgctnt, 0, sizeof(MESSAGE_CONTENT));
 	auto dbase = pdb->lock_base_rd();
 	auto pinstance = dbase->get_instance_c(instance_id);
 	if (pinstance == nullptr || pinstance->type != instance_type::message)
 		return FALSE;
+	*pmsgctnt = {};
 	return instance_read_message(static_cast<MESSAGE_CONTENT *>(pinstance->pcontent), pmsgctnt);
 }
 
@@ -1341,12 +1326,13 @@ BOOL exmdb_server::read_attachment_instance(const char *dir,
 	auto pdb = db_engine_get_db(dir);
 	if (!pdb)
 		return FALSE;
+	*pattctnt = {};
 	/* No database access, so no transaction. */
-	memset(pattctnt, 0, sizeof(ATTACHMENT_CONTENT));
 	auto dbase = pdb->lock_base_rd();
 	auto pinstance = dbase->get_instance_c(instance_id);
 	if (pinstance == nullptr || pinstance->type != instance_type::attachment)
 		return FALSE;
+	*pattctnt = {};
 	return instance_read_attachment(static_cast<ATTACHMENT_CONTENT *>(pinstance->pcontent), pattctnt);
 }
 
@@ -1776,7 +1762,7 @@ static uint32_t instance_get_message_flags(MESSAGE_CONTENT *pmsgctnt)
 	return message_flags;
 }
 
-static BOOL instance_get_message_subject(TPROPVAL_ARRAY *pproplist,
+static bool instance_get_message_subject(TPROPVAL_ARRAY *pproplist,
     cpid_t cpid, proptag_t proptag, void **ppvalue)
 {
 	auto pnormalized_subject = pproplist->get<const char>(PR_NORMALIZED_SUBJECT);
@@ -1795,21 +1781,13 @@ static BOOL instance_get_message_subject(TPROPVAL_ARRAY *pproplist,
 		*ppvalue = NULL;
 		return TRUE;
 	}
-	if (pnormalized_subject == nullptr)
-		pnormalized_subject = "";
-	if (psubject_prefix == nullptr)
-		psubject_prefix = "";
-	auto pvalue = cu_alloc<char>(strlen(pnormalized_subject) + strlen(psubject_prefix) + 1);
-	if (pvalue == nullptr)
-		return FALSE;
-	strcpy(pvalue, psubject_prefix);
-	strcat(pvalue, pnormalized_subject);
+	auto su = std::string(znul(psubject_prefix)) + znul(pnormalized_subject);
 	if (PROP_TYPE(proptag) != PT_UNICODE) {
-		*ppvalue = cu_utf8_to_mb_dup(cpid, pvalue);
-		return TRUE;
+		*ppvalue = cu_utf8_to_mb_dup(cpid, su);
+		return *ppvalue != nullptr;
 	}
-	*ppvalue = common_util_dup(pvalue);
-	return *ppvalue != nullptr ? TRUE : false;
+	*ppvalue = common_util_dup(su);
+	return *ppvalue != nullptr;
 }
 
 static BOOL instance_get_attachment_properties(cpid_t cpid,

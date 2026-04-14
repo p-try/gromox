@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2022-2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2022-2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cctype>
@@ -25,7 +25,9 @@
 #include <gromox/idset.hpp>
 #include <gromox/mapi_types.hpp>
 #include <gromox/mysql_adaptor.hpp>
+#include <gromox/svc_loader.hpp>
 #include <gromox/usercvt.hpp>
+#include <gromox/util.hpp>
 
 using namespace std::string_literals;
 using namespace gromox;
@@ -131,17 +133,8 @@ static constexpr char
 		"HTTP/1.1 {} {}\r\n"
 		"Content-Type: application/json\r\n"
 		"Content-Length: {}\r\n\r\n",
-	error_templ[] =
-		"<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-		"<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">"
-			"<Response>"
-				"<Error Time=\"{}\" Id=\"{}\">"
-					"<ErrorCode>{}</ErrorCode>"
-					"<Message>{}</Message>"
-					"<DebugData />"
-				"</Error>"
-			"</Response>"
-		"</Autodiscover>";
+	autodiscover_error_xmlns[] =
+		"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006";
 
 static const std::pair<const char *, const char *> protocol_list[] = {
 	{"Actions", ""}, // outlook.office365.com/actionsb2netcore
@@ -357,26 +350,55 @@ http_status OxdiscoPlugin::proc(int ctx_id, const void *content, uint64_t len) t
 	auto email = gtx(*req_node, "EMailAddress");
 	if (email == nullptr || strchr(email, '@') == nullptr)
 		return die(ctx_id, invalid_request_code, invalid_request_msg);
-
-	sql_meta_result mres{};
-	if (strncasecmp(email, public_folder_email, 19) != 0) {
-		auto err = mysql_adaptor_meta(email, WANTPRIV_METAONLY, mres);
-		if (err != 0) {
-			mlog(LV_DEBUG, "oxdisco: unknown mailbox \"%s\": %s", email, strerror(err));
-			return die(ctx_id, 404, "Not Found");
-		}
-		email = mres.username.c_str();
-	}
-
 	auto ars = gtx(*req_node, "AcceptableResponseSchema");
 	if (ars == nullptr)
 		return die(ctx_id, provider_unavailable_code, provider_unavailable_msg);
-	auto [err_code, reason] = access_ok(ctx_id, email, auth_info.username);
-	if (err_code != ok_code)
+	bool eas_schema = strcasecmp(ars, response_mobile_xmlns) == 0;
+
+	std::string auth_actor = auth_info.username;
+	std::string target_email = email;
+	bool eas_impersonation = false;
+	if (eas_schema && !parse_impersonation_address(email, target_email,
+	    auth_actor, eas_impersonation))
+		return die(ctx_id, invalid_request_code, invalid_request_msg);
+	if (eas_impersonation) {
+		unsigned int auth_uid = 0, auth_did = 0;
+		unsigned int conn_uid = 0, conn_did = 0;
+		if (!mysql_adaptor_get_user_ids(auth_actor.c_str(), &auth_uid, &auth_did, nullptr) ||
+		    !mysql_adaptor_get_user_ids(auth_info.username, &conn_uid, &conn_did, nullptr) ||
+		    auth_uid != conn_uid || auth_did != conn_did)
+			return http_status::unauthorized;
+	}
+
+	sql_meta_result mres{};
+	if (strncasecmp(target_email.c_str(), public_folder_email, 19) != 0) {
+		auto err = mysql_adaptor_meta(target_email.c_str(), WANTPRIV_METAONLY, mres);
+		if (err != 0) {
+			mlog(LV_DEBUG, "oxdisco: unknown mailbox \"%s\": %s", target_email.c_str(), strerror(err));
+			return die(ctx_id, 404, "Not Found");
+		}
+		target_email = mres.username;
+		if (eas_impersonation) {
+			uint32_t perm = rightsNone;
+			if (!exmdb.get_mbox_perm(mres.maildir.c_str(), auth_actor.c_str(), &perm))
+				return http_status::unauthorized;
+			if (!(perm & frightsGromoxStoreOwner)) {
+				mlog(LV_DEBUG, "oxdisco: autodiscover impersonation denied: actor \"%s\" lacks frightsGromoxStoreOwner on \"%s\" (perm=0x%x)",
+					auth_actor.c_str(), target_email.c_str(), perm);
+				return http_status::unauthorized;
+			}
+		}
+	}
+
+	auto [err_code, reason] = access_ok(ctx_id, target_email.c_str(), auth_actor.c_str());
+	if (err_code != ok_code) {
+		if (eas_impersonation)
+			return http_status::unauthorized;
 		return die(ctx_id, err_code, reason.c_str());
+	}
 	if (!RedirectAddr.empty() || !RedirectUrl.empty())
 		mlog(LV_DEBUG, "[oxdisco] send redirect response");
-	return resp(ctx_id, auth_info.username, email, ars);
+	return resp(ctx_id, auth_actor.c_str(), target_email.c_str(), ars);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1700: ENOMEM\n");
 	return die(ctx_id, server_error_code, server_error_msg);
@@ -517,7 +539,24 @@ http_status OxdiscoPlugin::die(int ctx_id, unsigned int error_code,
 	auto timeinfo = localtime_r(&rawtime, &timebuf);
 	strftime(error_time, std::size(error_time), "%T", timeinfo);
 
-	auto data = fmt::format(error_templ, error_time, server_id, error_code, error_msg);
+	XMLDocument doc;
+	doc.InsertEndChild(doc.NewDeclaration());
+	auto root = doc.NewElement("Autodiscover");
+	doc.InsertEndChild(root);
+	root->SetAttribute("xmlns", autodiscover_error_xmlns);
+	auto resp = root->InsertNewChildElement("Response");
+	auto err = resp->InsertNewChildElement("Error");
+	err->SetAttribute("Time", error_time);
+	err->SetAttribute("Id", server_id);
+	auto ec = err->InsertNewChildElement("ErrorCode");
+	ec->SetText(error_code);
+	auto msg = err->InsertNewChildElement("Message");
+	msg->SetText(error_msg);
+	err->InsertNewChildElement("DebugData");
+	XMLPrinter printer(nullptr, true);
+	doc.Print(&printer);
+	std::string data = printer.CStr();
+
 	mlog(LV_DEBUG, "[oxdisco] die response: %zu, %s", data.size(), data.c_str());
 	writeheader(ctx_id, 200, data.size());
 	return write_response(ctx_id, data.c_str(), data.size());
@@ -1058,7 +1097,6 @@ http_status OxdiscoPlugin::resp_autocfg(int ctx_id, const char *email) const
 	add_child(srv, "socketType", "SSL");
 	add_child(srv, "authentication", "password-cleartext");
 	add_child(srv, "username", "%EMAILADDRESS%");
-	add_child(srv, "owaURL", "https://"s + t_host_id + "/web/");
 	add_child(srv, "ewsURL", fmt::format(ews_base_url, t_host_id, exchange_asmx));
 	add_child(srv, "easURL", fmt::format(msas_base_url, t_host_id));
 
@@ -1163,6 +1201,8 @@ static std::unique_ptr<OxdiscoPlugin> g_oxdisco_plugin;
 static BOOL oxdisco_init(const struct dlfuncs &apidata)
 {
 	LINK_HPM_API(apidata)
+	if (service_run_library({"libgxs_mysql_adaptor.so", SVC_mysql_adaptor}) != PLUGIN_LOAD_OK)
+		return false;
 	HPM_INTERFACE ifc{};
 	ifc.preproc = &OxdiscoPlugin::preproc;
 	ifc.proc    = [](int ctx, const void *cont, uint64_t len) { return g_oxdisco_plugin->proc(ctx, cont, len); };

@@ -23,7 +23,7 @@ be regarded as a form of routing. ("Through myaccount@, access sharedmbox@"))
 .TP
 \fB\-c\fP \fIconfig\fP
 Read configuration directives from the given file. If this option is not
-specified, /etc/gromox/imap.cfg will be read if it exists.
+specified, /etc/gromox/gromox.cfg and /etc/gromox/imap.cfg will be read.
 .TP
 \fB\-\-version\fP
 Output version information and exit.
@@ -237,6 +237,9 @@ The lowest TLS version to offer. Possible values are: \fBtls1.0\fP,
 \fBtls1.1\fP, \fBtls1.2\fP, and, if supported by the system, \fBtls1.3\fP.
 .br
 Default: \fItls1.2\fP
+.SH Signals
+Upon receipt of SIGHUP, configuration files are re-read, but only a few select
+directives can be changed this way, as many parts do not implement reload.
 .SH Files
 .IP \(bu 4
 \fIdata_file_path\fP/folder_lang.txt: Translations for IMAP folder names.

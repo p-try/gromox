@@ -73,7 +73,6 @@ static constexpr HXoption g_options_table[] = {
 
 static constexpr generic_module g_dfl_svc_plugins[] = {
 	{"libgxs_mysql_adaptor.so", SVC_mysql_adaptor},
-	{"libgromox_auth.so/ldap", SVC_ldap_adaptor},
 	{"libgromox_auth.so/mgr", SVC_authmgr},
 	{"libgxs_timer_agent.so", SVC_timer_agent},
 };
@@ -96,7 +95,6 @@ static constexpr cfg_directive zcore_cfg_defaults[] = {
 	{"mailbox_ping_interval", "5min", CFG_TIME, "1min", "1h"},
 	{"max_ext_rule_length", "510K", CFG_SIZE, "1"},
 	{"max_rcpt_num", "256", CFG_SIZE, "1"},
-	{"notify_stub_threads_num", "10", CFG_SIZE, "1", "100"},
 	{"rpc_proxy_connection_num", "10", CFG_SIZE, "1", "100"},
 	{"submit_command", "/usr/bin/php " PKGDATADIR "/submit.php"},
 	{"user_cache_interval", "1h", CFG_TIME, "1min", "1day"},
@@ -213,6 +211,7 @@ static int listener_run(const char *sockpath)
 	g_listener_notify_stop = false;
 	auto ret = pthread_create4(&g_listener_id, nullptr, zcls_thrwork, nullptr);
 	if (ret != 0) {
+		g_listener_notify_stop = true;
 		close(g_listen_sockd);
 		mlog(LV_ERR, "listener: failed to create accept thread: %s", strerror(ret));
 		return -5;
@@ -281,7 +280,6 @@ int main(int argc, char **argv)
 
 	filedes_limit_bump(gxconfig->get_ll("zcore_fd_limit"));
 	service_init({g_config_file, g_dfl_svc_plugins, threads_num});
-	auto cl_0 = HX::make_scope_exit(service_stop);
 	
 	unsigned int table_size = pconfig->get_ll("address_table_size");
 	mlog(LV_INFO, "system: address table size is %d", table_size);
@@ -291,8 +289,8 @@ int main(int argc, char **argv)
 	mlog(LV_INFO, "system: address book tree item"
 		" cache interval is %s", temp_buff);
 
-	ab_tree::AB.init(g_config_file->get_value("x500_org_name"), cache_interval);
-	auto cl_5 = HX::make_scope_exit([]{ab_tree::AB.stop();});
+	if (ab_tree::AB.init(g_config_file->get_value("x500_org_name"), cache_interval) != 0)
+		return EXIT_FAILURE;
 
 	auto max_rcpt = pconfig->get_ll("max_rcpt_num");
 	mlog(LV_INFO, "system: maximum rcpt number is %lld", max_rcpt);
@@ -323,9 +321,6 @@ int main(int argc, char **argv)
 	int proxy_num = pconfig->get_ll("rpc_proxy_connection_num");
 	mlog(LV_INFO, "system: exmdb proxy connection number is %d", proxy_num);
 	
-	int stub_num = pconfig->get_ll("notify_stub_threads_num");
-	mlog(LV_INFO, "system: exmdb notify stub threads number is %d", stub_num);
-	
 	table_size = pconfig->get_ll("user_table_size");
 	mlog(LV_INFO, "system: hash table size is %d", table_size);
 
@@ -337,39 +332,35 @@ int main(int argc, char **argv)
 	HX_unit_seconds(temp_buff, std::size(temp_buff), ping_interval, 0);
 	mlog(LV_INFO, "system: mailbox ping interval is %s", temp_buff);
 
-	if (service_run_early() != 0) {
-		mlog(LV_ERR, "system: failed to run PLUGIN_EARLY_INIT");
-		return EXIT_FAILURE;
-	}
 	if (switch_user_exec(*g_config_file, argv) != 0)
 		return EXIT_FAILURE;
 	if (iconv_validate() != EXIT_SUCCESS)
 		return EXIT_FAILURE;
 	textmaps_init();
+	auto cl_0 = HX::make_scope_exit(service_stop);
 	if (0 != service_run()) {
 		mlog(LV_ERR, "system: failed to start services");
 		return EXIT_FAILURE;
 	}
-	auto cl_1 = HX::make_scope_exit(system_services_stop);
 	if (0 != system_services_run()) {
 		mlog(LV_ERR, "system: failed to start system services");
 		return EXIT_FAILURE;
 	}
+	auto cl_1 = HX::make_scope_exit(system_services_stop);
 
 	zserver_init(table_size, cache_interval, ping_interval);
-	auto cl_7 = HX::make_scope_exit(zserver_stop);
-	exmdb_client.emplace(proxy_num, stub_num);
+	exmdb_client.emplace(proxy_num);
+	exmdb_client->set_async_notif(zs_notification_proc);
 	auto cl_8 = HX::make_scope_exit([]() { exmdb_client.reset(); });
 	/* parser after zserver: dependency on session table */
 	/* parser after service: dependency on mysql_adaptor */
 	rpc_parser_init(threads_num);
-	auto cl_6 = HX::make_scope_exit(rpc_parser_stop);
 	listener_init();
-	auto cl_10 = HX::make_scope_exit(listener_stop);
 	if (listener_run(g_config_file->get_value("zcore_listen")) != 0) {
 		mlog(LV_ERR, "system: failed to start listener");
 		return EXIT_FAILURE;
 	}
+	auto cl_10 = HX::make_scope_exit(listener_stop);
 	if (common_util_run(g_config_file->get_value("data_file_path")) != 0) {
 		mlog(LV_ERR, "system: failed to start common util");
 		return EXIT_FAILURE;
@@ -383,14 +374,17 @@ int main(int argc, char **argv)
 		mlog(LV_ERR, "system: failed to start address book tree");
 		return EXIT_FAILURE;
 	}
+	auto cl_5 = HX::make_scope_exit([]() { ab_tree::AB.stop(); });
 	if (0 != rpc_parser_run()) {
 		mlog(LV_ERR, "system: failed to start ZRPC parser");
 		return EXIT_FAILURE;
 	}
+	auto cl_6 = HX::make_scope_exit(rpc_parser_stop);
 	if (zserver_run() != 0) {
 		mlog(LV_ERR, "system: failed to run zserver");
 		return EXIT_FAILURE;
 	}
+	auto cl_7 = HX::make_scope_exit(zserver_stop);
 	if (exmdb_client_run_front(g_config_file->get_value("config_file_path")) != 0) {
 		mlog(LV_ERR, "system: failed to start exmdb client");
 		return EXIT_FAILURE;

@@ -347,9 +347,9 @@ delivery_status exmdb_local_deliverquota(MESSAGE_CONTEXT *pcontext,
 	pmsg->proplist.erase(PidTagChangeNumber);
 	uint64_t folder_id, message_id = 0;
 	uint32_t r32 = 0;
-	unsigned int flags = DELIVERY_DO_RULES | DELIVERY_DO_NOTIF;
+	unsigned int flags = DELIVERY_DO_RULES_SV | DELIVERY_DO_NOTIF_SV;
 	if (g_lda_twostep)
-		flags = 0;
+		flags = DELIVERY_DO_RULES_CL | DELIVERY_DO_NOTIF_CL;
 	if (deliver_to_junk)
 		flags |= DELIVERY_FORCE_JUNK;
 	if (!exmdb_client_remote::deliver_message(home_dir,
@@ -562,7 +562,7 @@ BOOL HOOK_exmdb_local(enum plugin_op reason, const struct dlfuncs &ppdata)
 
 		bounce_audit_init(response_capacity, response_interval);
 		cache_queue_init(cache_path, cache_interval, retrying_times);
-		exmdb_client.emplace(conn_num, 0);
+		exmdb_client.emplace(conn_num);
 		exmdb_rpc_alloc = exmdb_local_alloc;
 		exmdb_rpc_free  = [](void *) {};
 		exmdb_local_init(org_name);
