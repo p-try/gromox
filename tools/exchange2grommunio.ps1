@@ -1,7 +1,7 @@
 <#
 # A PowerShell script for Exchange to grommunio migration.
 #
-# Copyright 2022-2025 Walter Hofstaedtler & grommunio GmbH
+# Copyright 2022-2026 Walter Hofstaedtler & grommunio GmbH
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Authors: grommunio <dev@grommunio.com>
 #          Walter Hofstaedtler <walter@hofstaedtler.com>
@@ -87,23 +87,31 @@
 # * After migration, you can reset the membership
 # * Remove-RoleGroupMember "Exchange Mailbox Import Export" -Member Administrator
 #
+#
 # To mount the Windows share on Linux:
 #
-# 1. install the cifs-utils package
+# 1. Create the Windows share $WinSharedFolder and give the $WindowsUser user at
+#    least read rights to this folder. As the Exchange service runs as the Network
+#    Service, give the Everyone group full rights to this folder!
+#
+# 2. Install the cifs-utils package
 #    SUSE: `zypper in -y cifs-utils`
 #    Debian / Ubuntu: `apt install cifs-utils`
 #    EL: `yum install cifs-utils`
 #
-# 2. Create the mount point <shared folder name> in /mnt.
+# 3. Create the mount point <shared folder name> in /mnt.
 #    mkdir /mnt/<shared folder name>
 #
-# 3. Mount the Windows share. This needs the Windows user and password.
+# 4. Mount the Windows share. This needs the Windows user and password.
 #    # mount.cifs "//<SERVER FQDN>/<shared folder name>" /mnt/<shared folder name>
 #      -v -o ro,username=<Windows user>,password=<Windows password>
 #
-#   To automount the Windows share, set $AutoMount = $true.
+#    Test the mount from the Linux command line and then unmount the Windows share
+#    using 'umount /mnt/<shared folder name>'.
 #
-# 3.1 Alternatively add a fstab entry and credentials file on the Grommunio Host.
+#    To automount the Windows share, set $AutoMount = $true.
+#
+# 4.1 Alternatively add a fstab entry and credentials file on the Grommunio Host.
 #    Remember so set $AutoMount = $false.
 #
 #    /etc/fstab - FSTAB(5)
@@ -118,7 +126,7 @@
 #    password=PASSWORD
 #    ```
 #
-# 4. Rinse and repeat!
+# 5. Rinse and repeat!
 #    You will likely run multiple tests before doing the actual migration.
 #    To remove all Data from the Mailbox but not deleting the Accounts you can
 #    run the following command. GROMOX-MBOP(8)
@@ -130,6 +138,10 @@
 #
 #    (the "XXX" where placed on purpose as a safe option)
 #
+# 6. After migration you may want to uninstall the cifs-utils package
+#    SUSE: `zypper remove -y cifs-utils`
+#    Debian / Ubuntu: `apt remove --purge cifs-utils`
+#    EL: `yum remove cifs-utils`
 #
 
 #>
@@ -151,8 +163,10 @@ $LinuxSharedFolder = "/mnt/<shared folder name>"
 # Login for the grommunio side shell
 $LinuxUser = "root"
 
-# For cleartext password authentication
-# set the $LinuxUser's password
+# For cleartext password authentication, set the $LinuxUser's password.
+# If the $LinuxUserPWD contains a ($) sign, escape it with a backtick character (`) like `$.
+# Alternatively, use single quotes instead of double quotes. "abc`$123" and 'abc$123' are both valid.
+# If the $LinuxUserPWD contains a backtick (`), escape it with a second backtick (`) like `` or use single quotes.
 # $LinuxUserPWD = "Secret_root_Password"
 # For pubkey authentication without a passphrse set
 # $LinuxUserSSHKey = "C:\grommunio\exch.ppk"
@@ -211,8 +225,10 @@ $AutoMount = $true
 # permissions on $WinSharedFolder.
 $WindowsUser = "<Windows user>"
 
-# Password for $WindowsUser. The password must not contain the characters "$"
-# or "!", both of which cause problems in the Linux shell.
+# Password for $WindowsUser.
+# If the $WindowsPassword contains a ($) sign, escape it with a backtick character (`) like `$.
+# Alternatively, use single quotes instead of double quotes. "abc`$123" and 'abc$123' are both valid.
+# If the $WindowsPassword contains a backtick (`), escape it with a second backtick (`) like `` or use single quotes.
 $WindowsPassword = "<Windows user password>"
 
 # Create the grommunio mailbox
@@ -226,6 +242,12 @@ $OnlyCreateGrommunioMailbox = $false
 # The language with which all mailboxes are created.
 # The languages can be found in: /usr/share/grommunio-admin-api/res/storelangs.json
 $MailboxLanguage = "de_DE"
+
+# An organization is needed to create mailboxes when a mailbox has aliases in different domains.
+# This is only needed if the script needs to create mailboxes. If no organization is used, leave the variable $Organization empty.
+# To create mailboxes in the first organization, use the following command: $Organization = "-o 1"
+#$Organization = "-o 1"
+$Organization = ""
 
 # Stop marker, if $WaitAfterImport = $false, create this file and migration will be interrupted after current mailbox
 $StopMarker = "exchange2grommunio.STOP"
@@ -266,12 +288,13 @@ $MigrationPriority = "Normal"
 #$CreateGrommunioMailbox = $false
 #$OnlyCreateGrommunioMailbox = $false
 #$MailboxLanguage = "de_DE"
+#$Organization = ""
 #$StopMarker = "exchange2grommunio.STOP"
 #$LogFile = "exchange2grommunio.log"
 #$MigrationPriority = "Normal"
 #>
 # Use configuration file named "exchange2grommunio.config.ps1" to override the
-# configration values above instead of changing the values in this script.
+# configuration values above instead of changing the values in this script.
 if (Test-Path $PSScriptRoot/exchange2grommunio.config.ps1) {
 	. $PSScriptRoot/exchange2grommunio.config.ps1
 }
@@ -430,6 +453,42 @@ function Linux-Umount
 	}
 }
 
+# Test if the Windows share can be accessed via Linux.
+#
+function Test-Share
+{
+	$TestFile = "Test_File_08x15_wh.tst"
+	Write-MLog "" white
+	# Create the $TestFile on the Windows share.
+	echo $TestFile > $WinSharedFolder\$TestFile
+	#
+	# Test for the existence of the file '$TestFile' on the Linux side.
+	if ($PowerShellOld) {
+		.\plink.exe @PLINKARGS "test -f $LinuxSharedFolder/$TestFile"
+		$CMDExitCode = $lastexitcode
+	} else {
+		.\plink.exe @PLINKARGS "test -f $LinuxSharedFolder/$TestFile"  2>&1 | Foreach-Object ToString | Tee-Object -Variable TeeVar
+		$CMDExitCode = $lastexitcode
+		# Save plink output to $LogFile
+		Write-MLog "---" none
+		Add-Content -Path $LogFile -Value $TeeVar
+		Write-MLog "---" none
+	}
+	# Remove the $TestFile.
+	Remove-Item -ErrorAction SilentlyContinue -Path $WinSharedFolder\$TestFile -Force
+	#
+	# Now, checkt if we have found the $TestFile in the $WinSharedFolder?
+	if ($CMDExitCode -eq 0) {
+		Write-MLog "Success: we are able to access the Windows share '$WinSharedFolder' and the Linux mount '$LinuxSharedFolder'." green
+	} else {
+		Write-MLog "Error: we can't access the Windows share '$WinSharedFolder' or the Linux mount '$LinuxSharedFolder'." red
+		Write-MLog "Fix the error and try again." red
+		Linux-Umount
+		exit 1
+	}
+	Write-MLog "" white
+}
+
 # Test if plink.exe exists in $PSScriptRoot
 #
 function Test-Plink
@@ -584,6 +643,7 @@ if ($UsePageant) {
 }
 Test-Exchange
 Linux-Mount
+Test-Share
 
 # If we get a create error, do not import the mailbox.
 #
@@ -592,7 +652,8 @@ $SkipImportCreateError = $false
 #
 # The migration loop
 #
-foreach ($Mailbox in (Get-Mailbox | Sort-Object -Property Alias)) {
+# Set parameter -ResultSize Unlimited. This will return all mailboxes rather than just the first 1000.
+foreach ($Mailbox in (Get-Mailbox -ResultSize Unlimited | Sort-Object -Property Alias)) {
 	$MigMBox = $Mailbox.PrimarySmtpAddress.ToString().ToLower()
 	$LogPath = (Join-Path -Path $WinSharedFolder -ChildPath logs)
 	New-Item -Path $LogPath -ErrorAction Ignore -Type Directory
@@ -743,10 +804,10 @@ foreach ($Mailbox in (Get-Mailbox | Sort-Object -Property Alias)) {
 	if ($CreateGrommunioMailbox) {
 		Write-MLog "Create grommunio mailbox: $MigMBox." green
 		if ($PowerShellOld) {
-			.\plink.exe @PLINKARGS "grommunio-admin ldap downsync -l $MailboxLanguage $MigMBox"
+			.\plink.exe @PLINKARGS "grommunio-admin ldap downsync -l $MailboxLanguage $MigMBox $Organization"
 			$CMDExitCode = $lastexitcode
 		} else {
-			.\plink.exe @PLINKARGS "grommunio-admin ldap downsync -l $MailboxLanguage $MigMBox" 2>&1 | Foreach-Object ToString | Tee-Object -Variable TeeVar
+			.\plink.exe @PLINKARGS "grommunio-admin ldap downsync -l $MailboxLanguage $MigMBox $Organization" 2>&1 | Foreach-Object ToString | Tee-Object -Variable TeeVar
 			$CMDExitCode = $lastexitcode
 			# Save plink output to $LogFile
 			Write-MLog "---" none
