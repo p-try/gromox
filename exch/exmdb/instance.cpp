@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cerrno>
 #include <cstdint>
@@ -1598,12 +1598,7 @@ BOOL exmdb_server::unload_instance(const char *dir, uint32_t instance_id)
 		return FALSE;
 	/* No database access, so no transaction. */
 	auto dbase = pdb->lock_base_wr();
-	for (auto it = dbase->instance_list.begin(); it != dbase->instance_list.end(); ++it) {
-		if (it->instance_id == instance_id) {
-			dbase->instance_list.erase(it);
-			break;
-		}
-	}
+	erase_first_if(dbase->instance_list, [&](const instance_node &n) { return n.instance_id == instance_id; });
 	return TRUE;
 }
 
@@ -2704,10 +2699,11 @@ BOOL exmdb_server::get_message_instance_rcpts_all_proptags(const char *dir,
 			    rcpt.ppropval[j].proptag))
 				return FALSE;
 	/* MSMAPI expects to always see these four tags, even if no rows are sent later. */
-	proptag_array_append(pproptags1.get(), PR_RECIPIENT_TYPE);
-	proptag_array_append(pproptags1.get(), PR_DISPLAY_NAME);
-	proptag_array_append(pproptags1.get(), PR_ADDRTYPE);
-	proptag_array_append(pproptags1.get(), PR_EMAIL_ADDRESS);
+	if (!proptag_array_append(pproptags1.get(), PR_RECIPIENT_TYPE) ||
+	    !proptag_array_append(pproptags1.get(), PR_DISPLAY_NAME) ||
+	    !proptag_array_append(pproptags1.get(), PR_ADDRTYPE) ||
+	    !proptag_array_append(pproptags1.get(), PR_EMAIL_ADDRESS))
+		return false;
 	pproptags->count = pproptags1->count;
 	pproptags->pproptag = cu_alloc<proptag_t>(pproptags1->count);
 	if (pproptags->pproptag == nullptr)
@@ -2771,13 +2767,13 @@ BOOL exmdb_server::get_message_instance_rcpts(const char *dir,
 			sizeof(TAGGED_PROPVAL)*pset->pparray[i]->count);
 
 		auto &srecip = *prcpts->pparray[begin_pos+i];
-		auto drecip = *pset->pparray[i];
+		auto &drecip = *pset->pparray[i];
 		if (!srecip.has(PR_RECIPIENT_TYPE))
 			drecip.emplace_back(PR_RECIPIENT_TYPE, &dummy_rcpttype);
 		if (!srecip.has(PR_DISPLAY_NAME))
 			drecip.emplace_back(PR_DISPLAY_NAME, dummy_string);
 		if (!srecip.has(PR_ADDRTYPE))
-			drecip.emplace_back(PR_ADDRTYPE, &dummy_addrtype);
+			drecip.emplace_back(PR_ADDRTYPE, dummy_addrtype);
 		if (!srecip.has(PR_EMAIL_ADDRESS))
 			drecip.emplace_back(PR_EMAIL_ADDRESS, dummy_string);
 	}
@@ -2837,7 +2833,7 @@ BOOL exmdb_server::update_message_instance_rcpts(const char *dir,
 		tpropval_array_ptr prcpt(mod.dup());
 		if (prcpt == nullptr)
 			return FALSE;
-		if (pmsgctnt->children.prcpts->append_move(std::move(prcpt)) != 0)
+		if (pmsgctnt->children.prcpts->append_move(std::move(prcpt)) != ecSuccess)
 			return FALSE;
 	}
 	return TRUE;

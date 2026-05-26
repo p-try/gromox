@@ -75,9 +75,9 @@ extern GX_EXPORT int encode64(const void *in, size_t inlen, char *out, size_t ou
 extern GX_EXPORT int encode64_ex(const void *in, size_t inlen, char *out, size_t outmax, size_t *outlen);
 #define decode64 decode64_ex
 extern GX_EXPORT int decode64_ex(const char *in, size_t inlen, void *out, size_t outmax, size_t *outlen);
-extern GX_EXPORT ssize_t qp_decode_ex(void *output, size_t out_len, const char *input, size_t length, unsigned int qp_flags = 0);
-extern GX_EXPORT ssize_t qp_encode_ex(void *output, size_t outlen, const char *input, size_t length);
-extern GX_EXPORT int decode_hex_int(const char *in);
+extern GX_EXPORT ssize_t qpnl_decode_sized(std::string_view, void *output, size_t outlen, unsigned int qp_flags = 0);
+extern GX_EXPORT ssize_t qpnl_encode_sized(std::string_view, void *output, size_t outlen);
+extern GX_EXPORT uint32_t eight_LE_hexchars_to_int(const char *in);
 extern GX_EXPORT BOOL encode_hex_binary(const void *src, int srclen, char *dst, int dstlen);
 extern GX_EXPORT BOOL decode_hex_binary(const char *src, void *dst, int dstlen);
 
@@ -110,7 +110,7 @@ extern GX_EXPORT bool parse_bool(const char *s);
 extern GX_EXPORT std::string bin2cstr(const void *, size_t);
 extern GX_EXPORT std::string bin2txt(const void *, size_t);
 extern GX_EXPORT std::string bin2hex(const void *, size_t);
-inline std::string bin2hex(const std::string_view &s) { return bin2hex(s.data(), s.size()); }
+inline std::string bin2hex(const std::string_view s) { return bin2hex(s.data(), s.size()); }
 inline std::string bin2hex(const std::string &s) { return bin2hex(s.data(), s.size()); }
 template<typename T> std::string bin2hex(const T &x) { return bin2hex(&x, sizeof(x)); }
 extern GX_EXPORT std::string hex2bin(std::string_view, hex2bin_mode = HEX2BIN_EMPTY);
@@ -127,8 +127,6 @@ extern GX_EXPORT int iconv_validate();
 extern GX_EXPORT const std::string_view *ianatz_to_tzdef(const char *);
 extern GX_EXPORT const std::string_view *wintz_to_tzdef(const char *);
 extern GX_EXPORT bool get_digest(const char *src, const char *tag, char *out, size_t outmax);
-extern GX_EXPORT bool set_digest(char *src, size_t length, const char *tag, const char *v);
-extern GX_EXPORT bool set_digest(char *src, size_t length, const char *tag, uint64_t v);
 extern GX_EXPORT bool parse_impersonation_address(const char *address, std::string &store_user, std::string &auth_user, bool &is_impersonation);
 extern GX_EXPORT void mlog_init(const char *ident, const char *file, unsigned int level, const char *user = nullptr);
 extern GX_EXPORT void mlog(unsigned int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -147,9 +145,9 @@ extern GX_EXPORT std::vector<std::string> gx_split(std::string_view, char sep);
 extern GX_EXPORT std::vector<std::string> gx_split_ws(std::string_view);
 extern GX_EXPORT std::string resource_parse_stcode_line(const char *);
 extern GX_EXPORT void startup_banner(const char *);
-extern GX_EXPORT std::string base64_encode(const std::string_view &);
-extern GX_EXPORT std::string base64_decode(const std::string_view &);
-extern GX_EXPORT std::string sss_obf_reverse(const std::string_view &);
+extern GX_EXPORT std::string base64_encode(std::string_view);
+extern GX_EXPORT std::string base64_decode(std::string_view);
+extern GX_EXPORT std::string sss_obf_reverse(std::string_view);
 
 /* _xlen - exact length (chars); _len - allocation size, i.e. \0-terminated */
 /* All the classic 8-bit charsets map to within the Unicode Basic Multilingual Plane */

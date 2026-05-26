@@ -30,15 +30,6 @@ int32_t ab::base_id(const GUID& guid)
 }
 
 /**
- * @brief      Remove base from registry, causing it to reload on next access
- */
-void ab::drop(int32_t id)
-{
-	std::unique_lock lock(m_lock);
-	m_base_hash.erase(id);
-}
-
-/**
  * @brief      Initialize address book
  *
  * Initializes address book with given parameters. Only effective on first
@@ -134,24 +125,23 @@ void ab::stop()
  */
 void ab::work()
 {
-	std::chrono::seconds wait_time;
 	std::mutex notify_lock;
 	std::unique_lock notify_guard(notify_lock);
 	while (running) {
-		std::unique_lock lock_guard(m_lock);
-		if (worker_queue.empty())
-			wait_time = m_cache_interval;
-		else {
-			auto base = get(worker_queue.front());
-			if (!base || base->age() >= m_cache_interval) {
-				drop(worker_queue.front());
-				worker_queue.pop_front();
-				continue;
+		std::vector<std::shared_ptr<ab_base>> defer_list;
+		{
+			std::unique_lock lock_guard(m_lock);
+			for (auto iter = m_base_hash.begin(); iter != m_base_hash.end(); ) {
+				if (iter->second->age() >= m_cache_interval) {
+					defer_list.emplace_back(std::move(iter->second));
+					iter = m_base_hash.erase(iter);
+				} else {
+					++iter;
+				}
 			}
-			wait_time = m_cache_interval-base->age();
 		}
-		lock_guard.unlock();
-		worker_signal.wait_for(notify_guard, wait_time);
+		if (defer_list.empty())
+			worker_signal.wait_for(notify_guard, m_cache_interval, [&]() { return !running; });
 	}
 }
 
@@ -655,14 +645,14 @@ minid ab_base::resolve(const char* dn) const
 	if (strncasecmp(dn, server_prefix.c_str(), server_prefix.size()) == 0 &&
 	    z >= server_prefix.size() + 60) {
 		/* Reason for 60: see DN format in ab_tree_get_mdbdn */
-		auto id = decode_hex_int(dn + server_prefix.size() + 60);
+		auto id = eight_LE_hexchars_to_int(&dn[server_prefix.size()+60]);
 		return minid(minid::address, id);
 	}
 	const std::string &rcpts_prefix = AB.essdn_rcpts_prefix();
 	if (strncasecmp(dn, rcpts_prefix.c_str(), rcpts_prefix.size()) != 0 ||
 	    z < rcpts_prefix.size() + 8)
 		return {};
-	auto id = decode_hex_int(dn + rcpts_prefix.size() + 8);
+	auto id = eight_LE_hexchars_to_int(&dn[rcpts_prefix.size()+8]);
 	return minid(minid::address, id);
 }
 
@@ -812,35 +802,35 @@ ab_base::iterator &ab_base::iterator::operator+=(difference_type offset)
 
 	if (it.index() == 0) {
 		auto &i = std::get<0>(it);
-		ssize_t dist = std::distance(i, m_base->m_domains.cend());
+		ssize_t dist = std::distance(i, m_root->m_domains.cend());
 		if (offset < 0 || offset < dist) {
 			i += offset;
 			mid = minid(minid::domain, i->id);
 			return *this;
 		}
 		/* Wrap forwards over to users */
-		auto i2 = m_base->m_users.cbegin() + (offset - dist);
+		auto i2 = m_root->m_users.cbegin() + (offset - dist);
 		it = i2;
-		if (i2 != m_base->m_users.cend())
+		if (i2 != m_root->m_users.cend())
 			mid = minid(minid::address, i2->id);
 		else
 			mid = 0;
 		return *this;
 	} else if (it.index() == 1) {
 		auto &i = std::get<1>(it);
-		ssize_t dist = std::distance(m_base->m_users.cbegin(), i);
+		ssize_t dist = std::distance(m_root->m_users.cbegin(), i);
 		if (offset > 0 || -offset <= dist) {
 			i += offset;
-			if (i != m_base->m_users.cend())
+			if (i != m_root->m_users.cend())
 				mid = minid(minid::address, i->id);
 			else
 				mid = 0;
 			return *this;
 		}
 		/* Wrap backwards over to domains */
-		auto i2 = m_base->m_domains.cend() + (dist + offset);
+		auto i2 = m_root->m_domains.cend() + (dist + offset);
 		it = i2;
-		if (i2 != m_base->m_domains.cend())
+		if (i2 != m_root->m_domains.cend())
 			mid = minid(minid::domain, i2->id);
 		else
 			mid = 0;
@@ -856,8 +846,8 @@ ab_base::iterator &ab_base::iterator::operator+=(difference_type offset)
  */
 size_t ab_base::iterator::pos() const
 {
-	return it.index() == 0 ? std::distance(m_base->m_domains.cbegin(), std::get<0>(it)) :
-	                         std::distance(m_base->m_users.cbegin(), std::get<1>(it)) + m_base->m_domains.size();
+	return it.index() == 0 ? std::distance(m_root->m_domains.cbegin(), std::get<0>(it)) :
+	                         std::distance(m_root->m_users.cbegin(), std::get<1>(it)) + m_root->m_domains.size();
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -865,19 +855,19 @@ size_t ab_base::iterator::pos() const
 
 ab_node::iterator ab_node::begin() const
 {
-	const ab_domain *domain = base->fetch_domain(mid);
+	const ab_domain *domain = root->fetch_domain(mid);
 	return domain ? domain->userref.cbegin() : iterator();
 }
 
 ab_node::iterator ab_node::end() const
 {
-	const ab_domain *domain = base->fetch_domain(mid);
+	const ab_domain *domain = root->fetch_domain(mid);
 	return domain ? domain->userref.cend() : iterator();
 }
 
 minid ab_node::operator[](uint32_t idx) const
 {
-	const ab_domain *domain = base->fetch_domain(mid);
+	const ab_domain *domain = root->fetch_domain(mid);
 	return domain && idx < domain->userref.size() ? domain->userref[idx] : minid();
 }
 

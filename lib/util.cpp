@@ -886,8 +886,10 @@ void replace_unsafe_basename(char *s)
 /*
  * The resulting QP data is not suitable as encoded-words, only bodytext.
  */
-ssize_t qp_encode_ex(void *voutput, size_t outlen, const char *input, size_t length)
+ssize_t qpnl_encode_sized(std::string_view sv_in, void *voutput, size_t outlen)
 {
+	auto input = sv_in.data();
+	auto length = sv_in.size();
 	auto output = static_cast<uint8_t *>(voutput);
 	size_t inpos, outpos, linelen;
 
@@ -1082,9 +1084,11 @@ static size_t qp_decode(void *voutput, const char *input, size_t length,
 	return cnt;
 }
 
-ssize_t qp_decode_ex(void *voutput, size_t out_len, const char *input,
-    size_t length, unsigned int qp_flags)
+ssize_t qpnl_decode_sized(std::string_view sv_in, void *voutput, size_t out_len,
+    unsigned int qp_flags)
 {
+	auto input = sv_in.data();
+	auto length = sv_in.size();
 	auto output = static_cast<uint8_t *>(voutput);
 	int c;
 	size_t i, cnt = 0;
@@ -1128,23 +1132,6 @@ ssize_t qp_decode_ex(void *voutput, size_t out_len, const char *input,
 	return qp_decode(output, input, length, qp_flags);
 }
 
-int decode_hex_int(const char *in)
-{
-	int retval;
-	char t_buff[3];
-	
-	if (strlen(in) < 2 * sizeof(int))
-		return 0;
-	retval = 0;
-	for (size_t i = 0; i < sizeof(int); ++i) {
-		t_buff[0] = in[2*i];
-		t_buff[1] = in[2*i+1];
-		t_buff[2] = '\0';
-		retval |= strtol(t_buff, NULL, 16) << i*8;
-	}
-	return retval;
-}
-
 BOOL encode_hex_binary(const void *vsrc, int srclen, char *dst, int dstlen)
 {
 	auto src = static_cast<const uint8_t *>(vsrc);
@@ -1171,6 +1158,8 @@ BOOL decode_hex_binary(const char *src, void *vdst, int dstlen)
 	int i, j, len;
 
 	len = strlen(src);
+	if (len % 2 != 0)
+		return false;
 	if (len / 2 > dstlen)
 		return FALSE;
 	for (i=0,j=0; i<len; i+=2,j++) {

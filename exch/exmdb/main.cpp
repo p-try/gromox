@@ -53,12 +53,14 @@ static constexpr cfg_directive exmdb_gromox_cfg_defaults[] = {
 	{"exmdb_force_write_txn", "0", CFG_BOOL},
 	{"exmdb_ics_log_file", ""},
 	{"exmdb_optimize_stm", "1", CFG_BOOL},
+	{"exmdb_parallelize_schemaup", "4"},
+	{"exmdb_parallelize_sqliteshut", "4"},
 	{"outgoing_smtp_url", "sendmail://localhost"},
 	CFG_TABLE_END,
 };
 
 static constexpr cfg_directive exmdb_cfg_defaults[] = {
-	{"cache_interval", "15min", CFG_TIME, "1s"},
+	{"cache_interval", "1min", CFG_TIME, "1s"},
 	{"dbg_synthesize_content", "0"},
 	{"enable_dam", "1", CFG_BOOL},
 	{"exmdb_body_autosynthesis", "1", CFG_BOOL},
@@ -141,7 +143,7 @@ static bool exmdb_provider_reload(std::shared_ptr<config_file> gxcfg = nullptr,
 	return true;
 }
 
-BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
+bool SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 {
 	switch(reason) {
 	case PLUGIN_RELOAD:
@@ -168,9 +170,18 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 		}
 		if (!exmdb_provider_reload(gxcfg, pconfig))
 			return false;
-		bool allow_lpc = strcasecmp(get_prog_id(), "istore") == 0;
-		if (!allow_lpc)
-			return TRUE;
+		/*
+		 * Looking at the config does not tell us [libgxs_exmdb_provider.so]
+		 * what process we are in; hence the use of get_prog_id() instead.
+		 * But we do need istore_standalone for other purposes.
+		 */
+		g_istore_standalone = gxcfg->get_ll("istore_standalone");
+		auto prog_id = service_get_prog_id();
+		if (strncmp(prog_id, "istore-worker:", 14) == 0)
+			return TRUE; /* worker role; no listening socket */
+		if (strcmp(prog_id, "istore-director") != 0)
+			return TRUE; /* client role; no listening socket */
+		/* Director role */
 		if (exmdb_listener_init(*gxcfg, *pconfig) != 0)
 			return FALSE;
 		return TRUE;
@@ -196,7 +207,9 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 		int max_msg_count = pconfig->get_ll("max_store_message_count");
 		int max_rule = pconfig->get_ll("max_rule_number");
 		int max_ext_rule = pconfig->get_ll("max_ext_rule_number");
-		int populating_num = pconfig->get_ll("populating_threads_num");
+		int sfpop_max = pconfig->get_ll("populating_threads_num");
+		int par_upg = gxcfg->get_ll("exmdb_parallelize_schemaup");
+		int par_shut = gxcfg->get_ll("exmdb_parallelize_sqliteshut");
 		auto str = pconfig->get_value("exmdb_file_compression");
 		if (str == nullptr || !parse_bool(str))
 			g_cid_compression = 0;
@@ -230,19 +243,22 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 		        "popul_num=%d, smtp=%s, getprop_optimize_stm=%u",
 		        org_name, connection_num, table_size,
 		        cache_int_s, max_msg_count, max_rule, max_ext_rule,
-		        populating_num, smtp_url.c_str(), g_exmdb_enable_optim_stm);
+		        sfpop_max, smtp_url.c_str(), g_exmdb_enable_optim_stm);
 
 		common_util_init(org_name, max_msg_count, max_rule, max_ext_rule, std::move(smtp_url));
-		db_engine_init(table_size, cache_interval, populating_num);
-		bool allow_lpc = strcasecmp(get_prog_id(), "istore") == 0;
-		if (!allow_lpc)
-			exmdb_parser_init(0, 0);
-		else
+		db_engine_init(table_size, cache_interval, sfpop_max, par_upg, par_shut);
+		auto prog_id = service_get_prog_id();
+		bool run_parser = strncmp(prog_id, "istore-", 7) == 0;
+		if (run_parser)
+			/* Director or worker */
 			exmdb_parser_init(max_threads, max_routers);
+		else
+			/* This process seems to be a client */
+			exmdb_parser_init(0, 0);
 
 		exmdb_client.emplace(connection_num);
 		exmdb_client->set_async_notif(exmdb_server::event_proc);
-		exmdb_client->m_allow_lpc = allow_lpc;
+		exmdb_client->m_allow_lpc = run_parser && g_istore_standalone == 0;
 		if (bounce_gen_init(get_config_path(), get_data_path(),
 		    "mail_bounce") != 0) {
 			mlog(LV_ERR, "exmdb_provider: failed to start bounce producer");
@@ -259,7 +275,7 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 		 * process image, which means we are authoritative and should
 		 * launch the socket.
 		 */
-		if (exmdb_client->m_allow_lpc &&
+		if (run_parser &&
 		    exmdb_listener_run(get_config_path(), *pconfig) != 0) {
 			mlog(LV_ERR, "exmdb_provider: failed to start exmdb listener");
 			exmdb_listener_stop();
@@ -282,6 +298,9 @@ BOOL SVC_exmdb_provider(enum plugin_op reason, const struct dlfuncs &ppdata)
 #undef IDLOUT
 		register_service("exmdb_client_register_proc", exmdb_server::register_proc);
 		register_service("pass_service", common_util_pass_service);
+		register_service("exmdb_pickup_run", exmdb_pickup_run);
+		register_service("exmdb_pickup_running", exmdb_pickup_running);
+		register_service("exmdb_pickup_stop", exmdb_pickup_stop);
 		return TRUE;
 	}
 	case PLUGIN_FREE:

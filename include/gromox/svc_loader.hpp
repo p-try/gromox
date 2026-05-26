@@ -12,7 +12,7 @@ struct GX_EXPORT service_init_param {
 	std::shared_ptr<config_file> cfg;
 	std::span<const gromox::generic_module> plugin_list;
 	unsigned int context_num = 0;
-	const char *prog_id = nullptr;
+	const char *prog_id = nullptr, *prog_arg0 = nullptr;
 };
 
 extern GX_EXPORT void service_init(service_init_param &&);
@@ -20,7 +20,8 @@ extern GX_EXPORT int service_run_early();
 extern GX_EXPORT int service_run();
 extern GX_EXPORT int service_run_library(const gromox::generic_module &);
 extern GX_EXPORT void service_stop();
-extern GX_EXPORT void *service_query(const char *service_name, const char *module, const std::type_info &);
-extern GX_EXPORT void service_release(const char *service_name, const char *module);
-extern GX_EXPORT BOOL service_register_service(const char *func_name, void *addr, const std::type_info &);
+extern GX_EXPORT void *service_query(const char *func_name, const std::type_info &);
+extern GX_EXPORT bool service_register_service(const char *func_name, void *addr, const std::type_info &);
 extern GX_EXPORT void service_trigger_all(enum plugin_op);
+extern GX_EXPORT const char *service_get_prog_id();
+extern GX_EXPORT const char *service_get_prog_arg0();

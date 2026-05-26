@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2020–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2020–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <climits>
 #include <cstdint>
@@ -33,10 +33,10 @@ ec_error_t rop_getpropertyidsfromnames(uint8_t flags,
 	BOOL b_create;
 	ems_objtype object_type;
 	
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	if (rop_processor_get_object(plogmap, logon_id, hin, &object_type) == nullptr)
+	if (plogmap->get_object(logon_id, hin, &object_type) == nullptr)
 		return ecNullObject;
 	switch (object_type) {
 	using enum ems_objtype;
@@ -70,10 +70,10 @@ ec_error_t rop_getnamesfrompropertyids(const PROPID_ARRAY &ppropids,
     PROPNAME_ARRAY *ppropnames, LOGMAP *plogmap, uint8_t logon_id, uint32_t hin)
 {
 	ems_objtype object_type;
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	if (rop_processor_get_object(plogmap, logon_id, hin, &object_type) == nullptr)
+	if (plogmap->get_object(logon_id, hin, &object_type) == nullptr)
 		return ecNullObject;
 	switch (object_type) {
 	case ems_objtype::logon:
@@ -140,7 +140,7 @@ ec_error_t rop_getpropertiesspecific(uint16_t size_limit, uint16_t want_unicode,
 	
 	/* we ignore the size_limit as
 		mentioned in MS-OXCPRPT 3.2.5.1 */
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	BOOL b_unicode = want_unicode == 0 ? false : TRUE;
@@ -168,8 +168,9 @@ ec_error_t rop_getpropertiesspecific(uint16_t size_limit, uint16_t want_unicode,
 	}
 	case ems_objtype::message: {
 		auto msg = static_cast<message_object *>(pobject);
-		if (!msg->get_properties(0, *ptmp_proptags, &propvals))
-			return ecError;
+		auto err = msg->get_properties(0, *ptmp_proptags, &propvals);
+		if (err != ecSuccess)
+			return err;
 		cpid = msg->get_cpid();
 		break;
 	}
@@ -227,7 +228,7 @@ ec_error_t rop_getpropertiesall(uint16_t size_limit, uint16_t want_unicode,
 	ems_objtype object_type;
 	PROPTAG_ARRAY proptags;
 	
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	switch (object_type) {
@@ -281,13 +282,15 @@ ec_error_t rop_getpropertiesall(uint16_t size_limit, uint16_t want_unicode,
 	}
 	case ems_objtype::message: {
 		auto msg = static_cast<message_object *>(pobject);
-		if (!msg->get_all_proptags(&proptags))
-			return ecError;
+		auto err = msg->get_all_proptags(&proptags);
+		if (err != ecSuccess)
+			return err;
 		auto ptmp_proptags = cu_trim_proptags(proptags);
 		if (ptmp_proptags == nullptr)
 			return ecServerOOM;
-		if (!msg->get_properties(size_limit, *ptmp_proptags, ppropvals))
-			return ecError;
+		err = msg->get_properties(size_limit, *ptmp_proptags, ppropvals);
+		if (err != ecSuccess)
+			return err;
 		cpid = msg->get_cpid();
 		break;
 	}
@@ -320,7 +323,7 @@ ec_error_t rop_getpropertieslist(PROPTAG_ARRAY *pproptags, LOGMAP *plogmap,
     uint8_t logon_id, uint32_t hin)
 {
 	ems_objtype object_type;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	switch (object_type) {
@@ -333,9 +336,7 @@ ec_error_t rop_getpropertieslist(PROPTAG_ARRAY *pproptags, LOGMAP *plogmap,
 			return ecError;
 		return ecSuccess;
 	case ems_objtype::message:
-		if (!static_cast<message_object *>(pobject)->get_all_proptags(pproptags))
-			return ecError;
-		return ecSuccess;
+		return static_cast<message_object *>(pobject)->get_all_proptags(pproptags);
 	case ems_objtype::attach:
 		if (!static_cast<attachment_object *>(pobject)->get_all_proptags(pproptags))
 			return ecError;
@@ -351,10 +352,10 @@ ec_error_t rop_setproperties(const TPROPVAL_ARRAY *ppropvals,
 	ems_objtype object_type;
 	uint32_t permission;
 	
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	switch (object_type) {
@@ -383,9 +384,7 @@ ec_error_t rop_setproperties(const TPROPVAL_ARRAY *ppropvals,
 		auto tag_access = msg->get_tag_access();
 		if (!(tag_access & MAPI_ACCESS_MODIFY))
 			return ecAccessDenied;
-		if (!msg->set_properties(ppropvals, pproblems))
-			return ecError;
-		return ecSuccess;
+		return msg->set_properties(ppropvals, pproblems);
 	}
 	case ems_objtype::attach: {
 		auto atx = static_cast<attachment_object *>(pobject);
@@ -414,10 +413,10 @@ ec_error_t rop_deleteproperties(proptag_cspan pproptags,
 	ems_objtype object_type;
 	uint32_t permission;
 	
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	switch (object_type) {
@@ -446,9 +445,7 @@ ec_error_t rop_deleteproperties(proptag_cspan pproptags,
 		auto tag_access = msg->get_tag_access();
 		if (!(tag_access & MAPI_ACCESS_MODIFY))
 			return ecAccessDenied;
-		if (!msg->remove_properties(pproptags, pproblems))
-			return ecError;
-		return ecSuccess;
+		return msg->remove_properties(pproptags, pproblems);
 	}
 	case ems_objtype::attach: {
 		auto atx = static_cast<attachment_object *>(pobject);
@@ -480,10 +477,10 @@ ec_error_t rop_querynamedproperties(uint8_t query_flags, const GUID *pguid,
 	PROPTAG_ARRAY proptags;
 	PROPNAME_ARRAY propnames;
 	
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	if ((query_flags & QUERY_FLAG_NOIDS) &&
@@ -502,10 +499,12 @@ ec_error_t rop_querynamedproperties(uint8_t query_flags, const GUID *pguid,
 		if (!static_cast<folder_object *>(pobject)->get_all_proptags(&proptags))
 			return ecError;
 		break;
-	case ems_objtype::message:
-		if (!static_cast<message_object *>(pobject)->get_all_proptags(&proptags))
-			return ecError;
+	case ems_objtype::message: {
+		auto err = static_cast<message_object *>(pobject)->get_all_proptags(&proptags);
+		if (err != ecSuccess)
+			return err;
 		break;
+	}
 	case ems_objtype::attach:
 		if (!static_cast<attachment_object *>(pobject)->get_all_proptags(&proptags))
 			return ecError;
@@ -570,13 +569,13 @@ ec_error_t rop_copyproperties(uint8_t want_asynchronous, uint8_t copy_flags,
 	/* We do not support MAPI_MOVE, just like EXC 2010 or later */
 	if (copy_flags & ~(MAPI_MOVE | MAPI_NOREPLACE))
 		return ecInvalidParam;
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hsrc, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hsrc, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
-	auto pobject_dst = rop_processor_get_object(plogmap, logon_id, hdst, &dst_type);
+	auto pobject_dst = plogmap->get_object(logon_id, hdst, &dst_type);
 	if (pobject_dst == nullptr)
 		return ecDstNullObject;
 	if (object_type != dst_type)
@@ -641,20 +640,23 @@ ec_error_t rop_copyproperties(uint8_t want_asynchronous, uint8_t copy_flags,
 		b_force = TRUE;
 		if (copy_flags & MAPI_NOREPLACE) {
 			b_force = FALSE;
-			if (!msgdst->get_all_proptags(&proptags1))
-				return ecError;
+			auto err = msgdst->get_all_proptags(&proptags1);
+			if (err != ecSuccess)
+				return err;
 		}
 		for (size_t i = 0; i < pproptags.size(); ++i) {
 			const auto tag = pproptags[i];
 			if (tag == PR_MESSAGE_ATTACHMENTS) {
-				if (!msgdst->copy_attachments(msgsrc, b_force, &b_result))
-					return ecError;
+				auto err = msgdst->copy_attachments(msgsrc, b_force, &b_result);
+				if (err != ecSuccess)
+					return err;
 				if (!b_result)
 					pproblems->emplace_back(i, PR_MESSAGE_ATTACHMENTS, ecAccessDenied);
 				continue;
 			} else if (tag == PR_MESSAGE_RECIPIENTS) {
-				if (!msgdst->copy_rcpts(msgsrc, b_force, &b_result))
-					return ecError;
+				auto err = msgdst->copy_rcpts(msgsrc, b_force, &b_result);
+				if (err != ecSuccess)
+					return err;
 				if (!b_result)
 					pproblems->emplace_back(i, PR_MESSAGE_RECIPIENTS, ecAccessDenied);
 				continue;
@@ -668,15 +670,17 @@ ec_error_t rop_copyproperties(uint8_t want_asynchronous, uint8_t copy_flags,
 			poriginal_indices.push_back(i);
 			proptags.emplace_back(tag);
 		}
-		if (!msgsrc->get_properties(0, proptags, &propvals))
-			return ecError;
+		auto err = msgsrc->get_properties(0, proptags, &propvals);
+		if (err != ecSuccess)
+			return err;
 		for (size_t i = 0; i < proptags.count; ++i) {
 			const auto tag = pproptags[i];
 			if (!propvals.has(tag))
 				pproblems->emplace_back(poriginal_indices[i], tag, ecNotFound);
 		}
-		if (!msgdst->set_properties(&propvals, &tmp_problems))
-			return ecError;
+		err = msgdst->set_properties(&propvals, &tmp_problems);
+		if (err != ecSuccess)
+			return err;
 		for (size_t i = 0; i < tmp_problems.count; ++i)
 			tmp_problems.pproblem[i].index = pproptags.indexof(tmp_problems.pproblem[i].proptag);
 		*pproblems += std::move(tmp_problems);
@@ -743,13 +747,13 @@ ec_error_t rop_copyto(uint8_t want_asynchronous, uint8_t want_subobjects,
 	/* We do not support MAPI_MOVE, just like EXC 2010 or later */
 	if (copy_flags & ~(MAPI_MOVE | MAPI_NOREPLACE))
 		return ecInvalidParam;
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hsrc, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hsrc, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
-	auto pobject_dst = rop_processor_get_object(plogmap, logon_id, hdst, &dst_type);
+	auto pobject_dst = plogmap->get_object(logon_id, hdst, &dst_type);
 	if (pobject_dst == nullptr)
 		return ecDstNullObject;
 	if (object_type != dst_type)
@@ -833,9 +837,10 @@ ec_error_t rop_copyto(uint8_t want_asynchronous, uint8_t want_subobjects,
 		auto tag_access = msgdst->get_tag_access();
 		if (!(tag_access & MAPI_ACCESS_MODIFY))
 			return ecAccessDenied;
-		if (!msgdst->copy_to(static_cast<message_object *>(pobject),
-		    pexcluded_proptags, b_force, &b_cycle, pproblems))
-			return ecError;
+		auto err = msgdst->copy_to(static_cast<message_object *>(pobject),
+		           pexcluded_proptags, b_force, &b_cycle, pproblems);
+		if (err != ecSuccess)
+			return err;
 		if (b_cycle)
 			return ecMsgCycle;
 		return ecSuccess;
@@ -871,10 +876,10 @@ ec_error_t rop_openstream(proptag_t proptag, uint8_t flags, uint32_t *pstream_si
 	uint32_t max_length;
 	uint32_t permission;
 	
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecError;
-	auto pobject = rop_processor_get_object(plogmap, logon_id, hin, &object_type);
+	auto pobject = plogmap->get_object(logon_id, hin, &object_type);
 	if (pobject == nullptr)
 		return ecNullObject;
 	const bool b_write = flags & MAPI_BEST_ACCESS; /* one bit suffices for wanting to write */
@@ -939,8 +944,8 @@ ec_error_t rop_openstream(proptag_t proptag, uint8_t flags, uint32_t *pstream_si
 	if (!pstream->prop_present())
 		return ecNotFound;
 	auto rstream = pstream.get();
-	auto hnd = rop_processor_add_object_handle(plogmap,
-	           logon_id, hin, {ems_objtype::stream, std::move(pstream)});
+	auto hnd = plogmap->add_object_handle(logon_id, hin,
+	           {ems_objtype::stream, std::move(pstream)});
 	if (hnd < 0)
 		return aoh_to_error(hnd);
 	*phout = hnd;
@@ -956,7 +961,7 @@ ec_error_t rop_readstream(uint16_t byte_count, uint32_t max_byte_count,
 	uint32_t buffer_size;
 	ems_objtype object_type;
 	
-	auto pstream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hin, &object_type);
+	auto pstream = plogmap->get_obj<stream_object>(logon_id, hin, &object_type);
 	if (pstream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
@@ -993,7 +998,7 @@ ec_error_t rop_writestream(const BINARY *pdata_bin, uint16_t *pwritten_size,
 {
 	ems_objtype object_type;
 	
-	auto pstream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hin, &object_type);
+	auto pstream = plogmap->get_obj<stream_object>(logon_id, hin, &object_type);
 	if (pstream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
@@ -1021,7 +1026,7 @@ ec_error_t rop_commitstream(LOGMAP *plogmap, uint8_t logon_id, uint32_t hin)
 {
 	ems_objtype object_type;
 	
-	auto pstream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hin, &object_type);
+	auto pstream = plogmap->get_obj<stream_object>(logon_id, hin, &object_type);
 	if (pstream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
@@ -1044,7 +1049,7 @@ ec_error_t rop_getstreamsize(uint32_t *pstream_size, LOGMAP *plogmap,
 {
 	ems_objtype object_type;
 	
-	auto pstream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hin, &object_type);
+	auto pstream = plogmap->get_obj<stream_object>(logon_id, hin, &object_type);
 	if (pstream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
@@ -1061,7 +1066,7 @@ ec_error_t rop_setstreamsize(uint64_t stream_size, LOGMAP *plogmap,
 	if (stream_size > static_cast<uint64_t>(INT32_MAX) + 1)
 		/* That weird +1 is specified in MS-OXCPRPT v17 §2.2.19 and §2.2.20 */
 		return ecInvalidParam;
-	auto pstream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hin, &object_type);
+	auto pstream = plogmap->get_obj<stream_object>(logon_id, hin, &object_type);
 	if (pstream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
@@ -1088,7 +1093,7 @@ ec_error_t rop_seekstream(uint8_t seek_pos, int64_t offset, uint64_t *pnew_pos,
 		return StreamSeekError;
 	if (offset > 0 && static_cast<uint64_t>(offset) > static_cast<uint64_t>(INT32_MAX) + 1)
 		return StreamSeekError;
-	auto pstream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hin, &object_type);
+	auto pstream = plogmap->get_obj<stream_object>(logon_id, hin, &object_type);
 	if (pstream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
@@ -1107,12 +1112,12 @@ ec_error_t rop_copytostream(uint64_t byte_count, uint64_t *pread_bytes,
 	ems_objtype object_type;
 	uint32_t length;
 	
-	auto psrc_stream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hsrc, &object_type);
+	auto psrc_stream = plogmap->get_obj<stream_object>(logon_id, hsrc, &object_type);
 	if (psrc_stream == nullptr)
 		return ecNullObject;
 	if (object_type != ems_objtype::stream)
 		return ecNotSupported;
-	auto pdst_stream = rop_proc_get_obj<stream_object>(plogmap, logon_id, hdst, &object_type);
+	auto pdst_stream = plogmap->get_obj<stream_object>(logon_id, hdst, &object_type);
 	if (pdst_stream == nullptr)
 		return ecDstNullObject;
 	if (pdst_stream->get_open_flags() == MAPI_READONLY)

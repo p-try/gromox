@@ -6,6 +6,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <climits>
 #include <csignal>
@@ -19,12 +20,14 @@
 #include <mutex>
 #include <optional>
 #include <pthread.h>
+#include <span>
 #include <sqlite3.h>
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <fmt/core.h>
+#include <libHX/ctype_helper.h>
 #include <libHX/io.h>
 #include <libHX/scope.hpp>
 #include <libHX/string.h>
@@ -111,22 +114,16 @@ using syncmessage_list = std::unordered_map<uint64_t /* message_id */, syncmessa
 struct ct_node;
 using CONDITION_TREE = std::vector<ct_node>;
 struct ct_node {
-	ct_node() = default;
-	ct_node(ct_node &&);
-	~ct_node();
-	void operator=(ct_node &&) = delete;
-
-	CONDITION_TREE *pbranch = nullptr;
+	std::optional<CONDITION_TREE> pbranch;
 	enum midb_conj conjunction = midb_conj::c_and;
 	enum midb_cond condition = midb_cond::x_none;
 
 	union {
-		char *ct_headers[2]{};
 		time_t ct_time;
 		size_t ct_size;
-		imap_seq_list *ct_seq;
 	};
-	std::string ct_keyword;
+	std::string ct_headers[2], ct_keyword;
+	imap_seq_list ct_seq;
 };
 using CONDITION_TREE_NODE = ct_node;
 
@@ -201,12 +198,12 @@ static std::string make_midb_path(const char *d)
 	return d + "/exmdb/midb.sqlite3"s;
 }
 
-static std::string me_ct_to_utf8(const char *charset, const char *string)
+static std::string me_ct_to_utf8(const char *charset, std::string_view sv)
 {
 	if (strcasecmp(charset, "UTF-8") == 0||
 	    strcasecmp(charset, "US-ASCII") == 0)
-		return string;
-	return iconvtext(string, charset, "UTF-8");
+		return std::string(sv);
+	return iconvtext(sv, charset, "UTF-8");
 }
 
 static uint64_t me_get_digest(sqlite3 *psqlite, const char *mid_string,
@@ -286,10 +283,10 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 		if (-1 == begin_pos && '=' == in_buff[i] && '?' == in_buff[i + 1]) {
 			begin_pos = i;
 			if (i > last_pos) {
-				memcpy(temp_buff, in_buff + last_pos, begin_pos - last_pos);
-				temp_buff[begin_pos - last_pos] = '\0';
-				HX_strltrim(temp_buff);
-				auto tmp_string = me_ct_to_utf8(charset, temp_buff);
+				std::string_view scratch(&in_buff[last_pos], begin_pos - last_pos);
+				while (scratch.size() > 0 && HX_isspace(scratch[0]))
+					scratch.remove_prefix(1);
+				auto tmp_string = me_ct_to_utf8(charset, scratch);
 				memcpy(&out_buff[offset], tmp_string.c_str(), tmp_string.size());
 				offset += tmp_string.size();
 				last_pos = i;
@@ -311,8 +308,8 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 				temp_buff[decode_len] = '\0';
 				tmp_string = me_ct_to_utf8(encode_string.charset, temp_buff);
 			} else if (strcasecmp(encode_string.encoding, "quoted-printable") == 0) {
-				auto decode_len = qp_decode_ex(temp_buff, std::size(temp_buff),
-				                  encode_string.title, tmp_len);
+				auto decode_len = qpnl_decode_sized({encode_string.title, tmp_len},
+				                  temp_buff, std::size(temp_buff));
 				if (decode_len < 0)
 					return NULL;
 				temp_buff[decode_len] = '\0';
@@ -369,15 +366,14 @@ static void me_ct_enum_mime(MJSON_MIME *pmime, void *param) try
 	if (strcasecmp(pmime->get_encoding(), "base64") == 0) {
 		content = base64_decode(ctview);
 	} else if (strcasecmp(pmime->get_encoding(), "quoted-printable") == 0) {
-		auto xl = qp_decode_ex(&content[0], content.size(), ctview.data(), ctview.size());
+		auto xl = qpnl_decode_sized(ctview, &content[0], content.size());
 		if (xl < 0)
 			return;
 		content.resize(xl);
 	}
 
 	auto charset = pmime->get_charset();
-	auto rs = me_ct_to_utf8(*charset != '\0' ?
-	          charset : penum->charset, content.c_str());
+	auto rs = me_ct_to_utf8(*charset != '\0' ? charset : penum->charset, content);
 	if (strcasestr(rs.c_str(), penum->keyword) != nullptr)
 		penum->b_result = TRUE;
 } catch (const std::bad_alloc &) {
@@ -385,7 +381,7 @@ static void me_ct_enum_mime(MJSON_MIME *pmime, void *param) try
 }
 
 static bool me_ct_search_head(const char *charset, const char *mid_string,
-    const char *tag, const char *value)
+    const std::string &tag, const std::string &value)
 {
 	std::string content;
 	if (!exmdb_client->imapfile_read(cu_get_maildir(), "eml",
@@ -397,12 +393,12 @@ static bool me_ct_search_head(const char *charset, const char *mid_string,
 
 	for (const auto &hf : hdr.getFieldList()) {
 		auto hk = hf->getName();
-		if (strcasecmp(hk.c_str(), tag) != 0)
+		if (strcasecmp(hk.c_str(), tag.c_str()) != 0)
 			continue;
 		vmime::text txt;
 		txt.parse(hf->getValue()->generate());
 		auto tdec = txt.getConvertedText(vmime::charsets::UTF_8);
-		if (strcasestr(tdec.c_str(), value) != nullptr)
+		if (strcasestr(tdec.c_str(), value.c_str()) != nullptr)
 			return true;
 	}
 	return false;
@@ -418,24 +414,40 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
     sqlite3_stmt *pstmt_message, const char *mid_string, int id, int total_mail,
     uint32_t uidnext, const CONDITION_TREE *ptree) try
 {
-	int sp = 0;
-	bool b_loaded, b_result, b_result1, results[1024];
+	size_t sp = 0;
+	bool b_loaded, b_result, b_result1;
 	midb_conj conjunction;
 	time_t tmp_time;
 	size_t temp_len;
 	char temp_buff[1024];
 	char temp_buff1[1024];
-	midb_conj conjunctions[1024];
 	KEYWORD_ENUM keyword_enum;
-	const CONDITION_TREE *trees[1024];
-	CONDITION_TREE::const_iterator pnode, nodes[1024];
+	std::vector<const CONDITION_TREE *> trees;
+	std::vector<CONDITION_TREE::const_iterator> nodes;
+	std::vector<midb_conj> conjunctions;
+	std::vector<bool> results;
+	CONDITION_TREE::const_iterator pnode;
 	Json::Value digest;
 	
-#define PUSH_MATCH(TREE, NODE, CONJUNCTION, RESULT) \
-		{trees[sp]=TREE;nodes[sp]=NODE;conjunctions[sp]=CONJUNCTION;results[sp]=RESULT;sp++;}
+#define PUSH_MATCH(TREE, NODE, CONJUNCTION, RESULT) do { \
+	trees.push_back(TREE); \
+	nodes.push_back(NODE); \
+	conjunctions.push_back(CONJUNCTION); \
+	results.push_back(RESULT); \
+	++sp; \
+} while (false);
 	
-#define POP_MATCH(TREE, NODE, CONJUNCTION, RESULT) \
-		{sp--;TREE=trees[sp];NODE=nodes[sp];CONJUNCTION=conjunctions[sp];RESULT=results[sp];}
+#define POP_MATCH(TREE, NODE, CONJUNCTION, RESULT) do { \
+	assert(trees.size() == sp); \
+	assert(nodes.size() == sp); \
+	assert(conjunctions.size() == sp); \
+	assert(results.size() == sp); \
+	TREE = trees.back(); trees.pop_back(); \
+	NODE = nodes.back(); nodes.pop_back(); \
+	CONJUNCTION = conjunctions.back(); conjunctions.pop_back(); \
+	RESULT = results.back(); results.pop_back(); \
+	--sp; \
+} while (false);
 
 /* begin of recursion procedure */
 	while (true) {
@@ -450,9 +462,9 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 		    (!b_result && conjunction == midb_conj::c_and))
 			continue;
 		b_result1 = false;
-		if (NULL != ptree_node->pbranch) {
+		if (ptree_node->pbranch.has_value()) {
 			PUSH_MATCH(ptree, pnode, conjunction, b_result)
-			ptree = ptree_node->pbranch;
+			ptree = &*ptree_node->pbranch;
 			goto PROC_BEGIN;
 		} else {
 			switch (ptree_node->condition) {
@@ -573,7 +585,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 					ptree_node->ct_headers[1]);
 				break;
 			case midb_cond::id:
-				b_result1 = ct_hint_seq(*ptree_node->ct_seq, id, total_mail);
+				b_result1 = ct_hint_seq(ptree_node->ct_seq, id, total_mail);
 				break;
 			case midb_cond::larger:
 				sqlite3_reset(pstmt_message);
@@ -802,7 +814,7 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 					1, mid_string, -1, SQLITE_STATIC);
 				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
 					break;
-				b_result1 = ct_hint_seq(*ptree_node->ct_seq,
+				b_result1 = ct_hint_seq(ptree_node->ct_seq,
 					sqlite3_column_int64(pstmt_message, CTM_UID),
 					uidnext);
 				break;
@@ -877,8 +889,8 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 	return false;
 }
 
-static int me_ct_compile_criteria(int argc,
-	char **argv, int offset, char **argv_out)
+static int me_ct_compile_criteria(std::span<std::string> argv,
+    size_t i, std::vector<std::string> &argv_out)
 {
 	static constexpr const char *kwlist1[] =
 		{"ALL", "ANSWERED", "DELETED", "DRAFT", "FLAGGED", "NEW",
@@ -888,103 +900,54 @@ static int me_ct_compile_criteria(int argc,
 		{"BCC", "BEFORE", "BODY", "CC", "FROM", "KEYWORD", "LARGER",
 		"ON", "SENTBEFORE", "SENTON", "SENTSINCE", "SINCE", "SMALLER",
 		"SUBJECT", "TEXT", "TO", "UID", "UNKEYWORD"};
-	int i;
-	int tmp_argc;
-	int tmp_argc1;
 	
-	i = offset;
-	if (argc < i + 1)
+	if (argv.size() < i + 1)
 		return -1;
-	argv_out[0] = argv[i];
-	if (0 == strcasecmp(argv[i], "OR")) {
+	auto keyword = argv[i].c_str();
+	argv_out.emplace_back(argv[i]);
+	if (strcasecmp(keyword, "OR") == 0) {
 		i ++;
-		if (argc < i + 1)
+		if (argv.size() < i + 1)
 			return -1;
-		tmp_argc = me_ct_compile_criteria(argc, argv, i, &argv_out[1]);
+		auto tmp_argc = me_ct_compile_criteria(argv, i, argv_out);
 		if (tmp_argc == -1)
 			return -1;
 		i += tmp_argc;
-		if (argc < i + 1)
+		if (argv.size() < i + 1)
 			return -1;
-		tmp_argc1 = me_ct_compile_criteria(argc, argv, i, &argv_out[1+tmp_argc]);
+		auto tmp_argc1 = me_ct_compile_criteria(argv, i, argv_out);
 		if (tmp_argc1 == -1)
 			return -1;
 		return tmp_argc + tmp_argc1 + 1;
-	} else if (array_find_istr(kwlist1, argv[i])) {
+	} else if (array_find_istr(kwlist1, keyword)) {
 		return 1;
-	} else if (array_find_istr(kwlist2, argv[i])) {
+	} else if (array_find_istr(kwlist2, keyword)) {
 		i ++;
-		if (argc < i + 1)
+		if (argv.size() < i + 1)
 			return -1;
-		argv_out[1] = argv[i];
+		argv_out.emplace_back(argv[i]);
 		return 2;
-	} else if (0 == strcasecmp(argv[i], "HEADER")) {
+	} else if (strcasecmp(keyword, "HEADER") == 0) {
 		i ++;
-		if (argc < i + 1)
+		if (argv.size() < i + 1)
 			return -1;
-		argv_out[1] = argv[i];
+		argv_out.emplace_back(argv[i]);
 		i++;
-		if (argc < i + 1)
+		if (argv.size() < i + 1)
 			return -1;
-		argv_out[2] = argv[i];
+		argv_out.emplace_back(argv[i]);
 		return 3;
-	} else if (0 == strcasecmp(argv[i], "NOT")) {
+	} else if (strcasecmp(keyword, "NOT") == 0) {
 		i ++;
-		if (argc < i + 1)
+		if (argv.size() < i + 1)
 			return -1;
-		tmp_argc = me_ct_compile_criteria(argc, argv, i, &argv_out[1]);
+		auto tmp_argc = me_ct_compile_criteria(argv, i, argv_out);
 		if (-1 == tmp_argc)
 			return -1;
 		return tmp_argc + 1;
 	} else {
 		/* <sequence set> or () as default */
 		return 1;
-	}
-}
-
-ct_node::ct_node(ct_node &&o) :
-	pbranch(o.pbranch), conjunction(o.conjunction), condition(o.condition)
-{
-	o.pbranch = nullptr;
-	switch (condition) {
-	case midb_cond::id ... midb_cond::uid:
-		ct_seq = o.ct_seq;
-		o.ct_seq = nullptr;
-		break;
-	case midb_cond::bcc ... midb_cond::unkeyword:
-		ct_keyword = std::move(o.ct_keyword);
-		break;
-	case midb_cond::header:
-		ct_headers[0] = o.ct_headers[0];
-		ct_headers[1] = o.ct_headers[1];
-		o.ct_headers[0] = o.ct_headers[1] = nullptr;
-		break;
-	case midb_cond::before ... midb_cond::since:
-		ct_time = o.ct_time;
-		break;
-	case midb_cond::larger ... midb_cond::smaller:
-		ct_size = o.ct_size;
-		break;
-	default:
-		break;
-	}
-	o.condition = midb_cond::x_none;
-}
-
-ct_node::~ct_node()
-{
-	if (pbranch != nullptr)
-		return;
-	switch (condition) {
-	case midb_cond::id ... midb_cond::uid:
-		delete ct_seq;
-		break;
-	case midb_cond::header:
-		free(ct_headers[0]);
-		free(ct_headers[1]);
-		break;
-	default:
-		break;
 	}
 }
 
@@ -1031,8 +994,8 @@ static enum midb_cond cond_str_to_cond(const char *s)
 	return midb_cond::x_none;
 }
 
-static std::unique_ptr<CONDITION_TREE> me_ct_build_internal(const char *charset,
-    int argc, char **argv) try
+static std::optional<CONDITION_TREE> me_ct_build_internal(const char *charset,
+    std::span<std::string> argv) try
 {
 	static constexpr const char *kwlist1[] =
 		{"BCC", "BODY", "CC", "FROM", "KEYWORD", "SUBJECT", "TEXT",
@@ -1043,112 +1006,107 @@ static std::unique_ptr<CONDITION_TREE> me_ct_build_internal(const char *charset,
 		{"ALL", "ANSWERED", "DELETED", "DRAFT", "FLAGGED", "NEW",
 		"OLD", "RECENT", "SEEN", "UNANSWERED", "UNDELETED", "UNDRAFT",
 		"UNFLAGGED", "UNSEEN"};
-	int i, len;
-	int tmp_argc;
-	int tmp_argc1;
+	int len;
 	struct tm tmp_tm;
-	char* tmp_argv[256];
-	auto plist = std::make_unique<CONDITION_TREE>();
+	std::vector<std::string> tmp_argv;
+	auto plist = std::make_optional<CONDITION_TREE>();
 
-	for (i=0; i<argc; i++) {
+	for (size_t i = 0; i < argv.size(); ++i) {
+		auto keyword = argv[i].data();
 		ct_node ctn, *ptree_node = &ctn;
-		ptree_node->pbranch = NULL;
-		if (0 == strcasecmp(argv[i], "NOT")) {
+		if (strcasecmp(keyword, "NOT") == 0) {
 			ptree_node->conjunction = midb_conj::c_not;
 			i ++;
-			if (i >= argc)
+			if (i >= argv.size())
 				return {};
 		} else {
 			ptree_node->conjunction = midb_conj::c_and;
 		}
-		if (array_find_istr(kwlist1, argv[i])) {
-			ptree_node->condition = cond_str_to_cond(argv[i]);
+		if (array_find_istr(kwlist1, keyword)) {
+			ptree_node->condition = cond_str_to_cond(keyword);
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_keyword = me_ct_to_utf8(charset, argv[i]);
-		} else if (array_find_istr(kwlist2, argv[i])) {
-			if (i + 1 > argc)
+			ptree_node->ct_keyword = me_ct_to_utf8(charset, keyword);
+		} else if (array_find_istr(kwlist2, keyword)) {
+			if (i + 1 > argv.size())
 				return {};
-			ptree_node->condition = cond_str_to_cond(argv[i]);
+			ptree_node->condition = cond_str_to_cond(keyword);
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
 			memset(&tmp_tm, 0, sizeof(tmp_tm));
-			if (strptime(argv[i], "%d-%b-%Y", &tmp_tm) == nullptr)
+			if (strptime(keyword, "%d-%b-%Y", &tmp_tm) == nullptr)
 				return {};
 			tmp_tm.tm_wday = -1;
 			ptree_node->ct_time = timegm(&tmp_tm);
 			if (ptree_node->ct_time == -1 && tmp_tm.tm_wday == -1)
 				return {};
-		} else if ('(' == argv[i][0]) {
-			len = strlen(argv[i]);
-			argv[i][len - 1] = '\0';
-			tmp_argc = parse_imap_args(argv[i] + 1,
-				len - 2, tmp_argv, sizeof(tmp_argv));
+		} else if (keyword[0] == '(') {
+			len = strlen(keyword);
+			keyword[len-1] = '\0';
+			auto tmp_argc = parse_imap_args(&keyword[1], len - 2, tmp_argv);
 			if (tmp_argc == -1)
 				return {};
-			auto plist1 = me_ct_build_internal(charset, tmp_argc, tmp_argv);
-			if (plist1 == nullptr)
+			ptree_node->pbranch = me_ct_build_internal(charset, tmp_argv);
+			if (!ptree_node->pbranch.has_value())
 				return {};
-			ptree_node->pbranch = plist1.release();
-		} else if (0 == strcasecmp(argv[i], "OR")) {
+		} else if (strcasecmp(keyword, "OR") == 0) {
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			tmp_argc = me_ct_compile_criteria(argc, argv, i, tmp_argv);
+			auto tmp_argc = me_ct_compile_criteria(argv, i, tmp_argv);
 			if (tmp_argc == -1)
 				return {};
 			i += tmp_argc;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			tmp_argc1 = me_ct_compile_criteria(argc, argv, i, &tmp_argv[tmp_argc]);
+			auto tmp_argc1 = me_ct_compile_criteria(argv, i, tmp_argv);
 			if (tmp_argc1 == -1)
 				return {};
-			auto plist1 = me_ct_build_internal(charset, tmp_argc + tmp_argc1, tmp_argv);
-			if (plist1 == nullptr)
+			auto plist1 = me_ct_build_internal(charset, tmp_argv);
+			if (!plist1.has_value())
 				return {};
 			if (plist1->size() != 2)
 				return {};
-			auto &ln = plist1->back();
-			ln.conjunction = midb_conj::c_or;
-			ln.pbranch = plist1.release();
+			plist1->back().conjunction = midb_conj::c_or;
+			ptree_node->pbranch = std::move(plist1);
 			i += tmp_argc1 - 1;
-		} else if (array_find_istr(kwlist3, argv[i])) {
-			ptree_node->condition = cond_str_to_cond(argv[i]);
-		} else if (0 == strcasecmp(argv[i], "HEADER")) {
+		} else if (array_find_istr(kwlist3, keyword)) {
+			ptree_node->condition = cond_str_to_cond(keyword);
+		} else if (strcasecmp(keyword, "HEADER") == 0) {
 			ptree_node->condition = midb_cond::header;
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_headers[0] = strdup(argv[i]);
+			ptree_node->ct_headers[0] = keyword;
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_headers[1] = strdup(argv[i]);
-		} else if (0 == strcasecmp(argv[i], "LARGER") ||
-			0 == strcasecmp(argv[i], "SMALLER")) {
-			ptree_node->condition = strcasecmp(argv[i], "LARGER") == 0 ?
+			ptree_node->ct_headers[1] = keyword;
+		} else if (strcasecmp(keyword, "LARGER") == 0 ||
+		    strcasecmp(keyword, "SMALLER") == 0) {
+			ptree_node->condition = strcasecmp(keyword, "LARGER") == 0 ?
 			                        midb_cond::larger : midb_cond::smaller;
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_size = strtol(argv[i], nullptr, 0);
-		} else if (0 == strcasecmp(argv[i], "UID")) {
+			ptree_node->ct_size = strtol(keyword, nullptr, 0);
+		} else if (strcasecmp(keyword, "UID") == 0) {
 			ptree_node->condition = midb_cond::uid;
 			i ++;
-			if (i + 1 > argc)
+			if (i + 1 > argv.size())
 				return {};
-			auto r = std::make_unique<imap_seq_list>();
-			if (parse_imap_seq(*r, argv[i]) != 0)
+			imap_seq_list r;
+			if (parse_imap_seq(r, keyword) != 0)
 				return {};
-			ptree_node->ct_seq = r.release();
+			ptree_node->ct_seq = std::move(r);
 		} else {
-			auto r = std::make_unique<imap_seq_list>();
-			if (parse_imap_seq(*r, argv[i]) != 0)
+			imap_seq_list r;
+			if (parse_imap_seq(r, keyword) != 0)
 				return {};
 			ptree_node->condition = midb_cond::id;
-			ptree_node->ct_seq = r.release();
+			ptree_node->ct_seq = std::move(r);
 		}
 		plist->push_back(std::move(ctn));
 	}
@@ -1158,13 +1116,13 @@ static std::unique_ptr<CONDITION_TREE> me_ct_build_internal(const char *charset,
 	return {};
 }
 
-static std::unique_ptr<CONDITION_TREE> me_ct_build(int argc, char **argv)
+static std::optional<CONDITION_TREE> me_ct_build(std::span<std::string> argv)
 {
-	if (strcasecmp(argv[0], "CHARSET") != 0)
-		return me_ct_build_internal("UTF-8", argc, argv);
-	if (argc < 3)
+	if (strcasecmp(argv[0].c_str(), "CHARSET") != 0)
+		return me_ct_build_internal("UTF-8", argv);
+	if (argv.size() < 3)
 		return {};
-	return me_ct_build_internal(argv[1], argc - 2, argv + 2);
+	return me_ct_build_internal(argv[1].c_str(), argv.subspan(2));
 }
 
 static bool ct_hint_seq(const imap_seq_list &list,
@@ -1189,7 +1147,7 @@ static bool ct_hint_seq(const imap_seq_list &list,
 
 static std::optional<std::vector<int>> me_ct_match(const char *charset,
     sqlite3 *psqlite, uint64_t folder_id, const CONDITION_TREE *ptree,
-    BOOL b_uid) try
+    bool b_uid) try
 {
 	uint32_t uid;
 	uint32_t uidnext;
@@ -2058,7 +2016,7 @@ static void *midbme_scanwork(void *param)
  * Response:
  * 	TRUE
  */
-static int me_mping(int argc, char **argv, int sockd)
+static int me_mping(std::span<char *> argv, int sockd)
 {
 	me_get_idb(argv[1]);
 	exmdb_client->ping_store(argv[1]);
@@ -2075,7 +2033,7 @@ static int me_mping(int argc, char **argv, int sockd)
  * 	TRUE <#folders>
  * 	<folder-id> <folder-name>  // repeat x #folders
  */
-static int me_menum(int argc, char **argv, int sockd) try
+static int me_menum(std::span<char *> argv, int sockd) try
 {
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -2111,7 +2069,7 @@ static int me_menum(int argc, char **argv, int sockd) try
  * Response:
  * 	TRUE
  */
-static int me_minst(int argc, char **argv, int sockd) try
+static int me_minst(std::span<char *> argv, int sockd) try
 {
 	uint32_t tmp_flags;
 	uint64_t change_num;
@@ -2240,13 +2198,13 @@ static int me_minst(int argc, char **argv, int sockd) try
  * Response:
  * 	TRUE
  */
-static int me_mdele(int argc, char **argv, int sockd)
+static int me_mdele(std::span<char *> argv, int sockd)
 {
 	BOOL b_partial;
 	EID_ARRAY message_ids;
 
 	message_ids.count = 0;
-	message_ids.pids = cu_alloc<eid_t>(argc - 3);
+	message_ids.pids = cu_alloc<eid_t>(argv.size() - 3);
 	if (message_ids.pids == nullptr)
 		return MIDB_E_NO_MEMORY;
 	auto pidb = me_get_idb(argv[1]);
@@ -2264,7 +2222,7 @@ static int me_mdele(int argc, char **argv, int sockd)
 		return MIDB_E_SQLPREP;
 
 	/* Translate midb-MIDs into Exch-MIDs. */
-	for (int i = 3; i < argc; ++i) {
+	for (size_t i = 3; i < argv.size(); ++i) {
 		sqlite3_reset(pstmt);
 		sqlite3_bind_text(pstmt, 1, argv[i], -1, SQLITE_STATIC);
 		if (SQLITE_ROW != pstmt.step() ||
@@ -2300,7 +2258,7 @@ static int me_mdele(int argc, char **argv, int sockd)
 	pstmt = gx_sql_prep(pidb->psqlite, "DELETE FROM messages WHERE mid_string=?");
 	if (pstmt == nullptr)
 		return MIDB_E_SQLPREP;
-	for (int i = 3; i < argc; ++i) {
+	for (size_t i = 3; i < argv.size(); ++i) {
 		pstmt.reset();
 		pstmt.bind_text(1, argv[i]);
 		if (pstmt.step() != SQLITE_DONE)
@@ -2322,7 +2280,7 @@ static int me_mdele(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE <new-mid>
  */
-static int me_mcopy(int argc, char **argv, int sockd) try
+static int me_mcopy(std::span<char *> argv, int sockd) try
 {
 	if (strlen(argv[4]) >= 1024)
 		return MIDB_E_PARAMETER_ERROR;
@@ -2396,7 +2354,7 @@ static int me_mcopy(int argc, char **argv, int sockd) try
  * Response:
  * 	TRUE
  */
-static int me_mrenf(int argc, char **argv, int sockd)
+static int me_mrenf(std::span<char *> argv, int sockd)
 {
 	if (strlen(argv[3]) >= 1024 || strcmp(argv[2], argv[3]) == 0)
 		return MIDB_E_PARAMETER_ERROR;
@@ -2506,7 +2464,7 @@ static int me_mrenf(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE
  */
-static int me_mmakf(int argc, char **argv, int sockd)
+static int me_mmakf(std::span<char *> argv, int sockd)
 {
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -2560,7 +2518,7 @@ static int me_mmakf(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE
  */
-static int me_mremf(int argc, char **argv, int sockd)
+static int me_mremf(std::span<char *> argv, int sockd)
 {
 	BOOL b_result;
 	BOOL b_partial;
@@ -2595,7 +2553,7 @@ static int me_mremf(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE <uid>
  */
-static int me_punid(int argc, char **argv, int sockd)
+static int me_punid(std::span<char *> argv, int sockd)
 {
 	int temp_len;
 	uint32_t uid;
@@ -2630,7 +2588,7 @@ static int me_punid(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE <#messages> <#recents> <#unreads> <uidvalidity> <uidnext>
  */
-static int me_pfddt(int argc, char **argv, int sockd)
+static int me_pfddt(std::span<char *> argv, int sockd)
 {
 	char temp_buff[1024];
 	char sql_string[1024];
@@ -2689,7 +2647,7 @@ static int me_pfddt(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE
  */
-static int me_psubf(int argc, char **argv, int sockd)
+static int me_psubf(std::span<char *> argv, int sockd)
 {
 	char sql_string[1024];
 
@@ -2714,7 +2672,7 @@ static int me_psubf(int argc, char **argv, int sockd)
  * Response:
  * 	TRUE
  */
-static int me_punsf(int argc, char **argv, int sockd)
+static int me_punsf(std::span<char *> argv, int sockd)
 {
 	char sql_string[1024];
 
@@ -2740,7 +2698,7 @@ static int me_punsf(int argc, char **argv, int sockd)
  * 	TRUE <#folders>
  * 	<folder-id> <folder-name>  // repeat x #folders
  */
-static int me_psubl(int argc, char **argv, int sockd) try
+static int me_psubl(std::span<char *> argv, int sockd) try
 {
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -2820,7 +2778,7 @@ static int simu_query(IDB_ITEM *pidb, const char *sql_string,
  * midb_agent:list_mail [POP3 logic] uses midstr and size.
  * midb_agent:fetch_simple_uid [IMAP logic] uses midstr, uid, flags.
  */
-static int me_psimu(int argc, char **argv, int sockd) try
+static int me_psimu(std::span<char *> argv, int sockd) try
 {
 	int total_mail = 0;
 	
@@ -2911,7 +2869,7 @@ static int me_psimu(int argc, char **argv, int sockd) try
  * 	TRUE <#messages>
  * 	- <mid> <uid>  // repeat x #messages
  */
-static int me_pdell(int argc, char **argv, int sockd) try
+static int me_pdell(std::span<char *> argv, int sockd) try
 {
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -2976,7 +2934,7 @@ static int dtlu_query(IDB_ITEM *pidb, const char *sql_string,
  * 	TRUE <#messages>
  * 	- <digest>  // repeat x #messages
  */
-static int me_pdtlu(int argc, char **argv, int sockd) try
+static int me_pdtlu(std::span<char *> argv, int sockd) try
 {
 	int total_mail = 0;
 	char sql_string[1024];
@@ -3084,7 +3042,7 @@ static std::string flags_rn(sqlite3 *db, uint64_t gcv)
  * Response:
  * 	TRUE
  */
-static int me_psflg(int argc, char **argv, int sockd) try
+static int me_psflg(std::span<char *> argv, int sockd) try
 {
 	uint64_t read_cn;
 	uint64_t message_id;
@@ -3192,7 +3150,7 @@ static int me_psflg(int argc, char **argv, int sockd) try
  * Response:
  * 	TRUE
  */
-static int me_prflg(int argc, char **argv, int sockd) try
+static int me_prflg(std::span<char *> argv, int sockd) try
 {
 	uint64_t read_cn;
 	uint64_t message_id;
@@ -3300,7 +3258,7 @@ static int me_prflg(int argc, char **argv, int sockd) try
  * Flags: e.g. Answered(A), Unsent(U), Flagged(F), Deleted(D), Read/Seen(S),
  * Recent(R), Forwarded(W)
  */
-static int me_pgflg(int argc, char **argv, int sockd) try
+static int me_pgflg(std::span<char *> argv, int sockd) try
 {
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -3345,32 +3303,28 @@ static int me_pgflg(int argc, char **argv, int sockd) try
  * Response:
  * 	TRUE <uid>...
  */
-static int me_psrhl(int argc, char **argv, int sockd) try
+static int me_psrhl(std::span<char *> argv, int sockd) try
 {
 	char *parg;
-	int tmp_argc;
 	sqlite3 *psqlite;
 	size_t decode_len;
-	char* tmp_argv[1024];
+	std::vector<std::string> tmp_argv;
 	char tmp_buff[16*1024];
 	
 	auto tmp_len = strlen(argv[4]);
 	if (tmp_len >= sizeof(tmp_buff) ||
 	    decode64(argv[4], tmp_len, tmp_buff, std::size(tmp_buff), &decode_len) != 0)
 		return MIDB_E_PARAMETER_ERROR;
-	tmp_argc = 0;
 	parg = tmp_buff;
 	while (*parg != '\0' && parg - tmp_buff >= 0 &&
-	       static_cast<size_t>(parg - tmp_buff) < decode_len &&
-	       static_cast<size_t>(tmp_argc) < sizeof(tmp_argv)) {
-		tmp_argv[tmp_argc] = parg;
+	       static_cast<size_t>(parg - tmp_buff) < decode_len) {
+		tmp_argv.emplace_back(parg);
 		parg += strlen(parg) + 1;
-		tmp_argc ++;
 	}
-	if (tmp_argc == 0)
+	if (tmp_argv.size() == 0)
 		return MIDB_E_PARAMETER_ERROR;
-	auto ptree = me_ct_build(tmp_argc, tmp_argv);
-	if (ptree == nullptr)
+	auto ptree = me_ct_build(tmp_argv);
+	if (!ptree.has_value())
 		return MIDB_E_PARAMETER_ERROR;
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -3386,7 +3340,7 @@ static int me_psrhl(int argc, char **argv, int sockd) try
 		return MIDB_E_HASHTABLE_FULL;
 	}
 	sqlite3_busy_timeout(psqlite, g_midb_busy_timeout_ns / 1000000);
-	auto presult = me_ct_match(argv[3], psqlite, folder_id, ptree.get(), false);
+	auto presult = me_ct_match(argv[3], psqlite, folder_id, &*ptree, false);
 	if (!presult.has_value()) {
 		sqlite3_close_v2(psqlite);
 		return MIDB_E_MNG_CTMATCH;
@@ -3423,32 +3377,28 @@ static int me_psrhl(int argc, char **argv, int sockd) try
  * 	TRUE <uid-list>
  * uid-list: space-separated IDs
  */
-static int me_psrhu(int argc, char **argv, int sockd) try
+static int me_psrhu(std::span<char *> argv, int sockd) try
 {
 	char *parg;
-	int tmp_argc;
 	sqlite3 *psqlite;
 	size_t decode_len;
-	char* tmp_argv[1024];
+	std::vector<std::string> tmp_argv;
 	char tmp_buff[16*1024];
 	
 	auto tmp_len = strlen(argv[4]);
 	if (tmp_len >= sizeof(tmp_buff) ||
 	    decode64(argv[4], tmp_len, tmp_buff, std::size(tmp_buff), &decode_len) != 0)
 		return MIDB_E_PARAMETER_ERROR;
-	tmp_argc = 0;
 	parg = tmp_buff;
 	while (*parg != '\0' && parg - tmp_buff >= 0 &&
-	       static_cast<size_t>(parg - tmp_buff) < decode_len &&
-	       static_cast<size_t>(tmp_argc) < sizeof(tmp_argv)) {
-		tmp_argv[tmp_argc] = parg;
+	       static_cast<size_t>(parg - tmp_buff) < decode_len) {
+		tmp_argv.emplace_back(parg);
 		parg += strlen(parg) + 1;
-		tmp_argc ++;
 	}
-	if (tmp_argc == 0)
+	if (tmp_argv.size() == 0)
 		return MIDB_E_PARAMETER_ERROR;
-	auto ptree = me_ct_build(tmp_argc, tmp_argv);
-	if (ptree == nullptr)
+	auto ptree = me_ct_build(tmp_argv);
+	if (!ptree.has_value())
 		return MIDB_E_PARAMETER_ERROR;
 	auto pidb = me_get_idb(argv[1]);
 	if (pidb == nullptr)
@@ -3464,7 +3414,7 @@ static int me_psrhu(int argc, char **argv, int sockd) try
 		return MIDB_E_HASHTABLE_FULL;
 	}
 	sqlite3_busy_timeout(psqlite, g_midb_busy_timeout_ns / 1000000);
-	auto presult = me_ct_match(argv[3], psqlite, folder_id, ptree.get(), TRUE);
+	auto presult = me_ct_match(argv[3], psqlite, folder_id, &*ptree, true);
 	if (!presult.has_value()) {
 		sqlite3_close_v2(psqlite);
 		return MIDB_E_MNG_CTMATCH;
@@ -3497,7 +3447,7 @@ static int me_psrhu(int argc, char **argv, int sockd) try
  * Response:
  * 	TRUE 1
  */
-static int me_xunld(int argc, char **argv, int sockd)
+static int me_xunld(std::span<char *> argv, int sockd)
 {
 	std::lock_guard hhold(g_hash_lock);
 	auto it = g_hash_table.find(argv[1]);
@@ -3522,7 +3472,7 @@ static int me_xunld(int argc, char **argv, int sockd)
  * 	TRUE 1: was loaded before (tracking changes live), now is synchronized
  * 	TRUE 2: was unloaded before (not tracking), now is synchronized
  */
-static int me_xrsym(int argc, char **argv, int sockd)
+static int me_xrsym(std::span<char *> argv, int sockd)
 {
 	auto idb = me_peek_idb(argv[1]);
 	if (idb == nullptr) {
@@ -3551,7 +3501,7 @@ static int me_xrsym(int argc, char **argv, int sockd)
  * 	FALSE 1
  * 	(also the regular FALSE 0 by way of midb core)
  */
-static int me_xrsyf(int argc, char **argv, int sockd)
+static int me_xrsyf(std::span<char *> argv, int sockd)
 {
 	auto idb = me_get_idb(argv[1]);
 	if (idb == nullptr)

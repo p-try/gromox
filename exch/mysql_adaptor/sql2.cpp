@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later, OR GPL-2.0-or-later WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #ifdef HAVE_CONFIG_H
 #	include "config.h"
@@ -36,6 +36,7 @@
 #include <gromox/mapidefs.h>
 #include <gromox/mysql_adaptor.hpp>
 #include <gromox/svc_common.h>
+#include <gromox/svc_loader.hpp>
 #include <gromox/util.hpp>
 #include "sql2.hpp"
 #define JOIN_WITH_DISPLAYTYPE "LEFT JOIN user_properties AS dt ON u.id=dt.user_id AND dt.proptag=956628995 " /* PR_DISPLAY_TYPE_EX */
@@ -592,9 +593,9 @@ bool mysql_plugin::reload_config(std::shared_ptr<config_file> &&cfg)
 	if (v == nullptr)
 		v = cfg->get_value("schema_upgrades");
 	par.schema_upgrade = SSU_NOT_ENABLED;
-	auto prog_id = get_prog_id();
+	auto prog_id = service_get_prog_id();
 	auto host_id = get_host_ID();
-	if (prog_id == nullptr || strcmp(prog_id, "istore") != 0)
+	if (prog_id == nullptr || strcmp(prog_id, "istore-director") != 0)
 		par.schema_upgrade = SSU_NOT_ME;
 	else if (v != nullptr && strncmp(v, "host:", 5) == 0 &&
 	    prog_id != nullptr && strcmp(&v[5], host_id) == 0)
@@ -726,7 +727,7 @@ bool mysql_plugin::get_user_props(const char *username,
 	return false;
 }
 
-BOOL SVC_mysql_adaptor(enum plugin_op reason, const struct dlfuncs &data) try
+bool SVC_mysql_adaptor(enum plugin_op reason, const struct dlfuncs &data) try
 {
 	if (reason == PLUGIN_FREE) {
 		le_mysql_plugin.reset();

@@ -916,12 +916,12 @@ bool rtf_reader::express_attr_end(int attr, int param)
 		return express_end_fontsize(param);
 	case ATTR_FONTFACE: 
 		if (is_within_htmlrtf) {
-			auto param = stack_list_find_attr(ATTR_FONTFACE);
+			auto ff = stack_list_find_attr(ATTR_FONTFACE);
 			const char *encoding;
-			if (param == nullptr) {
+			if (ff == nullptr) {
 				encoding = default_encoding.c_str();
 			} else {
-				auto entry = lookup_font(*param);
+				auto entry = lookup_font(*ff);
 				encoding = entry != nullptr ? entry->encoding.c_str() :
 				           default_encoding.c_str();
 			}
@@ -3399,7 +3399,7 @@ int rtf_reader::convert_group_node(SIMPLE_TREE_NODE *pnode)
  *
  * It is allowed for @input to refer to the same object as @buf_out.
  */
-ec_error_t rtf_to_html(std::string_view input, const char *charset,
+static ec_error_t rtf_to_html_boring(std::string_view input, const char *charset,
     std::string &buf_out, ATTACHMENT_LIST *pattachments) try
 {
 	int i;
@@ -3447,6 +3447,25 @@ ec_error_t rtf_to_html(std::string_view input, const char *charset,
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecMAPIOOM;
+}
+
+ec_error_t rtf_to_html(std::string_view inbuf, const char *cset,
+    std::string &outbuf, ATTACHMENT_LIST *atlist)
+{
+	auto s = getenv("GROMOX_RTFTOHTML");
+	/* PANDOC_RTH will use image embedding... might work, might not. */
+	if (s == nullptr) {
+		auto ret = convert_doc_with_program(inbuf, cset, outbuf,
+		           REND_PANDOC_RTH);
+		if (ret >= 0)
+			return ecSuccess;
+	} else if (strcasecmp(s, "pandoc") == 0) {
+		return convert_doc_with_program(inbuf, cset, outbuf,
+		       REND_PANDOC_RTH) >= 0 ? ecSuccess : ecError;
+	}
+
+	/* rtf_reader will put images in @atlist */
+	return rtf_to_html_boring(inbuf, cset, outbuf, atlist);
 }
 
 static constexpr std::pair<const char *, CMD_PROC_FUNC> g_cmd_map[] = {

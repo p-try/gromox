@@ -1114,7 +1114,7 @@ static void html_enum_tables(RTF_WRITER *pwriter, xmlNode *pnode)
  *
  * It is allowed for @inbuf to point to the same object as @out.
  */
-ec_error_t html_to_rtf(std::string_view inbuf, cpid_t cpid, std::string &out) try
+static ec_error_t html_to_rtf_boring(std::string_view inbuf, cpid_t cpid, std::string &out) try
 {
 	RTF_WRITER writer;
 	textmaps_init();
@@ -1148,7 +1148,7 @@ ec_error_t html_to_rtf(std::string_view inbuf, cpid_t cpid, std::string &out) tr
 	            HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_NONET);
 	if (hdoc == nullptr && inbuf.size() == 0)
 		/* Old libxml (prior to v2.13.0) has problems with 0-sized documents */
-		hdoc = htmlReadMemory("<!-- -->", 7, nullptr, "utf-8",
+		hdoc = htmlReadMemory("<!-- -->", 8, nullptr, "utf-8",
 		            HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_NONET);
 	if (hdoc == nullptr)
 		return ecError;
@@ -1165,4 +1165,21 @@ ec_error_t html_to_rtf(std::string_view inbuf, cpid_t cpid, std::string &out) tr
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "%s: ENOMEM", __func__);
 	return ecMAPIOOM;
+}
+
+ec_error_t html_to_rtf(std::string_view inbuf, cpid_t cpid, std::string &outbuf)
+{
+	auto cset = cpid_to_cset(cpid);
+	auto s = getenv("GROMOX_HTMLTORTF");
+	if (s == nullptr) {
+		auto ret = convert_doc_with_program(inbuf, cset, outbuf,
+		           REND_PANDOC_HTR);
+		if (ret >= 0)
+			return ecSuccess;
+	} else if (strcasecmp(s, "pandoc") == 0) {
+		return convert_doc_with_program(inbuf, cset, outbuf,
+		       REND_PANDOC_HTR) >= 0 ? ecSuccess : ecError;
+	}
+
+	return html_to_rtf_boring(inbuf, cpid, outbuf);
 }

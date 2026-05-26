@@ -923,11 +923,14 @@ static pack_result ext_buffer_pull_reply_action(EXT_PULL *pext, REPLY_ACTION *r)
 
 static pack_result ext_buffer_pull_recipient_block(EXT_PULL *pext, RECIPIENT_BLOCK *r)
 {
-	TRY(pext->g_uint8(&r->reserved));
-	TRY(pext->g_uint16(&r->count));
-	if (r->count == 0)
+	uint8_t resv = 0;
+	uint16_t count = 0;
+	TRY(pext->g_uint8(&resv));
+	TRY(pext->g_uint16(&count));
+	CLAMP16(count);
+	if (count == 0)
 		return pack_result::format;
-	CLAMP16(r->count);
+	r->count = count;
 	r->ppropval = pext->anew<TAGGED_PROPVAL>(r->count);
 	if (r->ppropval == nullptr) {
 		r->count = 0;
@@ -941,10 +944,12 @@ static pack_result ext_buffer_pull_recipient_block(EXT_PULL *pext, RECIPIENT_BLO
 static pack_result ext_buffer_pull_forwarddelegate_action(EXT_PULL *pext,
     FORWARDDELEGATE_ACTION *r)
 {
-	TRY(pext->g_uint16(&r->count));
-	if (r->count == 0)
+	uint16_t count = 0;
+	TRY(pext->g_uint16(&count));
+	CLAMP16(count);
+	if (count == 0)
 		return pack_result::format;
-	CLAMP16(r->count);
+	r->count = count;
 	r->pblock = pext->anew<RECIPIENT_BLOCK>(r->count);
 	if (r->pblock == nullptr) {
 		r->count = 0;
@@ -1373,9 +1378,10 @@ static pack_result ext_buffer_pull_ext_reply_action(EXT_PULL *pext,
 
 
 static pack_result ext_buffer_pull_ext_recipient_block(EXT_PULL *pext,
-    EXT_RECIPIENT_BLOCK *r)
+    RECIPIENT_BLOCK *r)
 {
-	TRY(pext->g_uint8(&r->reserved));
+	uint8_t resv = 0;
+	TRY(pext->g_uint8(&resv));
 	TRY(pext->g_uint32(&r->count));
 	if (r->count == 0)
 		return pack_result::format;
@@ -1391,13 +1397,13 @@ static pack_result ext_buffer_pull_ext_recipient_block(EXT_PULL *pext,
 }
 
 static pack_result ext_buffer_pull_ext_forwarddelegate_action(EXT_PULL *pext,
-	EXT_FORWARDDELEGATE_ACTION *r)
+    FORWARDDELEGATE_ACTION *r)
 {
 	TRY(pext->g_uint32(&r->count));
 	if (r->count == 0)
 		return pack_result::format;
 	CLAMP32(r->count);
-	r->pblock = pext->anew<EXT_RECIPIENT_BLOCK>(r->count);
+	r->pblock = pext->anew<RECIPIENT_BLOCK>(r->count);
 	if (r->pblock == nullptr) {
 		r->count = 0;
 		return pack_result::alloc;
@@ -1442,10 +1448,10 @@ static pack_result ext_buffer_pull_ext_action_block(EXT_PULL *pext, EXT_ACTION_B
 		return pext->g_uint32(static_cast<uint32_t *>(r->pdata));
 	case OP_FORWARD:
 	case OP_DELEGATE:
-		r->pdata = pext->anew<EXT_FORWARDDELEGATE_ACTION>();
+		r->pdata = pext->anew<FORWARDDELEGATE_ACTION>();
 		if (r->pdata == nullptr)
 			return pack_result::alloc;
-		return ext_buffer_pull_ext_forwarddelegate_action(pext, static_cast<EXT_FORWARDDELEGATE_ACTION *>(r->pdata));
+		return ext_buffer_pull_ext_forwarddelegate_action(pext, static_cast<FORWARDDELEGATE_ACTION *>(r->pdata));
 	case OP_TAG:
 		r->pdata = pext->anew<TAGGED_PROPVAL>();
 		if (r->pdata == nullptr)
@@ -1588,107 +1594,6 @@ pack_result EXT_PULL::g_sortorder_set(SORTORDER_SET *r)
 	}
 	for (size_t i = 0; i < r->count; ++i)
 		TRY(g_sortorder(&r->psort[i]));
-	return pack_result::ok;
-}
-
-pack_result EXT_PULL::g_recipient_row(std::span<const proptag_t> tags, RECIPIENT_ROW *r)
-{
-	uint8_t type;
-	BOOL b_unicode;
-	
-	TRY(g_uint16(&r->flags));
-	type = r->flags & 0x0007;
-	b_unicode = FALSE;
-	if (r->flags & RECIPIENT_ROW_FLAG_UNICODE)
-		b_unicode = TRUE;
-	r->pprefix_used = NULL;
-	r->have_display_type = false;
-	r->px500dn = NULL;
-	if (RECIPIENT_ROW_TYPE_X500DN == type) {
-		r->pprefix_used = anew<uint8_t>();
-		if (r->pprefix_used == nullptr)
-			return pack_result::alloc;
-		TRY(g_uint8(r->pprefix_used));
-		TRY(g_uint8(&r->display_type));
-		r->have_display_type = true;
-		TRY(g_str(&r->px500dn));
-	}
-	r->pentry_id = NULL;
-	r->psearch_key = NULL;
-	if (RECIPIENT_ROW_TYPE_PERSONAL_DLIST1 == type ||
-		RECIPIENT_ROW_TYPE_PERSONAL_DLIST2 == type) {
-		r->pentry_id = anew<BINARY>();
-		if (r->pentry_id == nullptr)
-			return pack_result::alloc;
-		TRY(g_bin(r->pentry_id));
-		r->psearch_key = anew<BINARY>();
-		if (r->psearch_key == nullptr)
-			return pack_result::alloc;
-		TRY(g_bin(r->psearch_key));
-	}
-	r->paddress_type = NULL;
-	if (type == RECIPIENT_ROW_TYPE_NONE &&
-	    (r->flags & RECIPIENT_ROW_FLAG_OUTOFSTANDARD))
-		TRY(g_str(&r->paddress_type));
-	r->pmail_address = NULL;
-	if (RECIPIENT_ROW_FLAG_EMAIL & r->flags) {
-		if (b_unicode)
-			TRY(g_wstr(&r->pmail_address));
-		else
-			TRY(g_str(&r->pmail_address));
-	}
-	r->pdisplay_name = NULL;
-	if (r->flags & RECIPIENT_ROW_FLAG_DISPLAY) {
-		if (b_unicode)
-			TRY(g_wstr(&r->pdisplay_name));
-		else
-			TRY(g_str(&r->pdisplay_name));
-	}
-	r->psimple_name = NULL;
-	if (r->flags & RECIPIENT_ROW_FLAG_SIMPLE) {
-		if (b_unicode)
-			TRY(g_wstr(&r->psimple_name));
-		else
-			TRY(g_str(&r->psimple_name));
-	}
-	r->ptransmittable_name = NULL;
-	if (r->flags & RECIPIENT_ROW_FLAG_TRANSMITTABLE) {
-		if (b_unicode)
-			TRY(g_wstr(&r->ptransmittable_name));
-		else
-			TRY(g_str(&r->ptransmittable_name));
-	}
-	if (RECIPIENT_ROW_FLAG_SAME == r->flags) {
-		if (r->pdisplay_name == nullptr && r->ptransmittable_name != nullptr)
-			r->pdisplay_name = r->ptransmittable_name;
-		else if (r->pdisplay_name != nullptr && r->ptransmittable_name == nullptr)
-			r->ptransmittable_name = r->pdisplay_name;
-	}
-	TRY(g_uint16(&r->count));
-	if (r->count > tags.size())
-		return pack_result::format;
-	return g_proprow(tags.subspan(0, r->count), &r->properties);
-}
-
-pack_result EXT_PULL::g_modrcpt_row(std::span<const proptag_t> tags, MODIFYRECIPIENT_ROW *r)
-{
-	uint16_t row_size;
-	
-	TRY(g_uint32(&r->row_id));
-	TRY(g_uint8(&r->recipient_type));
-	TRY(g_uint16(&row_size));
-	if (row_size == 0) {
-		r->precipient_row = NULL;
-		return pack_result::ok;
-	}
-	uint32_t offset = m_offset + row_size;
-	r->precipient_row = anew<RECIPIENT_ROW>();
-	if (r->precipient_row == nullptr)
-		return pack_result::alloc;
-	TRY(g_recipient_row(tags, r->precipient_row));
-	if (m_offset > offset)
-		return pack_result::format;
-	m_offset = offset;
 	return pack_result::ok;
 }
 
@@ -2270,14 +2175,22 @@ pack_result EXT_PUSH::p_rpchdr(const RPC_HEADER_EXT &r)
 /* FALSE: overflow, TRUE: not overflow */
 bool EXT_PUSH::make_room(uint32_t extra_size)
 {
+	if (extra_size > UINT32_MAX - m_offset)
+		return false;
 	auto alloc_size = extra_size + m_offset;
 	if (m_alloc_size >= alloc_size)
 		return TRUE;
 	if (!(m_flags & EXT_FLAG_DYNAMIC))
 		return FALSE;
-	if (alloc_size < m_alloc_size * 2)
-		/* Exponential growth policy, needed to reach amortized linear time (like std::string) */
-		alloc_size = m_alloc_size * 2;
+	/*
+	 * If we can still double the capacity, do so. Exponential growth
+	 * policy is needed to reach amortized linear time (like std::string).
+	 */
+	if (m_alloc_size < UINT32_MAX / 2) {
+		auto doubled = m_alloc_size * 2;
+		if (alloc_size < doubled)
+			alloc_size = doubled;
+	}
 	auto pdata = static_cast<uint8_t *>(m_mgt.realloc(m_udata, alloc_size));
 	if (pdata == nullptr)
 		return FALSE;
@@ -2687,9 +2600,9 @@ static pack_result ext_buffer_push_reply_action(EXT_PUSH *pext,
 static pack_result ext_buffer_push_recipient_block(EXT_PUSH *pext,
     const RECIPIENT_BLOCK *r)
 {
-	if (r->count == 0)
+	if (r->count == 0 || r->count > UINT16_MAX)
 		return pack_result::format;
-	TRY(pext->p_uint8(r->reserved));
+	TRY(pext->p_uint8(0));
 	TRY(pext->p_uint16(r->count));
 	for (const auto &p : *r)
 		TRY(pext->p_tagged_pv(p));
@@ -2699,7 +2612,7 @@ static pack_result ext_buffer_push_recipient_block(EXT_PUSH *pext,
 static pack_result ext_buffer_push_forwarddelegate_action(EXT_PUSH *pext,
     const FORWARDDELEGATE_ACTION *r)
 {
-	if (r->count == 0)
+	if (r->count == 0 || r->count > UINT16_MAX)
 		return pack_result::format;
 	TRY(pext->p_uint16(r->count));
 	for (const auto &rcpt : *r)
@@ -3002,89 +2915,6 @@ pack_result EXT_PUSH::p_typed_str(const TYPED_STRING &r)
 	default:
 		return pack_result::bad_switch;
 	}
-}
-
-pack_result EXT_PUSH::p_recipient_row(std::span<const proptag_t> cols, const RECIPIENT_ROW &r)
-{
-	BOOL b_unicode;
-	
-	b_unicode = FALSE;
-	if (r.flags & RECIPIENT_ROW_FLAG_UNICODE)
-		b_unicode = TRUE;
-	TRY(p_uint16(r.flags));
-	if (r.pprefix_used != nullptr)
-		TRY(p_uint8(*r.pprefix_used));
-	if (r.have_display_type)
-		TRY(p_uint8(r.display_type));
-	if (r.px500dn != nullptr)
-		TRY(p_str(r.px500dn));
-	if (r.pentry_id != nullptr)
-		TRY(p_bin(*r.pentry_id));
-	if (r.psearch_key != nullptr)
-		TRY(p_bin(*r.psearch_key));
-	if (r.paddress_type != nullptr)
-		TRY(p_str(r.paddress_type));
-	if (r.pmail_address != nullptr) {
-		if (b_unicode)
-			TRY(p_wstr(r.pmail_address));
-		else
-			TRY(p_str(r.pmail_address));
-	}
-	if (r.pdisplay_name != nullptr) {
-		if (b_unicode)
-			TRY(p_wstr(r.pdisplay_name));
-		else
-			TRY(p_str(r.pdisplay_name));
-	}
-	if (r.psimple_name != nullptr) {
-		if (b_unicode)
-			TRY(p_wstr(r.psimple_name));
-		else
-			TRY(p_str(r.psimple_name));
-	}
-	if (r.ptransmittable_name != nullptr) {
-		if (b_unicode)
-			TRY(p_wstr(r.ptransmittable_name));
-		else
-			TRY(p_str(r.ptransmittable_name));
-	}
-	TRY(p_uint16(r.count));
-	if (r.count > cols.size())
-		return pack_result::format;
-	return p_proprow(cols, r.properties);
-}
-
-pack_result EXT_PUSH::p_openrecipient_row(std::span<const proptag_t> cols, const OPENRECIPIENT_ROW &r)
-{
-	TRY(p_uint8(r.recipient_type));
-	TRY(p_uint16(r.cpid));
-	TRY(p_uint16(r.reserved));
-	uint32_t offset = m_offset;
-	TRY(advance(sizeof(uint16_t)));
-	TRY(p_recipient_row(cols, r.recipient_row));
-	uint16_t row_size = m_offset - (offset + sizeof(uint16_t));
-	uint32_t offset1 = m_offset;
-	m_offset = offset;
-	TRY(p_uint16(row_size));
-	m_offset = offset1;
-	return pack_result::ok;
-}
-
-pack_result EXT_PUSH::p_readrecipient_row(std::span<const proptag_t> cols, const READRECIPIENT_ROW &r)
-{
-	TRY(p_uint32(r.row_id));
-	TRY(p_uint8(r.recipient_type));
-	TRY(p_uint16(r.cpid));
-	TRY(p_uint16(r.reserved));
-	uint32_t offset = m_offset;
-	TRY(advance(sizeof(uint16_t)));
-	TRY(p_recipient_row(cols, r.recipient_row));
-	uint16_t row_size = m_offset - (offset + sizeof(uint16_t));
-	uint32_t offset1 = m_offset;
-	m_offset = offset;
-	TRY(p_uint16(row_size));
-	m_offset = offset1;
-	return pack_result::ok;
 }
 
 pack_result EXT_PUSH::p_permission_data(const PERMISSION_DATA &r)

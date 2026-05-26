@@ -12,6 +12,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <typeinfo>
 #include <libHX/option.h>
 #include <libHX/scope.hpp>
 #include <gromox/atomic.hpp>
@@ -29,6 +30,7 @@ using namespace gromox;
 
 static constexpr HXoption g_options_table[] = {
 	{nullptr, 'c', HXTYPE_STRING, {}, {}, {}, 0, "Config file to read", "FILE"},
+	{nullptr, 'x', HXTYPE_STRING, {}, {}, {}, 0, "Single-user mode", "DIR"},
 	HXOPT_AUTOHELP,
 	HXOPT_TABLEEND,
 };
@@ -40,7 +42,7 @@ static constexpr cfg_directive gromox_cfg_defaults[] = {
 	{"istore_fd_limit", "0", CFG_SIZE},
 	{"istore_log_file", "-"},
 	{"istore_log_level", "4" /* LV_NOTICE */},
-	{"istore_standalone", "0", CFG_BOOL},
+	{"istore_standalone", "0"},
 	{"running_identity", RUNNING_IDENTITY},
 	CFG_TABLE_END,
 };
@@ -77,14 +79,18 @@ int main(int argc, char **argv)
 {
 	int retcode = EXIT_FAILURE;
 	HXopt6_auto_result argp;
+	const char *opt_single_user = nullptr;
 
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	if (HX_getopt6(g_options_table, argc, argv, &argp,
 	    HXOPT_USAGEONERR | HXOPT_ITER_OPTS) != HXOPT_ERR_SUCCESS)
 		return EXIT_FAILURE;
-	for (int i = 0; i < argp.nopts; ++i)
+	for (int i = 0; i < argp.nopts; ++i) {
 		if (argp.desc[i]->sh == 'c')
 			opt_config_file = argp.oarg[i];
+		else if (argp.desc[i]->sh == 'x')
+			opt_single_user = argp.oarg[i];
+	}
 
 	startup_banner("gromox-istore");
 	setup_signal_defaults();
@@ -108,9 +114,17 @@ int main(int argc, char **argv)
 	if (!istore_reload_config(g_config_file))
 		return EXIT_FAILURE;
 
-	if (cfg->get_ll("istore_standalone") <= 0) {
-		mlog(LV_NOTICE, "istore not enabled (gromox.cfg:istore_standalone). Quitting.");
+	std::string prog_id = "istore-director";
+	if (opt_single_user != nullptr) {
+		mlog(LV_NOTICE, "istore single-store mode for %s", opt_single_user);
+		prog_id = std::string("istore-worker:") + opt_single_user;
+		if (setenv("ISTORE_USER", opt_single_user, true) != 0)
+			return EXIT_FAILURE;
+	} else if (!(cfg->get_ll("istore_standalone") & ISTORE_SPLIT_DIRECTOR)) {
+		mlog(LV_NOTICE, "istore↔http separation not enabled (gromox.cfg:istore_standalone). Quitting.");
 		return 6; /* EXIT_NOTCONFIGURED */
+	} else {
+		unsetenv("ISTORE_USER");
 	}
 	auto str = cfg->get_value("host_id");
 	if (str == nullptr) {
@@ -124,7 +138,7 @@ int main(int argc, char **argv)
 	mlog(LV_INFO, "istore: host ID is \"%s\"", str);
 
 	filedes_limit_bump(cfg->get_ll("istore_fd_limit"));
-	service_init({cfg, g_dfl_svc_plugins, 1, "istore"});
+	service_init({cfg, g_dfl_svc_plugins, 1, prog_id.c_str(), argv[0]});
 	auto cl_0 = HX::make_scope_exit(service_stop);
 	if (service_run_early() != 0)
 		return EXIT_FAILURE;
@@ -137,13 +151,38 @@ int main(int argc, char **argv)
 	if (service_run() != 0)
 		return EXIT_FAILURE;
 	retcode = EXIT_SUCCESS;
+
+	bool is_worker = getenv("ISTORE_USER");
+	int (*exmdb_pickup_run)(int) = nullptr;
+	bool (*exmdb_pickup_running)() = nullptr;
+	void (*exmdb_pickup_stop)(void) = nullptr;
+	if (is_worker) {
+		exmdb_pickup_run     = reinterpret_cast<decltype(exmdb_pickup_run)>(service_query("exmdb_pickup_run", typeid(*exmdb_pickup_run)));
+		exmdb_pickup_running = reinterpret_cast<decltype(exmdb_pickup_running)>(service_query("exmdb_pickup_running", typeid(*exmdb_pickup_running)));
+		exmdb_pickup_stop    = reinterpret_cast<decltype(exmdb_pickup_stop)>(service_query("exmdb_pickup_stop", typeid(*exmdb_pickup_stop)));
+		if (exmdb_pickup_run == nullptr ||
+		    exmdb_pickup_running == nullptr ||
+		    exmdb_pickup_stop == nullptr) {
+			mlog(LV_ERR, "exmdb_pickup routines not found");
+			return EXIT_FAILURE;
+		}
+		if (exmdb_pickup_run(STDIN_FILENO) < 0)
+			return EXIT_FAILURE;
+	}
+	auto cl_1 = HX::make_scope_exit([&]() {
+		if (is_worker && exmdb_pickup_stop != nullptr)
+			exmdb_pickup_stop();
+	});
+
 	mlog(LV_INFO, "Information Store is running");
 	while (!g_istore_stop) {
-		sleep(86400); /* interrupts on signal */
+		sleep(1);
 		if (g_hup_signalled.exchange(false)) {
 			istore_reload_config();
 			service_trigger_all(PLUGIN_RELOAD);
 		}
+		if (is_worker && !exmdb_pickup_running())
+			break;
 	}
 	return retcode;
 }

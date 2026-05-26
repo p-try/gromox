@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <cerrno>
@@ -62,8 +62,7 @@ void hpm_processor_init(int context_num, std::span<const generic_module> names)
 	g_plugin_names = std::move(names);
 }
 
-static BOOL hpm_processor_register_interface(
-	HPM_INTERFACE *pinterface)
+static bool hpm_processor_register_interface(HPM_INTERFACE *pinterface)
 {
 	auto fn = g_cur_plugin->file_name;
 	if (NULL == pinterface->preproc) {
@@ -90,6 +89,11 @@ static BOOL hpm_processor_register_interface(
 
 static HTTP_REQUEST *hpm_processor_get_request(unsigned int context_id)
 {
+	/*
+	 * `context_id` is an index-based handle. Every `whatever[context_id]`
+	 * is de-jure owned by a different thread. A particular thread can
+	 * access the members of its HTTP_CONTEXT without locking.
+	 */
 	auto phttp = static_cast<HTTP_CONTEXT *>(http_parser_get_contexts_list()[context_id]);
 	return &phttp->request;
 }
@@ -124,34 +128,7 @@ static void hpm_processor_wakeup_context(unsigned int context_id)
 	contexts_pool_signal(phttp);
 }
 
-static void *hpm_processor_queryservice(const char *service, const char *rq,
-    const std::type_info &ti)
-{
-	void *ret_addr;
-
-	if (g_cur_plugin == nullptr)
-		return NULL;
-	/* check if already exists in the reference list */
-	for (const auto &nd : g_cur_plugin->list_reference)
-		if (nd.service_name == service)
-			return nd.service_addr;
-	auto fn = g_cur_plugin->file_name;
-	ret_addr = service_query(service, fn, ti);
-	if (ret_addr == nullptr)
-		return NULL;
-	try {
-		g_cur_plugin->list_reference.emplace_back(service_node{ret_addr, service});
-	} catch (const std::bad_alloc &) {
-		service_release(service, fn);
-		mlog(LV_ERR, "E-1636: ENOMEM");
-		return nullptr;
-	}
-	return ret_addr;
-}
-
-static constexpr struct dlfuncs server_funcs = {
-	/* .symget = */ hpm_processor_queryservice,
-	/* .symreg = */ service_register_service,
+static constexpr struct dlfuncs hpm_funcs = {
 	/* .get_config_path = */ []() {
 		auto r = g_config_file->get_value("config_file_path");
 		return r != nullptr ? r : PKGSYSCONFDIR;
@@ -162,7 +139,6 @@ static constexpr struct dlfuncs server_funcs = {
 	},
 	/* .get_context_num = */ []() { return g_context_num; },
 	/* .get_host_ID = */ []() { return g_config_file->get_value("host_id"); },
-	/* .get_prog_id = */ nullptr,
 	/* .ndr_stack_alloc = */ pdu_processor_ndr_stack_alloc,
 	/* .rpc_new_stack = */ pdu_processor_rpc_new_stack,
 	/* .rpc_free_stack = */ pdu_processor_rpc_free_stack,
@@ -195,16 +171,10 @@ HPM_PLUGIN::~HPM_PLUGIN()
 	PLUGIN_MAIN func;
 	auto pplugin = this;
 	if (pplugin->init_state == generic_module::state::init_done) {
-		if (pplugin->file_name != nullptr)
-			mlog(LV_INFO, "http_processor: unloading %s", pplugin->file_name);
 		func = (PLUGIN_MAIN)pplugin->lib_main;
 		if (func != nullptr)
-			func(PLUGIN_FREE, server_funcs);
+			func(PLUGIN_FREE, hpm_funcs);
 	}
-
-	/* free the reference list */
-	for (const auto &nd : list_reference)
-		service_release(nd.service_name.c_str(), pplugin->file_name);
 }
 
 static int hpm_processor_load_library(const generic_module &mod)
@@ -217,7 +187,7 @@ static int hpm_processor_load_library(const generic_module &mod)
 	g_cur_plugin = &g_plugin_list.back();
     /* invoke the plugin's main function with the parameter of PLUGIN_INIT */
 	g_cur_plugin->init_state = generic_module::state::init_start;
-	if (!g_cur_plugin->lib_main(PLUGIN_INIT, server_funcs) ||
+	if (!g_cur_plugin->lib_main(PLUGIN_INIT, hpm_funcs) ||
 	    g_cur_plugin->interface.preproc == nullptr ||
 	    g_cur_plugin->interface.proc == nullptr ||
 	    g_cur_plugin->interface.retr == nullptr) {
@@ -510,7 +480,7 @@ void hpm_processor_trigger(enum plugin_op ev)
 {
 	for (auto &p : g_plugin_list) {
 		g_cur_plugin = &p;
-		p.lib_main(ev, server_funcs);
+		p.lib_main(ev, hpm_funcs);
 	}
 	g_cur_plugin = nullptr;
 }

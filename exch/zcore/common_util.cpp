@@ -116,7 +116,8 @@ bool cu_extract_delegator(message_object *pmessage, std::string &username)
 	static constexpr proptag_t proptag_buff[] =
 		{PR_SENT_REPRESENTING_ADDRTYPE, PR_SENT_REPRESENTING_EMAIL_ADDRESS,
 		PR_SENT_REPRESENTING_SMTP_ADDRESS, PR_SENT_REPRESENTING_ENTRYID};
-	if (!pmessage->get_properties(proptag_buff, &tmp_propvals))
+	auto err = pmessage->get_properties(proptag_buff, &tmp_propvals);
+	if (err != ecSuccess)
 		return FALSE;	
 	if (0 == tmp_propvals.count) {
 		username.clear();
@@ -266,7 +267,7 @@ BOOL common_util_essdn_to_uid(const char *pessdn, int *puid)
 	if (strncasecmp(pessdn, tmp_essdn, tmp_len) != 0 ||
 	    pessdn[tmp_len+16] != '-')
 		return FALSE;
-	*puid = decode_hex_int(pessdn + tmp_len + 8);
+	*puid = eight_LE_hexchars_to_int(&pessdn[tmp_len+8]);
 	return TRUE;
 }
 
@@ -279,8 +280,8 @@ BOOL common_util_essdn_to_ids(const char *pessdn,
 	if (strncasecmp(pessdn, tmp_essdn, tmp_len) != 0 ||
 	    pessdn[tmp_len+16] != '-')
 		return FALSE;
-	*pdomain_id = decode_hex_int(pessdn + tmp_len);
-	*puser_id = decode_hex_int(pessdn + tmp_len + 8);
+	*pdomain_id = eight_LE_hexchars_to_int(&pessdn[tmp_len]);
+	*puser_id   = eight_LE_hexchars_to_int(&pessdn[tmp_len+8]);
 	return TRUE;	
 }
 
@@ -1121,7 +1122,8 @@ ec_error_t cu_send_message(store_object *pstore, message_object *msg,
 					continue;
 				TAGGED_PROPVAL tp  = {tag, deconst(th)};
 				TPROPVAL_ARRAY tpa = {1, &tp};
-				if (!msg->set_properties(&tpa))
+				auto err = msg->set_properties(&tpa);
+				if (err != ecSuccess)
 					break;
 				/* Unclear if permitted to save (specs say nothing) */
 				msg->save();
@@ -1854,7 +1856,8 @@ BOOL common_util_message_to_vcf(message_object *pmessage, BINARY *pvcf_bin)
 	if (pvcf_bin->pv == nullptr)
 		return FALSE;
 	memcpy(pvcf_bin->pv, vcf_out.c_str(), vcf_out.size());
-	if (!pmessage->write_message(*pmsgctnt))
+	auto err = pmessage->write_message(*pmsgctnt);
+	if (err != ecSuccess)
 		/* ignore */;
 	return TRUE;
 }

@@ -93,11 +93,11 @@ struct rowdel_node {
 }
 
 static size_t g_table_size; /* hash table size */
-static unsigned int g_threads_num;
+static unsigned int g_sfpop_thrmax, g_exmdb_par_shutdown;
 static gromox::atomic_bool g_dbeng_stop; /* stop signal for scanning thread */
 static pthread_t g_scan_tid;
 static gromox::time_duration g_cache_interval; /* maximum living interval in table */
-static std::vector<pthread_t> g_thread_ids;
+static std::vector<pthread_t> g_sfpop_thrids;
 static std::mutex g_list_lock, g_hash_lock, g_maint_lock;
 static std::condition_variable g_waken_cond, g_maint_cv, g_maint_ref_cv;
 static std::unordered_map<std::string, db_base> g_hash_table; /* protected by g_hash_lock */
@@ -105,11 +105,11 @@ static std::unordered_map<std::string, db_maint_mode> g_maint_table; /* protecte
 /* List of queued searchcriteria, and list of searchcriteria evaluated right now */
 static std::list<POPULATING_NODE> g_populating_list, g_populating_list_active;
 static std::optional<std::counting_semaphore<>> g_autoupg_limiter;
-unsigned int g_exmdb_schema_upgrades, g_exmdb_search_pacing;
-unsigned long long g_exmdb_search_pacing_time = 2000000000;
-unsigned int g_exmdb_search_yield, g_exmdb_search_nice;
-unsigned int g_exmdb_pvt_folder_softdel, g_exmdb_max_sqlite_spares;
-unsigned long long g_sqlite_busy_timeout_ns;
+std::atomic<unsigned int> g_exmdb_schema_upgrades, g_exmdb_search_pacing;
+std::atomic<unsigned long long> g_exmdb_search_pacing_time = 2000000000;
+std::atomic<unsigned int> g_exmdb_search_yield, g_exmdb_search_nice;
+std::atomic<unsigned int> g_exmdb_pvt_folder_softdel, g_exmdb_max_sqlite_spares;
+std::atomic<unsigned long long> g_sqlite_busy_timeout_ns;
 std::string exmdb_eph_prefix;
 
 static bool dbase_is_purgable(const db_base &, time_point);
@@ -238,7 +238,7 @@ bool db_engine_set_maint(const char *path, enum db_maint_mode mode) try
  * Iff this function returns a non-null pointer, then pdb->psqlite and
  * pdb->m_sqlite_eph are also guaranteed to be viable.
  */
-db_conn_ptr db_engine_get_db(const char *path)
+std::optional<db_conn> db_engine_get_db(const char *path)
 {
 	if (*path == '\0')
 		return std::nullopt;
@@ -259,8 +259,8 @@ db_conn_ptr db_engine_get_db(const char *path)
 	auto it = g_hash_table.find(path);
 	if (it != g_hash_table.end()) {
 		pdb = &it->second;
-		db_conn_ptr conn(*pdb);
-		hhold.unlock();
+		std::optional<db_conn> conn(*pdb);
+		hhold.unlock(); /* The iterator is potentially invalid now */
 		if (!conn->open(path))
 			return std::nullopt;
 		if (getenv("SQLITE_WORKER") == nullptr)
@@ -271,7 +271,7 @@ db_conn_ptr db_engine_get_db(const char *path)
 			return conn;
 		conn.reset();
 		hhold.lock();
-		g_hash_table.erase(it);
+		g_hash_table.erase(path);
 	}
 	if (g_hash_table.size() >= g_table_size) {
 		hhold.unlock();
@@ -302,7 +302,7 @@ db_conn_ptr db_engine_get_db(const char *path)
 		return std::nullopt;
 	}
 
-	db_conn_ptr conn(*pdb);
+	std::optional<db_conn> conn(*pdb);
 	if (!conn->open(path))
 		return std::nullopt;
 	return conn;
@@ -825,9 +825,15 @@ static void *db_expiry_thread(void *param)
 		 * enough to establish absence of other readers (and there
 		 * ought to be no new ones, since we also hold g_hash_lock).
 		 */
-		std::erase_if(g_hash_table, [=](const decltype(g_hash_table)::value_type &iter) {
+		auto z = std::erase_if(g_hash_table, [=](const decltype(g_hash_table)::value_type &iter) {
 			return dbase_is_purgable(iter.second, now_time);
 		});
+		if (z > 0 && g_istore_standalone & ISTORE_SPLIT_WORKERS &&
+		    g_hash_table.empty()) {
+			g_exmdbpickup_wanttoend = true;
+			std::unique_lock lk(g_exmdbpickup_tlock);
+			pthread_kill(g_exmdbpickup_tid, SIGALRM);
+		}
 	}
 	return nullptr;
 }
@@ -1085,14 +1091,16 @@ static void *sf_popul_thread(void *param)
 	return nullptr;
 }
 
-void db_engine_init(size_t table_size, int cache_interval, unsigned int threads_num)
+void db_engine_init(size_t table_size, int cache_interval, unsigned int sfpop_max,
+    unsigned int par_upg, unsigned int par_shut)
 {
 	g_dbeng_stop = true;
 	g_table_size = table_size;
 	g_cache_interval = std::chrono::seconds{cache_interval};
-	g_threads_num = threads_num;
-	g_thread_ids.reserve(g_threads_num);
-	g_autoupg_limiter.emplace(threads_num);
+	g_sfpop_thrmax = sfpop_max;
+	g_sfpop_thrids.reserve(sfpop_max);
+	g_exmdb_par_shutdown = par_shut;
+	g_autoupg_limiter.emplace(par_upg);
 }
 
 int db_engine_run()
@@ -1114,7 +1122,7 @@ int db_engine_run()
 		mlog(LV_ERR, "exmdb_provider: failed to create db scan thread: %s", strerror(ret));
 		return -4;
 	}
-	for (unsigned int i = 0; i < g_threads_num; ++i) {
+	for (unsigned int i = 0; i < g_sfpop_thrmax; ++i) {
 		pthread_t tid;
 		ret = pthread_create4(&tid, nullptr, sf_popul_thread, nullptr);
 		if (ret != 0) {
@@ -1125,7 +1133,7 @@ int db_engine_run()
 		char buf[32];
 		snprintf(buf, sizeof(buf), "sfpop/%u", i);
 		pthread_setname_np(tid, buf);
-		g_thread_ids.push_back(tid);
+		g_sfpop_thrids.push_back(tid);
 	}
 	return 0;
 }
@@ -1144,7 +1152,7 @@ void db_engine_stop()
 	if (!g_dbeng_stop) {
 		g_dbeng_stop = true;
 		g_waken_cond.notify_all();
-		for (auto tid : g_thread_ids) {
+		for (auto tid : g_sfpop_thrids) {
 			pthread_kill(tid, SIGALRM);
 			pthread_join(tid, nullptr);
 		}
@@ -1153,7 +1161,7 @@ void db_engine_stop()
 			pthread_join(g_scan_tid, NULL);
 		}
 	}
-	g_thread_ids.clear();
+	g_sfpop_thrids.clear();
 	/*
 	 * This is db_engine_stop. We know we are single threaded and do not
 	 * really need to hold any locks.
@@ -1163,7 +1171,7 @@ void db_engine_stop()
 	 */
 	{
 		auto t_start = tp_now();
-		size_t conc = std::min(gx_concurrency(), g_threads_num);
+		size_t conc = std::min(gx_concurrency(), g_exmdb_par_shutdown);
 		std::vector<std::future<void>> futs;
 		/*
 		 * cov-scan may complain here about missing locks, but this is
@@ -3968,7 +3976,22 @@ void db_conn::notify_folder_modification(uint64_t parent_id, uint64_t folder_id,
 		auto pmodified_folder = &datagram.db_notify;
 		pmodified_folder->folder_id = folder_id;
 		pmodified_folder->parent_id = parent_id;
+		pmodified_folder->have_total = false;
+		pmodified_folder->have_unread = false;
 		pmodified_folder->proptags.count = 0;
+
+		void *val = nullptr;
+		if (cu_get_property(MAPI_FOLDER, folder_id, CP_ACP, *pdb,
+		    PR_CONTENT_COUNT, &val) && val != nullptr) {
+			pmodified_folder->total = *static_cast<const uint32_t *>(val);
+			pmodified_folder->have_total = true;
+		}
+		val = nullptr;
+		if (cu_get_property(MAPI_FOLDER, folder_id, CP_ACP, *pdb,
+		    PR_CONTENT_UNREAD, &val) && val != nullptr) {
+			pmodified_folder->unread = *static_cast<const uint32_t *>(val);
+			pmodified_folder->have_unread = true;
+		}
 		notifq.emplace_back(std::move(datagram), std::move(parrays));
 	}
 	dbeng_notify_hiertbl_modify_row(*pdb, parent_id, folder_id, dbase, notifq);
@@ -4098,7 +4121,8 @@ void db_conn::begin_batch_mode(db_base &dbase)
 	dbase.tables.b_batch = true;
 }
 
-void db_conn::commit_batch_mode_release(db_conn_ptr &&pdb, db_base_wr_ptr &&dbase)
+void db_conn::commit_batch_mode_release(std::optional<db_conn> &&pdb,
+    db_base_wr_ptr &&dbase)
 {
 	auto table_num = dbase->tables.table_list.size();
 	auto ptable_ids = table_num > 0 ? cu_alloc<uint32_t>(table_num) : nullptr;

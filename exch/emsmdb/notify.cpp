@@ -60,9 +60,10 @@ subscription_object::~subscription_object()
 	emsmdb_interface_remove_subscription_notify(psub->plogon->get_dir(), psub->sub_id);
 }
 
-notify_response *notify_response::create(uint32_t handle, uint8_t logon_id) try
+std::unique_ptr<notify_response>
+notify_response::create(uint32_t handle, uint8_t logon_id) try
 {
-	auto r = new notify_response{};
+	auto r = std::make_unique<notify_response>();
 	r->handle = handle;
 	r->logon_id = logon_id;
 	return r;
@@ -184,16 +185,14 @@ static ec_error_t cvt_fld_modified(notify_response &n,
 {
 	n.nflags    = fnevObjectModified;
 	n.folder_id = rop_util_nfid_to_eid(x.folder_id);
-#if 0
-	if (x.ptotal != nullptr) {
+	if (x.have_total) {
 		n.nflags |= NF_HAS_TOTAL;
-		n.total_count = *x.ptotal;
+		n.total_count = x.total;
 	}
-	if (x.punread != nullptr) {
+	if (x.have_unread) {
 		n.nflags |= NF_HAS_UNREAD;
-		n.unread_count = *x.punread;
+		n.unread_count = x.unread;
 	}
-#endif
 	return copy_tags(n, x.proptags);
 }
 
@@ -530,10 +529,10 @@ ec_error_t rop_registernotification(uint8_t notification_types, uint8_t reserved
 	uint64_t folder_id;
 	uint64_t message_id;
 
-	auto plogon = rop_processor_get_logon_object(plogmap, logon_id);
+	auto plogon = plogmap->get_logon_object(logon_id);
 	if (plogon == nullptr)
 		return ecNullObject;
-	if (rop_processor_get_object(plogmap, logon_id, hin, &object_type) == nullptr)
+	if (plogmap->get_object(logon_id, hin, &object_type) == nullptr)
 		return ecNullObject;
 	if (0 == want_whole_store) {
 		b_whole = FALSE;
@@ -549,8 +548,8 @@ ec_error_t rop_registernotification(uint8_t notification_types, uint8_t reserved
 	if (psub == nullptr)
 		return ecServerOOM;
 	auto rsub = psub.get();
-	auto hnd = rop_processor_add_object_handle(plogmap,
-	           logon_id, hin, {ems_objtype::subscription, std::move(psub)});
+	auto hnd = plogmap->add_object_handle(logon_id, hin,
+	           {ems_objtype::subscription, std::move(psub)});
 	if (hnd < 0)
 		return aoh_to_error(hnd);
 	rsub->set_handle(hnd);
@@ -560,5 +559,5 @@ ec_error_t rop_registernotification(uint8_t notification_types, uint8_t reserved
 
 void rop_release(LOGMAP *plogmap, uint8_t logon_id, uint32_t hin)
 {
-	rop_processor_release_object_handle(plogmap, logon_id, hin);
+	plogmap->release_object_handle(logon_id, hin);
 }

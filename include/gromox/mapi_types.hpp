@@ -75,18 +75,6 @@ struct GX_EXPORT EXT_REPLY_ACTION {
 #define BOUNCE_CODE_MESSAGE_NOT_DISPLAYED			0x0000001f
 #define BOUNCE_CODE_MESSAGE_DENIED					0x00000026
 
-struct GX_EXPORT EXT_RECIPIENT_BLOCK {
-	uint8_t reserved = 0;
-	uint32_t count = 0;
-	TAGGED_PROPVAL *ppropval = nullptr;
-};
-
-struct GX_EXPORT EXT_FORWARDDELEGATE_ACTION {
-	uint32_t count = 0;
-	EXT_RECIPIENT_BLOCK *pblock = nullptr;
-	I_BEGIN_END(pblock, count);
-};
-
 enum { /* ACTION_BLOCK::flavor for OP_FORWARD */
 	FWD_PRESERVE_SENDER = 0x1U,
 	FWD_DO_NOT_MUNGE_MSG = 0x2U,
@@ -260,16 +248,6 @@ struct GX_EXPORT EMSAB_ENTRYID {
 #define DAYOFWEEK_FRIDAY							0x5
 #define DAYOFWEEK_SATURDAY							0x6
 
-struct GX_EXPORT LOGON_TIME {
-	uint8_t second = 0, minute = 0, hour = 0, day_of_week = 0, day = 0, month = 0;
-	uint16_t year = 0;
-};
-
-struct GX_EXPORT GHOST_SERVER {
-	uint16_t server_count = 0, cheap_server_count = 0;
-	char **ppservers = nullptr;
-};
-
 #define RECIPIENT_ROW_FLAG_RESPONSIBLE				0x0080
 #define RECIPIENT_ROW_FLAG_SAME						0x0040
 #define RECIPIENT_ROW_FLAG_TRANSMITTABLE			0x0020
@@ -288,37 +266,6 @@ struct GX_EXPORT GHOST_SERVER {
 #define RECIPIENT_ROW_TYPE_OFFICE_SYSTEM			0x5
 #define RECIPIENT_ROW_TYPE_PERSONAL_DLIST1			0x6
 #define RECIPIENT_ROW_TYPE_PERSONAL_DLIST2			0x7
-
-struct GX_EXPORT RECIPIENT_ROW {
-	uint8_t *pprefix_used = nullptr;
-	char *px500dn = nullptr;
-	BINARY *pentry_id = nullptr, *psearch_key = nullptr;
-	char *paddress_type = nullptr, *pmail_address = nullptr;
-	char *pdisplay_name = nullptr, *psimple_name = nullptr;
-	char *ptransmittable_name = nullptr;
-	uint8_t have_display_type = false, display_type = 0;
-	uint16_t flags = 0, count = 0;
-	PROPERTY_ROW properties{};
-};
-
-struct GX_EXPORT OPENRECIPIENT_ROW {
-	uint8_t recipient_type = 0;
-	uint16_t cpid = 0, reserved = 0;
-	RECIPIENT_ROW recipient_row{};
-};
-
-struct GX_EXPORT MODIFYRECIPIENT_ROW {
-	uint32_t row_id = 0;
-	uint8_t recipient_type = 0;
-	RECIPIENT_ROW *precipient_row{};
-};
-
-struct GX_EXPORT READRECIPIENT_ROW {
-	uint32_t row_id = 0;
-	uint8_t recipient_type = 0;
-	uint16_t cpid = 0, reserved = 0;
-	RECIPIENT_ROW recipient_row{};
-};
 
 struct GX_EXPORT PERMISSION_DATA {
 	uint8_t flags = 0;

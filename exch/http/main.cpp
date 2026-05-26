@@ -81,7 +81,7 @@ static constexpr cfg_directive gromox_cfg_defaults[] = {
 	{"http_basic_auth_cred_caching", "1min", CFG_TIME_NS},
 	{"http_fd_limit", "0", CFG_SIZE},
 	{"http_remote_host_hdr", ""},
-	{"istore_standalone", "0", CFG_BOOL},
+	{"istore_standalone", "0"},
 	CFG_TABLE_END,
 };
 
@@ -295,20 +295,20 @@ int main(int argc, char **argv)
 
 	const char *program_identifier = "http";
 	auto istore_standalone = gxconfig->get_ll("istore_standalone");
-	if (istore_standalone) {
+	if (istore_standalone & ISTORE_SPLIT_DIRECTOR) {
 		/*
 		 * The module is loaded in both cases, because http still needs
 		 * the exmdb_client portion of libgxs_exmdb_provider.
 		 */
-		mlog(LV_INFO, "Information Store is set to external with EXRPC access");
+		mlog(LV_INFO, "Information Store is in another process; using RPCs");
 	} else {
-		program_identifier = "istore";
+		program_identifier = "istore-director";
 		mlog(LV_INFO, "Information Store is set to run in this process image with LPC");
 	}
 
 	filedes_limit_bump(gxconfig->get_ll("http_fd_limit"));
 	service_init({g_config_file, g_dfl_svc_plugins,
-		context_num, program_identifier});
+		context_num, program_identifier, argv[0]});
 	auto cleanup_6 = HX::make_scope_exit(service_stop);
 	if (!service_register_service("ndr_stack_alloc",
 	    reinterpret_cast<void *>(pdu_processor_ndr_stack_alloc),
@@ -330,7 +330,6 @@ int main(int argc, char **argv)
 	if (iconv_validate() != 0)
 		return EXIT_FAILURE;
 	textmaps_init();
-	auto cleanup_8 = HX::make_scope_exit(system_services_stop);
 	if (0 != system_services_run()) { 
 		mlog(LV_ERR, "system: failed to run system services");
 		return EXIT_FAILURE;

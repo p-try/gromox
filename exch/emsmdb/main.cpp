@@ -63,7 +63,7 @@ static constexpr cfg_directive emsmdb_cfg_defaults[] = {
 	{"ems_max_active_users", "0", CFG_SIZE, "0"},
 	{"ems_max_pending_sesnotif", "64K", CFG_SIZE, "0"},
 	{"emsmdb_max_cxh_per_user", "100", CFG_SIZE, "100"},
-	{"emsmdb_max_obh_per_session", "500", CFG_SIZE, "500"},
+	{"emsmdb_max_obh_per_session", "32768", CFG_SIZE, "2G"},
 	{"emsmdb_private_folder_softdelete", "1", CFG_BOOL},
 	{"emsmdb_rop_chaining", "1"},
 	{"mailbox_ping_interval", "5min", CFG_TIME, "60s", "1h"},
@@ -130,7 +130,7 @@ static constexpr DCERPC_INTERFACE interface_async_emsmdb = {
 };
 
 extern void emsmdb_report();
-BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
+bool PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 {
 	int max_rcpt;
 	int async_num;
@@ -246,10 +246,6 @@ BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 			mlog(LV_ERR, "emsmdb: failed to run asyncemsmdb interface");
 			return FALSE;
 		}
-		if (0 != rop_processor_run()) {
-			mlog(LV_ERR, "emsmdb: failed to run rop processor");
-			return FALSE;
-		}
 		return TRUE;
 	}
 	case PLUGIN_QUENCH_ASYNC:
@@ -261,7 +257,6 @@ BOOL PROC_exchange_emsmdb(enum plugin_op reason, const struct dlfuncs &ppdata)
 	case PLUGIN_FREE:
 		asyncemsmdb_interface_stop();
 		emsmdb_interface_stop();
-		rop_processor_stop();
 		asyncemsmdb_interface_free();
 		exmdb_client.reset();
 		return TRUE;
@@ -298,7 +293,7 @@ static int exchange_emsmdb_dispatch(unsigned int opnum, const GUID *pobject,
 	}
 	case ecDummyRpc: {
 		auto out = std::make_unique<ECDUMMYRPC_OUT>();
-		out->result = emsmdb_interface_dummy_rpc(handle);
+		out->result = ecSuccess;
 		*ecode = out->result;
 		ppout = std::move(out);
 		return DISPATCH_SUCCESS;
@@ -354,7 +349,6 @@ static int exchange_emsmdb_dispatch(unsigned int opnum, const GUID *pobject,
 
 static void exchange_emsmdb_unbind(uint64_t handle)
 {
-	emsmdb_interface_unbind_rpc_handle(handle);
 }
 
 static int exchange_async_emsmdb_dispatch(unsigned int opnum,

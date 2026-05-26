@@ -14,6 +14,7 @@
 #include <memory>
 #include <pthread.h>
 #include <sched.h>
+#include <spawn.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -34,6 +35,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #ifdef __sun
 #	include <sys/lwp.h>
 #endif
@@ -45,18 +47,26 @@
 #	include <sys/thr.h>
 #	include <sys/types.h>
 #endif
+#include <libHX/endian.h>
 #include <libHX/io.h>
 #include <libHX/proc.h>
+#include <libHX/scope.hpp>
 #include <libHX/socket.h>
 #include <libHX/string.h>
 #include <gromox/clock.hpp>
+#include <gromox/fileio.h>
 #include <gromox/generic_connection.hpp>
 #include <gromox/listener_ctx.hpp>
 #include <gromox/poll_ctx.hpp>
 #include <gromox/process.hpp>
+#include <gromox/socketpass.hpp>
 #include <gromox/util.hpp>
 
 using namespace gromox;
+
+extern "C" {
+extern char **environ;
+}
 
 namespace gromox {
 
@@ -680,15 +690,237 @@ int haproxy_intervene(int fd, unsigned int level, struct sockaddr_storage *ss)
 	return -1;
 }
 
+/**
+ * Returns >0 if the process was started.
+ * 0 is not returned.
+ * Returns <0 to signal an error. (Negative errno returned. /
+ * Global errno itself is not guaranteed to be set.)
+ */
+int socketpass_worker::start_raw(const char *prog, char **argv)
+{
+	posix_spawn_file_actions_t fa{};
+	auto ret = posix_spawn_file_actions_init(&fa);
+	if (ret != 0)
+		return -ret;
+	auto cl_actions = HX::make_scope_exit([&]() { posix_spawn_file_actions_destroy(&fa); });
+
+	int skfd[2]{-1, -1};
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, skfd) != 0)
+		return -errno;
+	auto cl_pair = HX::make_scope_exit([&]() {
+		if (skfd[0] >= 0)
+			close(skfd[0]);
+		if (skfd[1] >= 0)
+			close(skfd[1]);
+	});
+
+	ret = posix_spawn_file_actions_addclose(&fa, skfd[1]);
+	if (ret != 0)
+		return -ret;
+	if (skfd[0] != STDIN_FILENO) {
+		ret = posix_spawn_file_actions_adddup2(&fa, skfd[0], STDIN_FILENO);
+		if (ret != 0)
+			return -ret;
+		ret = posix_spawn_file_actions_addclose(&fa, skfd[0]);
+		if (ret != 0)
+			return -ret;
+	}
+
+	ret = posix_spawnp(&m_pid, prog, &fa, nullptr, argv, environ);
+	if (ret != 0)
+		return -ret;
+	cl_pair.release();
+	close(skfd[0]);
+	m_channel = skfd[1];
+	return 1;
 }
+
+/**
+ * Returns >0 if the process was started.
+ * Returns 0 if the process was already alive.
+ * Returns <0 to signal an error.
+ */
+int socketpass_worker::start(const char *prog, char **argv)
+{
+	if (running())
+		return 0;
+	stop();
+	return start_raw(prog, argv);
+}
+
+int socketpass_worker::restart(const char *prog, char **argv)
+{
+	stop();
+	return start_raw(prog, argv);
+}
+
+int socketpass_worker::stop()
+{
+	if (m_channel >= 0) {
+		close(m_channel);
+		m_channel = -1;
+	}
+	if (m_pid > 0) {
+		kill(m_pid, SIGTERM);
+		int status = 0;
+		waitpid(m_pid, &status, 0);
+		m_pid = -1;
+		return status;
+	}
+	return 0;
+}
+
+/**
+ * Returns an indication whether the subprocess is still considered running
+ * after attempting its potential collection.
+ */
+bool socketpass_worker::running()
+{
+	if (m_pid < 0)
+		return false;
+	int status = 0;
+	/* 0: still alive, <0: no child, >0: just reaped */
+	auto pid = waitpid(m_pid, &status, WNOHANG);
+	if (pid == 0)
+		return true;
+	if (pid < 0)
+		return false; /* no child */
+	/* just reaped */
+	if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+		mlog(LV_NOTICE, "socketpass worker %d terminated with exit status %d",
+			m_pid, WEXITSTATUS(status));
+	if (WIFSIGNALED(status))
+		mlog(LV_NOTICE, "socketpass worker %d terminated by signal %d",
+			m_pid, WTERMSIG(status));
+	m_pid = -1;
+	return false;
+}
+
+errno_t socketpass_worker::pass(std::string_view buffer, int fd_pass) const
+{
+	/*
+	 * SEQPACKET sockets have a caveat that the payload can't be overly
+	 * large else sendmsg() will return EMSGSIZE. For our usecases that
+	 * should be ok, because socketpass is only used with exmdb and that
+	 * only passes a buffer with a exmdb_callid::{connect,
+	 * listen_notification}, never e.g. exmdb_callid::write_message.
+	 */
+	uint32_t pktlen = buffer.size();
+	struct iovec iov;
+	iov.iov_base = &pktlen;
+	iov.iov_len  = sizeof(pktlen);
+	alignas(struct cmsghdr) char cbuf[CMSG_SPACE(sizeof(fd_pass))];
+	struct msghdr msg{};
+	msg.msg_iov        = &iov;
+	msg.msg_iovlen     = 1;
+	msg.msg_control    = cbuf;
+	msg.msg_controllen = std::size(cbuf);
+	auto cmsg        = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type  = SCM_RIGHTS;
+	cmsg->cmsg_len   = CMSG_LEN(sizeof(fd_pass));
+	memcpy(CMSG_DATA(cmsg), &fd_pass, sizeof(fd_pass));
+	if (sendmsg(m_channel, &msg, MSG_NOSIGNAL) < 0)
+		return errno;
+
+	iov.iov_base = deconst(buffer.data());
+	iov.iov_len  = pktlen;
+	msg.msg_control    = nullptr;
+	msg.msg_controllen = 0;
+	if (sendmsg(m_channel, &msg, MSG_NOSIGNAL) < 0)
+		return errno;
+
+	return 0;
+}
+
+/**
+ * @channel:   AF_UNIX contorl channel
+ * @pkt:       replay of the first packet (e.g. a CONNECT or LISTEN_NOTIFICATION)
+ * @client_fd: the client file descriptor
+ */
+errno_t socketpass_receive(int channel, std::string &pkt, int &client_fd) try
+{
+	uint32_t pktlen = 0;
+	struct iovec iov;
+	iov.iov_base    = &pktlen;
+	iov.iov_len     = sizeof(pktlen);
+	char cbuf[CMSG_SPACE(sizeof(int))]{};
+	struct msghdr msg{};
+	msg.msg_iov        = &iov;
+	msg.msg_iovlen     = 1;
+	msg.msg_control    = cbuf;
+	msg.msg_controllen = std::size(cbuf);
+
+	client_fd = -1;
+	auto read_len = recvmsg(channel, &msg, 0);
+	if (read_len == 0)
+		return ENOENT; /* eof */
+	if (read_len < 0) {
+		errno_t se = errno;
+		if (se != EINTR && se != EAGAIN)
+			mlog(LV_ERR, "%s: recvmsg.1: %s", __PRETTY_FUNCTION__, strerror(se));
+		return se;
+	}
+
+	wrapfd received_fd;
+	for (auto cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+	     cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+		if (cmsg->cmsg_level != SOL_SOCKET ||
+		    cmsg->cmsg_type != SCM_RIGHTS ||
+		    cmsg->cmsg_len != CMSG_LEN(sizeof(client_fd)))
+			continue;
+		int fd = -1;
+		memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+		received_fd = wrapfd(fd);
+		/*
+		 * Keep looping, we need to process all control messages.
+		 * Just on the odd chance someone is sending more than one fd.
+		 * (The use of wrapfd ensures all the unused ones get closed.)
+		 */
+	}
+	msg.msg_control = nullptr;
+	msg.msg_controllen = 0;
+	if (received_fd.get() < 0) {
+		/* No fd received, ditch rest */
+		if (recvmsg(channel, &msg, 0) < 0) {
+			errno_t se = errno;
+			mlog(LV_ERR, "%s: recvmsg.2: %s", __PRETTY_FUNCTION__, strerror(se));
+			return se;
+		}
+		return 0;
+	}
+
+	read_len = std::min(le32p_to_cpu(&pktlen), UINT32_MAX);
+	pkt.resize(read_len);
+	iov.iov_base = pkt.data();
+	iov.iov_len  = pkt.size();
+	read_len = recvmsg(channel, &msg, 0);
+	if (read_len == 0)
+		return ENOENT; /* eof */
+	if (read_len < 0) {
+		errno_t se = errno;
+		mlog(LV_ERR, "%s: recvmsg.3: %s", __PRETTY_FUNCTION__, strerror(se));
+		return se;
+	}
+	pkt.resize(read_len);
+	client_fd = received_fd.release();
+	return 0;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "%s: ENOMEM", __func__);
+	return ENOMEM;
+}
+
+} /* namespace gromox */
 
 generic_connection::generic_connection(generic_connection &&o) :
 	client_port(o.client_port), server_port(o.server_port),
+	proxy_port(o.proxy_port),
 	sockd(std::move(o.sockd)), mark(std::move(o.mark)), ssl(std::move(o.ssl)),
 	last_timestamp(o.last_timestamp)
 {
 	memcpy(client_addr, o.client_addr, sizeof(client_addr));
 	memcpy(server_addr, o.server_addr, sizeof(server_addr));
+	memcpy(proxy_addr, o.proxy_addr, sizeof(proxy_addr));
 	o.sockd = -1;
 	o.ssl = nullptr;
 }
@@ -697,10 +929,13 @@ generic_connection &generic_connection::operator=(generic_connection &&o)
 {
 	if (this == &o)
 		return *this;
+	reset();
 	memcpy(client_addr, o.client_addr, sizeof(client_addr));
 	memcpy(server_addr, o.server_addr, sizeof(server_addr));
+	memcpy(proxy_addr, o.proxy_addr, sizeof(proxy_addr));
 	client_port = o.client_port;
 	server_port = o.server_port;
+	proxy_port = o.proxy_port;
 	sockd = std::move(o.sockd);
 	o.sockd = -1;
 	mark = std::move(o.mark);
@@ -708,6 +943,51 @@ generic_connection &generic_connection::operator=(generic_connection &&o)
 	o.ssl = nullptr;
 	last_timestamp = o.last_timestamp;
 	return *this;
+}
+
+generic_connection generic_connection::takeover(int cl_sock)
+{
+	generic_connection conn;
+	conn.sockd = std::move(cl_sock);
+	struct sockaddr_storage sv_addr, cl_addr;
+	socklen_t addrlen = sizeof(cl_addr);
+	auto ret = getpeername(conn.sockd, reinterpret_cast<sockaddr *>(&cl_addr),
+	           &addrlen);
+	if (ret != 0) {
+		mlog(LV_WARN, "getpeername: %s\n", gai_strerror(ret));
+		conn.reset();
+		return conn;
+	}
+	/* no call to haproxy — the socket may already be through all those init stages */
+
+	char txtport[40];
+	ret = getnameinfo(reinterpret_cast<sockaddr *>(&cl_addr), addrlen,
+	      conn.client_addr, sizeof(conn.client_addr), txtport,
+	      sizeof(txtport), NI_NUMERICHOST | NI_NUMERICSERV);
+	if (ret != 0) {
+		mlog(LV_WARN, "getnameinfo: %s\n", gai_strerror(ret));
+		conn.reset();
+		return conn;
+	}
+	conn.client_port = strtoul(txtport, nullptr, 0);
+	addrlen = sizeof(sv_addr);
+	ret = getsockname(conn.sockd, reinterpret_cast<sockaddr *>(&sv_addr), &addrlen);
+	if (ret != 0) {
+		mlog(LV_WARN, "getsockname: %s\n", strerror(errno));
+		conn.reset();
+		return conn;
+	}
+	ret = getnameinfo(reinterpret_cast<sockaddr *>(&sv_addr), addrlen,
+	      conn.server_addr, sizeof(conn.server_addr), txtport,
+	      sizeof(txtport), NI_NUMERICHOST | NI_NUMERICSERV);
+	if (ret != 0) {
+		mlog(LV_WARN, "getnameinfo: %s\n", gai_strerror(ret));
+		conn.reset();
+		return conn;
+	}
+	conn.server_port = strtoul(txtport, nullptr, 0);
+	conn.last_timestamp = tp_now();
+	return conn;
 }
 
 generic_connection generic_connection::accept(int sv_sock,

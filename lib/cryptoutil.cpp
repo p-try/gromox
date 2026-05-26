@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later, OR GPL-2.0-or-later WITH linking exception
-// SPDX-FileCopyrightText: 2021-2022 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <cstdint>
 #include <cstring>
@@ -58,7 +58,7 @@ void tls_set_renego(SSL_CTX *ctx)
 	SSL_CTX_set_dh_auto(ctx, true);
 }
 
-std::string sss_obf_reverse(const std::string_view &x)
+std::string sss_obf_reverse(std::string_view x)
 {
 	std::string out;
 	auto z = x.size();
@@ -76,7 +76,7 @@ std::string sss_obf_reverse(const std::string_view &x)
 	if (cipher == nullptr ||
 	    !EVP_DecryptInit_ex(ctx.get(), cipher, nullptr, CU(&x[4]), CU(&x[36])))
 		return out;
-	out.resize(x.size() - 56);
+	out.resize(x.size() - 56 + EVP_MAX_BLOCK_LENGTH);
 	int plainlen = 0, digestlen = 0;
 	if (!EVP_DecryptUpdate(ctx.get(), U(&out[0]), &plainlen,
 	    CU(&x[52]), x.size() - 56) ||

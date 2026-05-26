@@ -1,13 +1,10 @@
 #pragma once
-#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <shared_mutex>
 #include <string>
 #include <thread>
-#include <type_traits>
 #include <unordered_map>
 #include <variant>
 #include <gromox/clock.hpp>
@@ -159,26 +156,26 @@ class GX_EXPORT ab_base {
 		iterator() = default;
 
 		iterator(const ab_base *b, const std::vector<ab_domain>::const_iterator &i) :
-			m_base(b), it(i)
+			m_root(b), it(i)
 		{
-			if (i != m_base->m_domains.cend())
+			if (i != m_root->m_domains.cend())
 				mid = minid(minid::domain, i->id);
 			else
 				mid = 0;
 		}
 
 		iterator(const ab_base *b, const std::vector<sql_user>::const_iterator &i) :
-			m_base(b), it(i)
+			m_root(b), it(i)
 		{
-			if (i != m_base->m_users.cend())
+			if (i != m_root->m_users.cend())
 				mid = minid(minid::address, i->id);
 			else
 				mid = 0;
 		}
 
-		constexpr bool operator==(const iterator &o) const { return m_base == o.m_base && it == o.it; }
+		constexpr bool operator==(const iterator &o) const { return m_root == o.m_root && it == o.it; }
 		constexpr auto operator<=>(const iterator &o) const {
-			auto c = m_base <=> o.m_base;
+			auto c = m_root <=> o.m_root;
 			if (c != 0)
 				return c;
 			c = it.index() <=> o.it.index();
@@ -205,14 +202,14 @@ class GX_EXPORT ab_base {
 		inline const minid &operator*() const { return mid; }
 		inline const minid *operator->() const { return &mid; }
 
-		inline const ab_base *base() const { return m_base; }
+		inline const ab_base *root() const { return m_root; }
 		size_t pos() const;
 
 		private:
 		using domain_it = std::vector<ab_domain>::const_iterator;
 		using user_it = std::vector<sql_user>::const_iterator;
 
-		const ab_base *m_base = nullptr;
+		const ab_base *m_root = nullptr;
 		std::variant<domain_it, user_it> it;
 		minid mid; ///< cached minid to allow returning references and pointers
 	};
@@ -305,7 +302,6 @@ class GX_EXPORT ab {
 
 	const_base_ref get(int32_t base_id);
 	inline const_base_ref get(const GUID &guid) { return get(base_id(guid)); }
-	void drop(int32_t base_id);
 
 	bool run();
 	void stop();
@@ -325,7 +321,6 @@ class GX_EXPORT ab {
 	std::unordered_map<int32_t, std::shared_ptr<ab_base>> m_base_hash;
 
 	std::thread worker; ///< Worker thread removing expired bases
-	std::deque<int> worker_queue; ///< Queue of base IDs to be flushed
 	std::condition_variable worker_signal; ///< Wake-up signal for the worker thread
 	std::atomic<int> running = 0; ///< Number of plugins that are using the address book
 
@@ -341,17 +336,17 @@ extern GX_EXPORT class ab AB;
 struct GX_EXPORT ab_node {
 	public:
 	ab_node() = default;
-	ab_node(const ab::const_base_ref &br, minid m) : base(br.get()), mid(m) {}
-	ab_node(const ab_base *b, minid m) : base(b), mid(m) {}
-	ab_node(const ab_base::iterator &it) : base(it.base()), mid(*it) {}
+	ab_node(const ab::const_base_ref &br, minid m) : root(br.get()), mid(m) {}
+	ab_node(const ab_base *b, minid m) : root(b), mid(m) {}
+	ab_node(const ab_base::iterator &it) : root(it.root()), mid(*it) {}
 
-	const ab_base *base = nullptr;
+	const ab_base *root = nullptr;
 	minid mid{};
 
 	#define WRAP(FUNC) \
 		template<typename... Args> \
 		inline auto FUNC(Args &&...args) const \
-		{ return base->FUNC(mid, std::forward<Args>(args)...); }
+		{ return root->FUNC(mid, std::forward<Args>(args)...); }
 
 	WRAP(aliases)
 	WRAP(children_count)
@@ -375,13 +370,12 @@ struct GX_EXPORT ab_node {
 	#undef WRAP
 
 	inline GUID guid() const { return GUID(mid); }
-	inline uint32_t hidden() const { return base->hidden(mid); }
-	inline bool valid() const { return base && base->exists(mid); }
+	inline uint32_t hidden() const { return root->hidden(mid); }
+	inline bool valid() const { return root != nullptr && root->exists(mid); }
 
 	using iterator = decltype(ab_domain::userref)::const_iterator;
 	iterator begin() const;
 	iterator end() const;
-	inline iterator find(minid) const { return mid.type() == minid::address ? std::find(begin(), end(), mid) : end(); }
 	inline minid at(uint32_t idx) const { return idx < children_count() ? this->operator[](idx) : minid(); }
 	minid operator[](uint32_t) const;
 };

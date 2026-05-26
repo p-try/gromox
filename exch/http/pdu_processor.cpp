@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <atomic>
@@ -99,13 +99,11 @@ class interface_eq {
 
 }
 
-static void *pdu_processor_queryservice(const char *, const char *, const std::type_info &);
 static DCERPC_INFO pdu_processor_get_rpc_info();
 static uint64_t pdu_processor_get_binding_handle();
-static void *pdu_processor_queryservice(const char *, const char *, const std::type_info &);
 
 unsigned int g_msrpc_debug;
-static BOOL g_bigendian;
+static bool g_bigendian;
 static unsigned int g_connection_num;
 static char g_dns_name[128];
 static BOOL g_header_signing;
@@ -186,7 +184,7 @@ void pdu_processor_init(int connection_num, const char *netbios_name,
     } e;
 
 	e.i = 0xFF000000;
-	g_bigendian = e.c[0] != 0 ? TRUE : false;
+	g_bigendian = e.c[0] != 0;
 	g_last_async_id = 0;
 	g_connection_ratio = connection_ratio;
 	g_connection_num = connection_num;
@@ -1595,7 +1593,7 @@ static void pdu_processor_cancel_async_id(uint32_t async_id)
 
 /* to check if the async_id is still available and
    then lock the async_id in async hash table */
-static BOOL pdu_processor_rpc_build_environment(int async_id)
+static bool pdu_processor_rpc_build_environment(int async_id)
 {
  BUILD_BEGIN:
 	std::unique_lock as_hold(g_async_lock);
@@ -1621,7 +1619,7 @@ static BOOL pdu_processor_rpc_build_environment(int async_id)
 }
 
 /* only can be invoked in non-rpc thread */
-BOOL pdu_processor_rpc_new_stack()
+bool pdu_processor_rpc_new_stack()
 {
 	NDR_STACK_ROOT *pstack_root;
 	
@@ -2810,7 +2808,7 @@ static DCERPC_ENDPOINT* pdu_processor_register_endpoint(const char *host,
 	return nullptr;
 }
 
-static BOOL pdu_processor_register_interface(DCERPC_ENDPOINT *pendpoint,
+static bool pdu_processor_register_interface(DCERPC_ENDPOINT *pendpoint,
     const DCERPC_INTERFACE *pinterface)
 {
 	if (NULL == pinterface->ndr_pull) {
@@ -2851,9 +2849,7 @@ static void pdu_processor_unregister_interface(DCERPC_ENDPOINT *ep,
 	lst.remove_if(interface_eq(tp->uuid, tp->version));
 }
 
-static constexpr struct dlfuncs server_funcs = {
-	/* .symget = */ pdu_processor_queryservice,
-	/* .symreg = */ service_register_service,
+static constexpr struct dlfuncs pdu_funcs = {
 	/* .get_config_path = */ []() {
 		auto r = g_config_file->get_value("config_file_path");
 		return r != nullptr ? r : PKGSYSCONFDIR;
@@ -2864,7 +2860,6 @@ static constexpr struct dlfuncs server_funcs = {
 	},
 	/* .get_context_num = */ []() { return g_connection_num; },
 	/* .get_host_ID = */ []() { return g_config_file->get_value("host_id"); },
-	/* .get_prog_id = */ nullptr,
 	/* .ndr_stack_alloc = */ pdu_processor_ndr_stack_alloc,
 	/* .rpc_new_stack = */ pdu_processor_rpc_new_stack,
 	/* .rpc_free_stack = */ pdu_processor_rpc_free_stack,
@@ -2875,7 +2870,7 @@ static constexpr struct dlfuncs server_funcs = {
 	pdu_processor_unregister_interface,
 	pdu_processor_get_binding_handle,
 	pdu_processor_get_rpc_info,
-	/* .rpc_is_bigendian = */ []() -> BOOL {
+	/* .rpc_is_bigendian = */ []() -> bool {
 		auto c = pdu_processor_get_call();
 		return c != nullptr ? c->b_bigendian : g_bigendian;
 	},
@@ -2893,14 +2888,10 @@ PROC_PLUGIN::~PROC_PLUGIN()
 	auto pplugin = this;
 	
 	if (pplugin->init_state == generic_module::state::init_done) {
-		if (pplugin->file_name != nullptr)
-			mlog(LV_INFO, "pdu_processor: unloading %s", pplugin->file_name);
 		func = (PLUGIN_MAIN)pplugin->lib_main;
 		if (func != nullptr)
-			func(PLUGIN_FREE, server_funcs);
+			func(PLUGIN_FREE, pdu_funcs);
 	}
-	for (const auto &nd : list_reference)
-		service_release(nd.service_name.c_str(), pplugin->file_name);
 }
 
 /* this function can also be invoked from hpm_plugins,
@@ -2953,30 +2944,6 @@ static uint64_t pdu_processor_get_binding_handle()
 	return 0;
 }
 
-static void *pdu_processor_queryservice(const char *service, const char *rq,
-    const std::type_info &ti)
-{
-	void *ret_addr;
-
-	if (g_cur_plugin == nullptr)
-		return NULL;
-	/* check if already exists in the reference list */
-	for (const auto &nd : g_cur_plugin->list_reference)
-		if (nd.service_name == service)
-			return nd.service_addr;
-	auto fn = g_cur_plugin->file_name;
-	ret_addr = service_query(service, fn, ti);
-	if (ret_addr == nullptr)
-		return NULL;
-	try {
-		g_cur_plugin->list_reference.emplace_back(service_node{ret_addr, service});
-	} catch (const std::bad_alloc &) {
-		service_release(service, fn);
-		return NULL;
-	}
-	return ret_addr;
-}
-
 /*
  *	load the hook plugin
  *	@param
@@ -3001,7 +2968,7 @@ static int pdu_processor_load_library(const generic_module &mod)
 	/* append the pendpoint node into endpoint list */
     /* invoke the plugin's main function with the parameter of PLUGIN_INIT */
 	g_cur_plugin->init_state = generic_module::state::init_start;
-	if (!g_cur_plugin->lib_main(PLUGIN_INIT, server_funcs)) {
+	if (!g_cur_plugin->lib_main(PLUGIN_INIT, pdu_funcs)) {
 		mlog(LV_ERR, "pdu_processor: error executing the plugin's init "
 			"function in %s", g_cur_plugin->file_name);
 		g_plugin_list.pop_back();
@@ -3017,7 +2984,7 @@ void pdu_processor_trigger(enum plugin_op ev)
 {
 	for (auto &p : g_plugin_list) {
 		g_cur_plugin = &p;
-		p.lib_main(ev, server_funcs);
+		p.lib_main(ev, pdu_funcs);
 	}
 	g_cur_plugin = nullptr;
 }

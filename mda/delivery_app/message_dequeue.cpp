@@ -360,7 +360,20 @@ static void message_dequeue_load_from_mess(int mess) try
 	/* check if it is an incomplete message */
 	if (le64p_to_cpu(ptr.get()) == 0) {
 		message_dequeue_put_to_free(pmessage);
-		return;	
+		return;
+	}
+	/*
+	 * mail_length comes from the spool file. Validate that the
+	 * subsequent flush_ID/bound_type/envelope offsets stay within
+	 * the bytes we actually read.
+	 */
+	size_t mail_length;
+	memcpy(&mail_length, ptr.get(), sizeof(mail_length));
+	if (mail_length > static_cast<size_t>(rdret) ||
+	    sizeof(size_t) + mail_length + 3 * sizeof(uint32_t) >
+	    static_cast<size_t>(rdret)) {
+		message_dequeue_put_to_free(pmessage);
+		return;
 	}
 	message_dequeue_retrieve_to_message(pmessage, std::move(ptr));
 	message_dequeue_put_to_used(pmessage);
@@ -466,26 +479,25 @@ errno_t message_dequeue_save(MESSAGE *pmessage)
 			return errno;
 		return 0;
 	}
-	int fd = open(new_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, FMODE_PRIVATE);
-	if (fd < 0) {
+	wrapfd fd = open(new_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, FMODE_PRIVATE);
+	if (fd.get() < 0) {
 		int se = errno;
 		mlog(LV_ERR, "mdq: opening %s for write: %s",
 		       new_file.c_str(), strerror(se));
 		return errno = se;
 	}
 	auto z = pmessage->mail_length + 4 * sizeof(uint32_t);
-	if (HXio_fullwrite(fd, pmessage->begin_address, z) < 0)
+	if (HXio_fullwrite(fd.get(), pmessage->begin_address, z) < 0)
 		return -9999;
 	auto len = strlen(pmessage->envelope_from);
-	if (HXio_fullwrite(fd, pmessage->envelope_from, len + 1) < 0)
+	if (HXio_fullwrite(fd.get(), pmessage->envelope_from, len + 1) < 0)
 		return -9999;
 	ptr = pmessage->envelope_rcpt;
 	while ((len = strlen(ptr)) != 0) {
 		len++;
-		if (HXio_fullwrite(fd, ptr, len) < 0)
+		if (HXio_fullwrite(fd.get(), ptr, len) < 0)
 			return -9999;
 		ptr += len;
 	}
-	close(fd);
 	return 0;
 }

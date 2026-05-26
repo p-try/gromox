@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sqlite3.h>
 #include <string>
@@ -241,14 +242,13 @@ struct db_conn {
 	private:
 	db_base *m_base = nullptr;
 };
-using db_conn_ptr = std::optional<db_conn>;
 
-extern void db_engine_init(size_t table_size, int cache_interval, unsigned int threads_num);
+extern void db_engine_init(size_t table_size, int cache_interval, unsigned int sfpop_max, unsigned int par_upg, unsigned int par_shut);
 extern int db_engine_run();
 extern void db_engine_stop();
 
 extern bool db_engine_set_maint(const char *path, enum db_maint_mode);
-extern db_conn_ptr db_engine_get_db(const char *dir);
+extern std::optional<db_conn> db_engine_get_db(const char *dir);
 extern BOOL db_engine_vacuum(const char *path);
 extern BOOL db_engine_cgkreset(const char *dir, uint32_t flags);
 BOOL db_engine_unload_db(const char *path);
@@ -256,11 +256,11 @@ extern bool db_engine_enqueue_populating_criteria(const char *dir, cpid_t, uint6
 extern bool db_engine_check_populating(const char *dir, uint64_t folder_id);
 extern void dg_notify(db_conn::NOTIFQ &&);
 
-extern unsigned int g_exmdb_schema_upgrades, g_exmdb_search_pacing;
-extern unsigned long long g_exmdb_search_pacing_time, g_exmdb_lock_timeout;
-extern unsigned int g_exmdb_search_yield, g_exmdb_search_nice;
-extern unsigned int g_exmdb_pvt_folder_softdel;
+extern std::atomic<unsigned int> g_exmdb_schema_upgrades, g_exmdb_search_pacing;
+extern std::atomic<unsigned long long> g_exmdb_search_pacing_time, g_exmdb_lock_timeout;
+extern std::atomic<unsigned int> g_exmdb_search_yield, g_exmdb_search_nice;
+extern std::atomic<unsigned int> g_exmdb_pvt_folder_softdel;
 extern std::string g_exmdb_ics_log_file, exmdb_eph_prefix;
 /* Max number of cached DB connections per store, 0 = unlimited */
-extern unsigned int g_exmdb_max_sqlite_spares;
-extern unsigned long long g_sqlite_busy_timeout_ns;
+extern std::atomic<unsigned int> g_exmdb_max_sqlite_spares;
+extern std::atomic<unsigned long long> g_sqlite_busy_timeout_ns;

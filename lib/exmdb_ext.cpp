@@ -44,14 +44,12 @@ static inline pack_result exmdb_push(EXT_PUSH &, const exresp &) { return pack_r
 
 static pack_result exmdb_pull(EXT_PULL &x, exreq_connect &d)
 {
-	TRY(x.g_str(&d.prefix));
 	TRY(x.g_str(&d.remote_id));
 	return x.g_bool(&d.b_private);
 }
 
 static pack_result exmdb_push(EXT_PUSH &x, const exreq_connect &d)
 {
-	TRY(x.p_str(d.prefix));
 	TRY(x.p_str(d.remote_id));
 	return x.p_bool(d.b_private);
 }
@@ -2224,25 +2222,11 @@ pack_result exmdb_ext_pull_request(std::string_view pbin_in,
 {
 	EXT_PULL ext_pull;
 	uint8_t raw_call_id;
+	char *dir = nullptr;
 	
 	ext_pull.init(pbin_in.data(), pbin_in.size(), exmdb_rpc_alloc, EXT_FLAG_WCOUNT);
 	TRY(ext_pull.g_uint8(&raw_call_id));
 	auto call_id = static_cast<exmdb_callid>(raw_call_id);
-	if (call_id == exmdb_callid::connect) {
-		auto r = std::make_unique<exreq_connect>();
-		auto xret = exmdb_pull(ext_pull, *r);
-		prequest = std::move(r);
-		prequest->call_id = call_id;
-		return xret;
-	} else if (call_id == exmdb_callid::listen_notification) {
-		auto r = std::make_unique<exreq_listen_notification>();
-		auto xret = exmdb_pull(ext_pull, *r);
-		prequest = std::move(r);
-		prequest->call_id = call_id;
-		return xret;
-	}
-
-	char *dir = nullptr;
 	TRY(ext_pull.g_str(&dir));
 	pack_result xret = pack_result::bad_callid;
 
@@ -2283,14 +2267,9 @@ pack_result exmdb_ext_push_request(const exreq *prequest, BINARY *pbin_out)
 	status = ext_push.p_uint8(static_cast<uint8_t>(prequest->call_id));
 	if (status != pack_result::ok)
 		return status;
-	if (prequest->call_id == exmdb_callid::connect) {
-		status = exmdb_push(ext_push, *static_cast<const exreq_connect *>(prequest));
-	} else if (prequest->call_id == exmdb_callid::listen_notification) {
-		status = exmdb_push(ext_push, *static_cast<const exreq_listen_notification *>(prequest));
-	} else {
-		status = ext_push.p_str(prequest->dir);
-		if (status != pack_result::ok)
-			return status;
+	status = ext_push.p_str(prequest->dir);
+	if (status != pack_result::ok)
+		return status;
 
 #define EDEF(t, id) case exmdb_callid::t: status = exmdb_push(ext_push, *static_cast<const exreq_ ## t::view_t *>(prequest)); break;
 #define EOBSOL(t, id)
@@ -2304,7 +2283,7 @@ pack_result exmdb_ext_push_request(const exreq *prequest, BINARY *pbin_out)
 
 #undef EDEF
 #undef EOBSOL
-	}
+
 	if (status != pack_result::ok)
 		return status;
 	pbin_out->cb = ext_push.m_offset;
@@ -3578,6 +3557,10 @@ pack_result exmdb_ext_pull_db_notify(std::string_view pbin_in,
 		TRY(ext_pull.g_uint64(&n.after_row_id));
 		TRY(ext_pull.g_uint64(&n.after_instance));
 		TRY(ext_pull.g_uint32(&n.message_flags));
+		TRY(ext_pull.g_uint32(&n.total));
+		TRY(ext_pull.g_uint32(&n.unread));
+		TRY(ext_pull.g_uint8(&n.have_total));
+		TRY(ext_pull.g_uint8(&n.have_unread));
 		TRY(ext_pull.g_str(&n.pmessage_class));
 		TRY(ext_pull.g_proptag_a(&n.proptags));
 		return pack_result::success;
@@ -3620,6 +3603,10 @@ static pack_result exmdb_ext_push_db_notify2(EXT_PUSH &ext_push,
 		TRY(ext_push.p_uint64(n.after_row_id));
 		TRY(ext_push.p_uint64(n.after_instance));
 		TRY(ext_push.p_uint32(n.message_flags));
+		TRY(ext_push.p_uint32(n.total));
+		TRY(ext_push.p_uint32(n.unread));
+		TRY(ext_push.p_uint8(n.have_total));
+		TRY(ext_push.p_uint8(n.have_unread));
 		TRY(ext_push.p_str(n.pmessage_class));
 		TRY(ext_push.p_proptag_a(n.proptags));
 		break;

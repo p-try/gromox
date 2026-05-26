@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only WITH linking exception
-// SPDX-FileCopyrightText: 2021–2025 grommunio GmbH
+// SPDX-FileCopyrightText: 2021–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
 #include <atomic>
@@ -15,6 +15,7 @@
 #include <mutex>
 #include <poll.h>
 #include <pthread.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unistd.h>
@@ -155,7 +156,7 @@ static bool midb_agent_reload(std::shared_ptr<CONFIG_FILE> &&cfg)
 	return true;
 }
 
-BOOL SVC_midb_agent(enum plugin_op reason, const struct dlfuncs &ppdata)
+bool SVC_midb_agent(enum plugin_op reason, const struct dlfuncs &ppdata)
 {
 	switch(reason) {
 	case PLUGIN_RELOAD:
@@ -512,7 +513,7 @@ int delete_mail(const char *path, const std::string &folder,
 }
 
 int search(const char *path, const std::string &folder,
-    const char *charset, int argc, char **argv, std::string &ret_buff,
+    const char *charset, std::span<std::string> argv, std::string &ret_buff,
     int *perrno) try
 {
 	size_t encode_len;
@@ -526,9 +527,9 @@ int search(const char *path, const std::string &folder,
 	auto length = gx_snprintf(buff.get(), cbufsize,
 	              "P-SRHL %s %s %s ", path, folder.c_str(), charset);
 	int length1 = 0;
-	for (int i = 0; i < argc; ++i)
+	for (const auto &elem : argv)
 		length1 += gx_snprintf(&buff1[length1], cbufsize - length1,
-					"%s", argv[i]) + 1;
+					"%s", elem.c_str()) + 1;
 	buff1[length1++] = '\0';
 	encode64(buff1.get(), length1, &buff[length], cbufsize - length,
 		&encode_len);
@@ -561,7 +562,7 @@ int search(const char *path, const std::string &folder,
 }
 
 int search_uid(const char *path, const std::string &folder,
-   const char *charset, int argc, char **argv, std::string &ret_buff,
+   const char *charset, std::span<std::string> argv, std::string &ret_buff,
    int *perrno) try
 {
 	size_t encode_len;
@@ -575,9 +576,9 @@ int search_uid(const char *path, const std::string &folder,
 	auto length = gx_snprintf(buff.get(), cbufsize,
 	              "P-SRHU %s %s %s ", path, folder.c_str(), charset);
 	int length1 = 0;
-	for (int i = 0; i < argc; ++i)
+	for (const auto &elem : argv)
 		length1 += gx_snprintf(&buff1[length1], cbufsize - length1,
-					"%s", argv[i]) + 1;
+					"%s", elem.c_str()) + 1;
 	buff1[length1++] = '\0';
 	encode64(buff1.get(), length1, &buff[length], cbufsize - length,
 		&encode_len);
