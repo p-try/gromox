@@ -93,7 +93,8 @@ struct rowdel_node {
 }
 
 static size_t g_table_size; /* hash table size */
-static unsigned int g_sfpop_thrmax, g_exmdb_par_shutdown;
+static unsigned int g_sfpop_thrmax;
+unsigned int g_exmdb_par_shutdown;
 static gromox::atomic_bool g_dbeng_stop; /* stop signal for scanning thread */
 static pthread_t g_scan_tid;
 static gromox::time_duration g_cache_interval; /* maximum living interval in table */
@@ -259,6 +260,7 @@ std::optional<db_conn> db_engine_get_db(const char *path)
 	auto it = g_hash_table.find(path);
 	if (it != g_hash_table.end()) {
 		pdb = &it->second;
+		pdb->last_time = tp_now();
 		std::optional<db_conn> conn(*pdb);
 		hhold.unlock(); /* The iterator is potentially invalid now */
 		if (!conn->open(path))
@@ -280,6 +282,7 @@ std::optional<db_conn> db_engine_get_db(const char *path)
 	}
 	try {
 		auto xp = g_hash_table.try_emplace(path);
+		g_dbengine_wanttoend = false;
 		pdb = &xp.first->second;
 	} catch (const std::bad_alloc &) {
 		hhold.unlock();
@@ -830,9 +833,10 @@ static void *db_expiry_thread(void *param)
 		});
 		if (z > 0 && g_istore_standalone & ISTORE_SPLIT_WORKERS &&
 		    g_hash_table.empty()) {
-			g_exmdbpickup_wanttoend = true;
+			g_dbengine_wanttoend = true;
 			std::unique_lock lk(g_exmdbpickup_tlock);
-			pthread_kill(g_exmdbpickup_tid, SIGALRM);
+			if (!pthread_equal(g_exmdbpickup_tid, {}))
+				pthread_kill(g_exmdbpickup_tid, SIGALRM);
 		}
 	}
 	return nullptr;

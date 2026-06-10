@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <netdb.h>
@@ -42,6 +43,7 @@
 #include <gromox/socketpass.hpp>
 #include <gromox/svc_loader.hpp>
 #include <gromox/util.hpp>
+#include "db_engine.hpp"
 #include "notification_agent.hpp"
 #include "parser.hpp"
 #ifndef AI_V4MAPPED
@@ -73,10 +75,11 @@ static std::mutex g_router_lock, g_connection_lock;
 static gromox::atomic_bool g_exmdblisten_stop, g_exmdbpickup_running;
 static std::vector<std::string> g_acl_list;
 static listener_ctx exmdb_listen_ctx;
-std::atomic<unsigned int> g_enable_dam, g_istore_standalone, g_exmdbpickup_wanttoend;
+std::atomic<unsigned int> g_enable_dam, g_istore_standalone, g_dbengine_wanttoend;
 std::string g_host_id;
 pthread_t g_exmdbpickup_tid;
 std::mutex g_exmdbpickup_tlock;
+static pthread_t g_spzclean_tid;
 
 parser_thread::parser_thread(generic_connection &&co) :
 	generic_connection(std::move(co))
@@ -731,6 +734,26 @@ int exmdb_listener_init(const config_file &gxcfg, const config_file &oldcfg)
 	return 0;
 }
 
+static void *spwz_cleaner(void *)
+{
+	/*
+	 * SIGCHLD is not guaranteed to be queued; i.e. there may be coalescing
+	 * and multiple children exiting might only lead to generation of a
+	 * single signal event. One approach would be to drain the waiting
+	 * queue `while(waitpid(-1, nullptr, WNOHANG) > 0){}`, but that runs
+	 * afoul of collecting unrelated children [e.g. from rtftohtml]. So we
+	 * will have to periodically loop over a list of PIDs known to us.
+	 */
+	pthread_setname_np(pthread_self(), "spwz_clean");
+	while (!g_exmdblisten_stop) {
+		sleep(60);
+		std::lock_guard lk(spwork_lock);
+		for (auto &e : spworkers)
+			e.second.maybe_reap();
+	}
+	return nullptr;
+}
+
 int exmdb_listener_run(const char *config_path, const config_file &oldcfg)
 {
 	auto ret = exmdb_acl_read(config_path, oldcfg.get_value("exmdb_hosts_allow"));
@@ -744,13 +767,37 @@ int exmdb_listener_run(const char *config_path, const config_file &oldcfg)
 		mlog(LV_ERR, "exmdb_provider: failed to create exmdb listener thread: %s", strerror(err));
 		return -1;
 	}
+	err = pthread_create(&g_spzclean_tid, nullptr, spwz_cleaner, nullptr);
+	if (err != 0) {
+		mlog(LV_ERR, "pthread_create spzclean: %s", strerror(err));
+		exmdb_listen_ctx.reset();
+		return -1;
+	}
 	return 0;
+}
+
+static void spw_clean()
+{
+	while (true) {
+		decltype(spworkers.extract(spworkers.begin())) wnode;
+		std::lock_guard lk(spwork_lock);
+		if (spworkers.empty())
+			return;
+		wnode = spworkers.extract(spworkers.begin());
+	}
 }
 
 void exmdb_listener_stop()
 {
 	g_exmdblisten_stop = true;
+	if (!pthread_equal(g_spzclean_tid, {})) {
+		pthread_kill(g_spzclean_tid, SIGALRM);
+		pthread_join(g_spzclean_tid, nullptr);
+	}
 	exmdb_listen_ctx.reset();
+	std::vector<std::future<void>> futs;
+	for (size_t i = 0; i < g_exmdb_par_shutdown; ++i)
+		futs.emplace_back(std::async(spw_clean));
 }
 
 static int exmdb_pickup_one(int control_fd)
@@ -762,7 +809,7 @@ static int exmdb_pickup_one(int control_fd)
 		return 0;
 	if (ern != 0)
 		return -1;
-	g_exmdbpickup_wanttoend = false;
+	g_dbengine_wanttoend = false;
 	par->conn = std::make_shared<exmdb_connection>(generic_connection::takeover(std::move(client_fd)));
 	if (par->conn->sockd < 0)
 		return 0;
@@ -778,6 +825,12 @@ static int exmdb_pickup_one(int control_fd)
 	return 0;
 }
 
+static size_t routers_active()
+{
+	std::lock_guard lk(g_router_lock);
+	return g_router_list.size();
+}
+
 static void *exmdb_pickup_loop(void *arg)
 {
 	pthread_setname_np(pthread_self(), "exmdb_pickup");
@@ -786,7 +839,7 @@ static void *exmdb_pickup_loop(void *arg)
 		auto status = exmdb_pickup_one(STDIN_FILENO);
 		if (status < 0)
 			break; /* havetoend */
-		if (status == 0 && g_exmdbpickup_wanttoend)
+		if (status == 0 && g_dbengine_wanttoend && !routers_active())
 			break;
 	}
 	g_exmdbpickup_running = false;
