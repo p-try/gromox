@@ -87,12 +87,15 @@ struct content_array final : public XARRAY {
  *              and which needs to be conveyed to the client
  * @f_expunged_uids: imapuids that were asynchronously deleted by another thread
  *                   and which needs to be conveyed to the client
+ *
+ * Adding a field here generally requires adding logic to clear().
  */
 struct imap_context final : public schedule_context {
 	imap_context();
 	NOMOVE(imap_context);
 	/* a.k.a. is_login in pop3 */
 	inline bool is_authed() const { return proto_stat >= iproto_stat::auth; }
+	void clear();
 
 	GENERIC_CONNECTION connection;
 	std::string mid, append_folder, append_flags;
@@ -116,6 +119,13 @@ struct imap_context final : public schedule_context {
 	 */
 	std::unordered_set<uint32_t> f_flags;
 	std::vector<uint32_t> f_expunged_uids;
+	/*
+	 * Custom keyword atoms already advertised to this session via an
+	 * untagged `* FLAGS` since the most-recent SELECT/EXAMINE. It is reset
+	 * on (re)select and cleared on close.
+	 */
+	std::vector<std::string> announced_keywords;
+	std::vector<uint32_t> saved_uids; /* UIDs saved by SEARCH/UID SEARCH RETURN */
 	char tag_string[32]{};
 	int command_len = 0;
 	char command_buffer[64*1024]{};
@@ -129,6 +139,8 @@ struct imap_context final : public schedule_context {
 	int auth_times = 0;
 	char username[UADDR_SIZE]{}, maildir[256]{}, defcharset[32]{};
 	bool synchronizing_literal = true;
+	/* client sent ENABLE IMAP4rev2 (RFC 9051); gates rev2-only behavior. */
+	bool enabled_rev2 = false;
 };
 
 extern void imap_parser_init(int context_num, int average_num, gromox::time_duration timeout, gromox::time_duration autologout_time, int max_auth_times, int block_auth_fail, bool support_tls, bool force_tls, const char *certificate_path, const char *cb_passwd, const char *key_path);
@@ -140,16 +152,21 @@ extern gromox::time_point imap_parser_get_context_timestamp(const schedule_conte
 extern SCHEDULE_CONTEXT **imap_parser_get_contexts_list();
 extern int imap_parser_threads_event_proc(int action);
 extern void imap_parser_bcast_touch(const imap_context *, const char *user, const std::string &fld);
-extern void imap_parser_echo_modify(imap_context *, STREAM *);
-extern void imap_parser_bcast_flags(const imap_context &, uint32_t uid);
+enum class echomod : bool { normal = false, suppress_expunge = true };
+extern void imap_parser_echo_modify(imap_context *, STREAM *, echomod sup_expu = echomod::suppress_expunge);
+enum class bcastfl : bool { exclude_self = false, include_self = true };
+extern void imap_parser_bcast_flags(const imap_context &, uint32_t uid, bcastfl = bcastfl::exclude_self);
 extern void imap_parser_add_select(imap_context *);
-extern void imap_parser_bcast_expunge(const imap_context &, const std::vector<MITEM *> &);
+extern void imap_parser_bcast_expunge(const imap_context &, const std::vector<MITEM *> &, const std::string &folder);
 extern void imap_parser_remove_select(imap_context *);
 extern  void imap_parser_safe_write(imap_context *, const void *pbuff, size_t count);
 extern void imap_parser_log_info(imap_context *, int level, const char *format, ...) __attribute__((format(printf, 3, 4)));
 
 extern void icp_clsfld(imap_context &);
+extern std::string icp_make_kwannounce_line(imap_context &, std::string_view);
 extern int icp_capability(std::span<std::string>, imap_context &);
+extern int icp_enable(std::span<std::string>, imap_context &);
+extern int icp_namespace(std::span<std::string>, imap_context &);
 extern int icp_id(std::span<std::string>, imap_context &);
 extern int icp_noop(std::span<std::string>, imap_context &);
 extern int icp_logout(std::span<std::string>, imap_context &);
@@ -181,6 +198,8 @@ extern int icp_search(std::span<std::string> argv, imap_context &);
 extern int icp_fetch(std::span<std::string> argv, imap_context &);
 extern int icp_store(std::span<std::string> argv, imap_context &);
 extern int icp_copy(std::span<std::string> argv, imap_context &);
+extern int icp_move(std::span<std::string> argv, imap_context &);
+extern int icp_uid_move(std::span<std::string> argv, imap_context &);
 extern int icp_uid_search(std::span<std::string> argv, imap_context &);
 extern int icp_uid_fetch(std::span<std::string> argv, imap_context &);
 extern int icp_uid_store(std::span<std::string> argv, imap_context &);

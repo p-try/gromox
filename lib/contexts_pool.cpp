@@ -112,9 +112,12 @@ static void *ctxp_scanwork(void *pparam)
 	DOUBLE_LIST temp_list;
 	DOUBLE_LIST_NODE *pnode;
 	SCHEDULE_CONTEXT *pcontext;
+	static constexpr unsigned int IDLE_SCAN_SECS = 4;
+	unsigned int idle_tick = 0;
 	
 	double_list_init(&temp_list);
 	while (!g_ctxpool_stop) {
+		{
 		std::unique_lock poll_hold(g_context_locks[static_cast<int>(sctx_status::polling)]);
 		auto current_time = tp_now();
 		auto ptail = double_list_get_tail(&g_context_lists[static_cast<int>(sctx_status::polling)]);
@@ -140,22 +143,30 @@ static void *ctxp_scanwork(void *pparam)
 			if (pnode == ptail)
 				break;
 		}
-		poll_hold.unlock();
+		}
+
+		if (++idle_tick >= IDLE_SCAN_SECS) {
+			idle_tick = 0;
+
 		std::unique_lock idle_hold(g_context_locks[static_cast<int>(sctx_status::idling)]);
 		while ((pnode = double_list_pop_front(&g_context_lists[static_cast<int>(sctx_status::idling)])) != nullptr) {
 			pcontext = (SCHEDULE_CONTEXT*)pnode->pdata;
 			pcontext->type = sctx_status::switching;
 			double_list_append_as_tail(&temp_list, pnode);
 		}
-		idle_hold.unlock();
+		}
+
 		num = 0;
+
+		{
 		std::unique_lock turn_hold(g_context_locks[static_cast<int>(sctx_status::turning)]);
 		while ((pnode = double_list_pop_front(&temp_list)) != nullptr) {
 			static_cast<schedule_context *>(pnode->pdata)->type = sctx_status::turning;
 			double_list_append_as_tail(&g_context_lists[static_cast<int>(sctx_status::turning)], pnode);
 			num ++;
 		}
-		turn_hold.unlock();
+		}
+
 		if (num == 1)
 			threads_pool_wakeup_thread();
 		else if (num > 1)
@@ -281,23 +292,27 @@ void contexts_pool_insert(schedule_context *pcontext, sctx_status tpraw)
 	pcontext->type = tpraw;
 	if (tpraw == sctx_status::polling) {
 		int fd = contexts_pool_get_context_socket(pcontext);
+		int se = 0;
 		if (original_type == sctx_status::constructing) {
-			if (g_poll_ctx.add(pcontext->polling_mask, fd, pcontext) != 0) {
+			se = g_poll_ctx.add(pcontext->polling_mask, fd, pcontext);
+			if (se != 0) {
 				pcontext->b_waiting = FALSE;
-				mlog(LV_DEBUG, "contexts_pool: failed to add event to epoll");
+				mlog(LV_DEBUG, "contexts_pool: add fd %d: %s", fd, strerror(se));
 			} else {
 				pcontext->b_waiting = TRUE;
 			}
-		} else if (g_poll_ctx.mod(pcontext->polling_mask, fd, pcontext) != 0) {
-			int se = errno;
-			if (errno == ENOENT && g_poll_ctx.add(pcontext->polling_mask, fd, pcontext) == 0) {
-				/* sometimes, fd will be removed by scanning
-				thread because of timeout, add it back
-				into epoll queue again */
+		} else if ((se = g_poll_ctx.mod(pcontext->polling_mask, fd, pcontext)) != 0) {
+			/*
+			 * Sometimes, the fd will be removed by the scanning
+			 * thread because of timeout, and mod() expectedly
+			 * fails. Just catch that and add it back.
+			 */
+			if (se == ENOENT)
+				se = g_poll_ctx.add(pcontext->polling_mask, fd, pcontext);
+			if (se == 0) {
 				pcontext->b_waiting = TRUE;
 			} else {
-				mlog(LV_DEBUG, "contexts_pool: failed to modify event in epoll: %s (T1), %s (T2)",
-					strerror(se), strerror(errno));
+				mlog(LV_DEBUG, "contexts_pool: mod fd %d: %s", fd, strerror(se));
 				shutdown(fd, SHUT_RDWR);
 			}
 		}

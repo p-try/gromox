@@ -87,7 +87,7 @@ GUID replid_to_replguid(const gromox::EWS::Structures::sMailboxInfo& mbinfo, uin
  * @param      content_length  Length of the response body
  */
 static void writeheader(detail::ContextKey ctx_id, http_status code,
-    size_t content_length)
+    size_t content_length, bool chunked = false)
 {
 	static constexpr char templ[] =
 	        "HTTP/1.1 {} {}\r\n"
@@ -98,14 +98,24 @@ static void writeheader(detail::ContextKey ctx_id, http_status code,
 	        "HTTP/1.1 {} {}\r\n"
 	        "Content-Type: text/xml\r\n"
 	        "\r\n";
+	static constexpr char templ_chunked[] =
+	        "HTTP/1.1 {} {}\r\n"
+	        "Content-Type: text/xml\r\n"
+	        "Transfer-Encoding: chunked\r\n"
+	        "\r\n";
 	const char* status = "OK";
 	switch(code) {
 	case http_status::bad_request: status = "Bad Request"; break;
 	case http_status::server_error: status = "Internal Server Error"; break;
 	default: break;
 	}
-	std::string rs = content_length ? fmt::format(templ, static_cast<int>(code), status, content_length) :
-	                 fmt::format(templ_nolen, static_cast<int>(code), status);
+	std::string rs;
+	if (chunked)
+		rs = fmt::format(templ_chunked, static_cast<int>(code), status);
+	else if (content_length > 0)
+		rs = fmt::format(templ, static_cast<int>(code), status, content_length);
+	else
+		rs = fmt::format(templ_nolen, static_cast<int>(code), status);
 	write_response(ctx_id, rs.c_str(), rs.size());
 }
 
@@ -117,10 +127,26 @@ static void writeheader(detail::ContextKey ctx_id, http_status code,
  * @param      log       Whether write data to log
  * @param      loglevel  Log level
  */
-static void writecontent(detail::ContextKey ctx_id, const std::string_view &data,
+static void writecontent(detail::ContextKey ctx_id, std::string_view data,
     bool log, gx_loglevel loglevel)
 {
 	write_response(ctx_id, data.data(), static_cast<int>(data.size()));
+	if (log)
+		mlog(loglevel, "[ews#%d] Response: %s", ctx_id, data.data());
+}
+
+/**
+ * @brief      Write one HTTP/1.1 chunk (Transfer-Encoding: chunked)
+ */
+static void writechunk(detail::ContextKey ctx_id, std::string_view data,
+    bool log, gx_loglevel loglevel)
+{
+	if (data.empty())
+		return;
+	std::string header = fmt::format("{:x}\r\n", data.size());
+	write_response(ctx_id, header.c_str(), header.size());
+	write_response(ctx_id, data.data(), static_cast<int>(data.size()));
+	write_response(ctx_id, "\r\n", 2);
 	if (log)
 		mlog(loglevel, "[ews#%d] Response: %s", ctx_id, data.data());
 }
@@ -465,15 +491,16 @@ static constexpr cfg_directive x500_defaults[] = {
 };
 
 static constexpr cfg_directive ews_cfg_defaults[] = {
-	{"ews_beta", "0", CFG_BOOL},
 	{"ews_cache_attachment_instance_lifetime", "30000"},
 	{"ews_cache_embedded_instance_lifetime", "30000"},
 	{"ews_cache_interval", "5000"},
 	{"ews_cache_message_instance_lifetime", "30000"},
 	{"ews_event_stream_interval", "45000"},
-	{"ews_experimental", "ews_beta", CFG_ALIAS},
 	{"ews_log_filter", "!"},
 	{"ews_log_timestamp", ""},
+	{"ews_max_get_items", "0", CFG_SIZE},
+	{"ews_max_pending_events", "4000", CFG_SIZE},
+	{"ews_max_sync_changes", "512", CFG_SIZE},
 	{"ews_max_user_photo_size", "5M", CFG_SIZE},
 	{"ews_pretty_response", "0", CFG_BOOL},
 	{"ews_request_logging", "0"},
@@ -511,7 +538,6 @@ void EWSPlugin::loadConfig()
 	mlog(LV_INFO, "[ews]: x500 org name is \"%s\"", x500_org_name.c_str());
 
 	cfg = config_file_initd("ews.cfg", get_config_path(), ews_cfg_defaults);
-	experimental = cfg->get_ll("ews_beta");
 	pretty_response = cfg->get_ll("ews_pretty_response");
 	request_logging = cfg->get_ll("ews_request_logging");
 	response_logging = cfg->get_ll("ews_response_logging");
@@ -522,6 +548,9 @@ void EWSPlugin::loadConfig()
 	event_stream_interval = std::chrono::milliseconds(cfg->get_ll("ews_event_stream_interval"));
 	cache_embedded_instance_lifetime = std::chrono::milliseconds(cfg->get_ll("ews_cache_embedded_instance_lifetime"));
 	max_user_photo_size = cfg->get_ll("ews_max_user_photo_size");
+	max_sync_changes = cfg->get_ll("ews_max_sync_changes");
+	max_get_items = cfg->get_ll("ews_max_get_items");
+	max_pending_events = cfg->get_ll("ews_max_pending_events");
 	ver.schema = cfg->get_value("ews_schema_version");
 
 	str = gxcfg->get_value("outgoing_smtp_url");
@@ -652,8 +681,8 @@ int EWSContext::notify()
 	if (nctx.state == NS::S_INIT) {
 		/* First call after initialization -> write context data */
 		m_response.doc.Print(&printer);
-		writeheader(m_ctx_id, m_code, 0);
-		writecontent(m_ctx_id, to_sv(printer), logResponse, loglevel);
+		writeheader(m_ctx_id, m_code, 0, true);
+		writechunk(m_ctx_id, to_sv(printer), logResponse, loglevel);
 		nctx.state = NS::S_WRITE;
 		return HPM_RETRIEVE_WRITE;
 	}
@@ -667,7 +696,7 @@ int EWSContext::notify()
 	auto flush = [&]() {
 		data.serialize(response);
 		envelope.doc.Print(&printer);
-		writecontent(m_ctx_id, to_sv(printer), logResponse, loglevel);
+		writechunk(m_ctx_id, to_sv(printer), logResponse, loglevel);
 		return HPM_RETRIEVE_WRITE;
 	};
 
@@ -676,7 +705,9 @@ int EWSContext::notify()
 		msg.ConnectionStatus = Enum::Closed;
 		msg.success();
 		nctx.state = NS::S_CLOSED;
-		return flush();
+		int ret = flush();
+		write_response(m_ctx_id, "0\r\n\r\n", 5);
+		return ret;
 	}
 
 	// S_SLEEP: Just woke up, check for new events and deliver update message
@@ -816,6 +847,16 @@ void EWSPlugin::event(const char* dir, BOOL, uint32_t ID, const DB_NOTIFY* notif
 	if (mgr == nullptr)
 		return;
 	lock = std::unique_lock(mgr->lock);
+	if (mgr->overflow)
+		/* Wait for the client to re-subscribe */
+		return;
+	if (max_pending_events != 0 && mgr->events.size() >= max_pending_events) {
+		mgr->overflow = true;
+		mgr->events.clear();
+		mlog(LV_DEBUG, "[ews] %s: streaming event backlog exceeded ews_max_pending_events=%u; signalling resync",
+			mgr->username.c_str(), max_pending_events);
+		return;
+	}
 	sTimePoint now(clock::now());
 	auto mkFid = [&](uint64_t fid) {
 		return tFolderId(mkFolderEntryId(mgr->mailboxInfo,
@@ -905,10 +946,20 @@ void EWSPlugin::event(const char* dir, BOOL, uint32_t ID, const DB_NOTIFY* notif
 	default:
 		break;
 	}
-	if (mgr->waitingContext >= 0)
+	if (mgr->waitingContext >= 0) try {
 		// Reschedule next wakeup 0.1 seconds. Should be enough to gather related events.
 		// Is still bound to the ObjectCache cleanup cycle and might take significantly longer than that.
 		cache.get(mgr->waitingContext, std::chrono::milliseconds(100));
+	} catch (const std::out_of_range &) {
+		/*
+		 * The context is linked but not currently parked in the cache
+		 * (between wakeups, or not yet asleep), so there is no wakeup
+		 * entry to bump. The event was already queued above; the 100ms
+		 * fast wake is a best-effort optimisation, so skip it silently
+		 * instead of throwing all the way to the outer handler and
+		 * logging a misleading "Failed to process notification".
+		 */
+	}
 } catch (const std::exception &err) {
 	mlog(LV_ERR, "[ews#evt] %s: Failed to process notification: %s",
 		err.what(), timestamp().c_str());

@@ -788,25 +788,27 @@ int utf8_to_mutf7(const char *u8, size_t u8len, char *u7, size_t u7len)
   return p - buf;
 }
 
-int parse_imap_args(char *cmdline, int cmdlen, std::vector<std::string> &argv) try
+/**
+ * Tokenize an IMAP input command buffer.
+ *
+ * @keep_nil: Retain "NIL" literally. Callers use this in substring parses
+ *            when there is no ambiguity what a NIL should mean, e.in
+ *            flag-list. (See RFC 9051 §4.5 ¶2 for some info.)
+ *
+ */
+int parse_imap_args(char *cmdline, int cmdlen, std::vector<std::string> &argv,
+    bool keep_nil) try
 {
-	char *ptr;
 	int b_count = 0, s_count = 0;
-	BOOL is_quoted;
-	char *last_space;
-	char *last_square;
-	char *last_quote = nullptr;
-	char *last_brace;
-	char *last_bracket;
+	bool is_quoted = false;
+	char *last_space = nullptr, *last_square = nullptr, *last_quote = nullptr;
+	char *last_brace = nullptr, *last_bracket = nullptr;
 
 	cmdline[cmdlen++] = ' ';
-	ptr = cmdline;
+	auto ptr = cmdline;
 	/* Build the argv list */
 	argv.clear();
-	last_bracket = NULL;
-	last_square = NULL;
 	last_space = cmdline;
-	is_quoted = FALSE;
 	/*
 	 * XXX: During splitting, both normal arguments and literals get
 	 * converted to strings, and the distinction is lost.
@@ -852,18 +854,18 @@ int parse_imap_args(char *cmdline, int cmdlen, std::vector<std::string> &argv) t
 			last_quote = nullptr;
 		}
 		if (*ptr == '[' && last_quote == nullptr) {
-			if (NULL == last_square) {
+			if (last_square == nullptr) {
 				last_square = ptr;
 				s_count = 0;
 			} else {
-				s_count ++;
+				++s_count;
 			}
 		}
-		if (']' == *ptr && NULL != last_square) {
+		if (']' == *ptr && last_square != nullptr) {
 			if (s_count == 0)
-				last_square = NULL;
+				last_square = nullptr;
 			else
-				s_count --;
+				--s_count;
 		}
 		if (*ptr == '(' && last_quote == nullptr) {
 			if (NULL == last_bracket) {
@@ -880,13 +882,13 @@ int parse_imap_args(char *cmdline, int cmdlen, std::vector<std::string> &argv) t
 				b_count --;
 		}
 		if (*ptr == ' ' && last_quote == nullptr &&
-			NULL == last_bracket && NULL == last_square) {
+		    last_bracket == nullptr && last_square == nullptr) {
 			/* ignore leading spaces */
 			if (ptr == last_space && !is_quoted) {
 				last_space ++;
 			} else {
 				*ptr = '\0';
-				if (!is_quoted && strcasecmp(last_space, "NIL") == 0)
+				if (!keep_nil && !is_quoted && strcasecmp(last_space, "NIL") == 0)
 					argv.emplace_back();
 				else
 					argv.emplace_back(last_space);
@@ -895,6 +897,12 @@ int parse_imap_args(char *cmdline, int cmdlen, std::vector<std::string> &argv) t
 			}
 		}
 		ptr ++;
+	}
+	if (last_square != nullptr) {
+		/* Unterminated '[' is valid in an atom; flush the pending token. */
+		cmdline[cmdlen-1] = '\0';
+		if (*last_space != '\0')
+			argv.emplace_back(last_space);
 	}
 	/* only one quote is found, error */
 	if (last_quote != nullptr || last_bracket != nullptr || last_square != nullptr) {
@@ -1155,7 +1163,7 @@ int html_to_plain_boring(std::string_view inbuf, std::string &outbuf) try
 				char *end;
 				auto uc = strtoul(&p[2], &end, 10);
 				if (end != &p[2] && end != nullptr && *end == ';') {
-					rp += wchar_to_utf8(uc);
+					rp += uchar_to_utf8(uc);
 					i += ilen;
 					p += ilen;
 					break;
@@ -1168,7 +1176,7 @@ int html_to_plain_boring(std::string_view inbuf, std::string &outbuf) try
 			if (it != std::cend(html_entities) && strncasecmp(p, it->input, ilen + 1) == 0)
 				rp += std::string_view(it->output, it->olen);
 			else
-				rp += wchar_to_utf8(0xfffd);
+				rp += uchar_to_utf8(0xfffd);
 			i += ilen;
 			p += ilen;
 			break;

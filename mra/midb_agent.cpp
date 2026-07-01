@@ -82,9 +82,21 @@ struct BACK_SVR {
 
 static void *midbag_scanwork(void *);
 static ssize_t read_line(int sockd, char *buff, size_t length);
+static ssize_t read_line_dyn(int sockd, std::string &out);
 static int connect_midb(const char *host, uint16_t port);
 
 std::atomic<size_t> g_midb_command_buffer_size{256 * 1024};
+/*
+ * Timeout for reading a command response from midb. This must be strictly
+ * greater than midb's own giant_lock wait (mail_engine.cpp:DB_LOCK_TIMEOUT,
+ * typically 60s), because when a command queues behind an in-progress resync,
+ * the server only answers (with an E-2403 FALSE) after its lock wait expires.
+ * If the client's read timeout were equal, it would deterministically give up
+ * first – it starts the clock at write time, before the server thread even
+ * begins waiting – and tear down the connection instead of receiving the
+ * orderly error. The 30s margin keeps the client waiting just past the server.
+ */
+static constexpr int MIDB_CMD_TIMEOUT_MS = 90000;
 static int g_conn_num;
 static gromox::atomic_bool g_midbagent_stop;
 static pthread_t g_scan_id;
@@ -217,6 +229,7 @@ static void *midbag_scanwork(void *param)
 	std::list<BACK_CONN> temp_list;
 
 	while (!g_midbagent_stop) {
+		{
 		std::unique_lock sv_hold(g_server_lock);
 		auto now_time = time(nullptr);
 		for (auto &srv : g_server_list) {
@@ -231,7 +244,7 @@ static void *midbag_scanwork(void *param)
 					break;
 			}
 		}
-		sv_hold.unlock();
+		}
 
 		while (temp_list.size() > 0) {
 			auto pback = &temp_list.front();
@@ -242,21 +255,20 @@ static void *midbag_scanwork(void *param)
 			    read(pback->sockd, temp_buff, 1024) <= 0) {
 				close(pback->sockd);
 				pback->sockd = -1;
-				sv_hold.lock();
+				std::unique_lock sv_hold(g_server_lock);
 				g_lost_list.splice(g_lost_list.end(), temp_list, temp_list.begin());
-				sv_hold.unlock();
 			} else {
 				pback->last_time = time(nullptr);
-				sv_hold.lock();
+				std::unique_lock sv_hold(g_server_lock);
 				pback->psvr->conn_list.splice(pback->psvr->conn_list.end(), temp_list, temp_list.begin());
-				sv_hold.unlock();
 			}
 		}
 
-		sv_hold.lock();
+		{
+		std::unique_lock sv_hold(g_server_lock);
 		temp_list = std::move(g_lost_list);
 		g_lost_list.clear();
-		sv_hold.unlock();
+		}
 
 		while (temp_list.size() > 0) {
 			auto pback = &temp_list.front();
@@ -264,13 +276,11 @@ static void *midbag_scanwork(void *param)
 							pback->psvr->port);
 			if (-1 != pback->sockd) {
 				pback->last_time = time(nullptr);
-				sv_hold.lock();
+				std::unique_lock sv_hold(g_server_lock);
 				pback->psvr->conn_list.splice(pback->psvr->conn_list.end(), temp_list, temp_list.begin());
-				sv_hold.unlock();
 			} else {
-				sv_hold.lock();
+				std::unique_lock sv_hold(g_server_lock);
 				g_lost_list.splice(g_lost_list.end(), temp_list, temp_list.begin());
-				sv_hold.unlock();
 			}
 		}
 		sleep(1);
@@ -286,21 +296,22 @@ static BACK_CONN_floating get_connection(const char *prefix)
 	if (i == g_server_list.end())
 		return fc;
 
+	{
 	std::unique_lock sv_hold(g_server_lock);
 	if (i->conn_list.size() > 0) {
 		fc.tmplist.splice(fc.tmplist.end(), i->conn_list, i->conn_list.begin());
 		return fc;
 	}
-	sv_hold.unlock();
+	}
+
 	for (size_t j = 0; j < SOCKET_TIMEOUT && !g_midbagent_stop; ++j) {
 		sleep(1);
-		sv_hold.lock();
+		std::unique_lock sv_hold(g_server_lock);
 		if (i->conn_list.size() > 0) {
 			fc.tmplist.splice(fc.tmplist.end(),
 				i->conn_list, i->conn_list.begin());
 			return fc;
 		}
-		sv_hold.unlock();
 	}
 	return fc;
 }
@@ -353,7 +364,7 @@ int list_mail(const char *path, const std::string &folder,
 	while (true) {
 		pfd_read.fd = pback->sockd;
 		pfd_read.events = POLLIN|POLLPRI;
-		if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+		if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 			return MIDB_RDWR_ERROR;
 		auto read_len = read(pback->sockd, &buff[offset], buff.size() - offset);
 		if (read_len <= 0)
@@ -512,48 +523,53 @@ int delete_mail(const char *path, const std::string &folder,
 	return MIDB_RDWR_ERROR;
 }
 
-int search(const char *path, const std::string &folder,
-    const char *charset, std::span<std::string> argv, std::string &ret_buff,
-    int *perrno) try
+/**
+ * Shared implementation of the SEARCH (P-SRHL) and UID SEARCH (P-SRHU)
+ * commands. The two differ only in the command verb. The matching id set is
+ * read back with read_line_dyn() so that large folders (the midb server emits
+ * the whole set as one line) are not rejected for exceeding a fixed buffer.
+ */
+static int search_common(const char *cmd, const char *path,
+    const std::string &folder, const char *charset,
+    std::span<std::string> argv, std::string &ret_buff, int *perrno) try
 {
-	size_t encode_len;
-
 	auto pback = get_connection(path);
 	if (pback == nullptr)
 		return MIDB_NO_SERVER;
-	auto cbufsize = g_midb_command_buffer_size.load();
-	auto buff   = std::make_unique<char[]>(cbufsize);
-	auto buff1  = std::make_unique<char[]>(cbufsize);
-	auto length = gx_snprintf(buff.get(), cbufsize,
-	              "P-SRHL %s %s %s ", path, folder.c_str(), charset);
-	int length1 = 0;
-	for (const auto &elem : argv)
-		length1 += gx_snprintf(&buff1[length1], cbufsize - length1,
-					"%s", elem.c_str()) + 1;
-	buff1[length1++] = '\0';
-	encode64(buff1.get(), length1, &buff[length], cbufsize - length,
-		&encode_len);
-	length += encode_len;
-	buff1.reset();
-	buff[length++] = '\r';
-	buff[length++] = '\n';
-	auto ret = rw_command(pback->sockd, buff.get(), length, cbufsize);
-	if (ret != 0)
-		return ret;
-	if (strncmp(buff.get(), "TRUE", 4) == 0) {
+
+	/* Pack the criteria as a NUL-separated, NUL-terminated list. */
+	std::string crit;
+	for (const auto &elem : argv) {
+		crit.append(elem);
+		crit.push_back('\0');
+	}
+	crit.push_back('\0');
+
+	auto req = fmt::format("{} {} {} {} {}\r\n", cmd, path, folder,
+	           charset, base64_encode(crit));
+	auto wrret = write(pback->sockd, req.c_str(), req.size());
+	if (wrret < 0 || static_cast<size_t>(wrret) != req.size())
+		return MIDB_RDWR_ERROR;
+
+	std::string resp;
+	auto ret = read_line_dyn(pback->sockd, resp);
+	if (ret == -ENOMEM)
+		return MIDB_LOCAL_ENOMEM;
+	if (ret <= 0)
+		return MIDB_RDWR_ERROR;
+	if (strncmp(resp.c_str(), "TRUE", 4) == 0) {
 		pback.reset();
-		length = strlen(&buff[4]);
-		if (0 == length) {
+		if (resp.size() <= 5) {
+			/* "TRUE" or "TRUE " with no ids */
 			ret_buff.clear();
 			return MIDB_RESULT_OK;
 		}
-		/* trim the first space */
-		length--;
-		ret_buff.assign(&buff[5], length);
+		/* skip "TRUE " (verb plus the one trailing space) */
+		ret_buff.assign(resp, 5, std::string::npos);
 		return MIDB_RESULT_OK;
-	} else if (strncmp(buff.get(), "FALSE ", 6) == 0) {
+	} else if (strncmp(resp.c_str(), "FALSE ", 6) == 0) {
 		pback.reset();
-		*perrno = strtol(&buff[6], nullptr, 0);
+		*perrno = strtol(resp.c_str() + 6, nullptr, 0);
 		return MIDB_RESULT_ERROR;
 	}
 	return MIDB_RDWR_ERROR;
@@ -561,53 +577,20 @@ int search(const char *path, const std::string &folder,
 	return MIDB_LOCAL_ENOMEM;
 }
 
+int search(const char *path, const std::string &folder,
+    const char *charset, std::span<std::string> argv, std::string &ret_buff,
+    int *perrno)
+{
+	return search_common("P-SRHL", path, folder, charset, argv,
+	       ret_buff, perrno);
+}
+
 int search_uid(const char *path, const std::string &folder,
    const char *charset, std::span<std::string> argv, std::string &ret_buff,
-   int *perrno) try
+   int *perrno)
 {
-	size_t encode_len;
-
-	auto pback = get_connection(path);
-	if (pback == nullptr)
-		return MIDB_NO_SERVER;
-	auto cbufsize = g_midb_command_buffer_size.load();
-	auto buff   = std::make_unique<char[]>(cbufsize);
-	auto buff1  = std::make_unique<char[]>(cbufsize);
-	auto length = gx_snprintf(buff.get(), cbufsize,
-	              "P-SRHU %s %s %s ", path, folder.c_str(), charset);
-	int length1 = 0;
-	for (const auto &elem : argv)
-		length1 += gx_snprintf(&buff1[length1], cbufsize - length1,
-					"%s", elem.c_str()) + 1;
-	buff1[length1++] = '\0';
-	encode64(buff1.get(), length1, &buff[length], cbufsize - length,
-		&encode_len);
-	length += encode_len;
-	buff1.reset();
-	buff[length++] = '\r';
-	buff[length++] = '\n';
-	auto ret = rw_command(pback->sockd, buff.get(), length, cbufsize);
-	if (ret != 0)
-		return ret;
-	if (strncmp(buff.get(), "TRUE", 4) == 0) {
-		pback.reset();
-		length = strlen(&buff[4]);
-		if (0 == length) {
-			ret_buff.clear();
-			return MIDB_RESULT_OK;
-		}
-		/* trim the first space */
-		length--;
-		ret_buff.assign(&buff[5], length);
-		return MIDB_RESULT_OK;
-	} else if (strncmp(buff.get(), "FALSE ", 6) == 0) {
-		pback.reset();
-		*perrno = strtol(&buff[6], nullptr, 0);
-		return MIDB_RESULT_ERROR;
-	}
-	return MIDB_RDWR_ERROR;
-} catch (const std::bad_alloc &) {
-	return MIDB_LOCAL_ENOMEM;
+	return search_common("P-SRHU", path, folder, charset, argv,
+	       ret_buff, perrno);
 }
 
 int get_uid(const char *path, const std::string &folder,
@@ -678,6 +661,40 @@ int summary_folder(const char *path, const std::string &folder, size_t *pexists,
 	return MIDB_RESULT_OK;
 }
 	
+int folder_sizes(const char *path, const std::string &folder, size_t *psize,
+    size_t *pdeleted, int *perrno)
+{
+	char buff[1024];
+	size_t size, deleted;
+
+	auto back = get_connection(path);
+	if (back == nullptr)
+		return MIDB_NO_SERVER;
+	auto length = gx_snprintf(buff, std::size(buff), "P-FDSZ %s %s\r\n",
+	              path, folder.c_str());
+	auto ret = rw_command(back->sockd, buff, length, std::size(buff));
+	if (ret != 0)
+		return ret;
+	if (strncmp(buff, "FALSE ", 6) == 0) {
+		back.reset();
+		*perrno = strtol(buff + 6, nullptr, 0);
+		return MIDB_RESULT_ERROR;
+	} else if (strncmp(buff, "TRUE", 4) != 0) {
+		return MIDB_RDWR_ERROR;
+	}
+	if (sscanf(buff, "TRUE %zu %zu", &size, &deleted) != 2) {
+		*perrno = -1;
+		back.reset();
+		return MIDB_RESULT_ERROR;
+	}
+	if (psize != nullptr)
+		*psize = size;
+	if (pdeleted != nullptr)
+		*pdeleted = deleted;
+	back.reset();
+	return MIDB_RESULT_OK;
+}
+
 int make_folder(const char *path, const std::string &folder, int *perrno)
 {
 	char buff[1024];
@@ -863,7 +880,7 @@ int enum_folders(const char *path, std::vector<enum_folder_t> &pfile,
 	while (true) {
 		pfd_read.fd = pback->sockd;
 		pfd_read.events = POLLIN|POLLPRI;
-		if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+		if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 			return MIDB_RDWR_ERROR;
 		auto read_len = read(pback->sockd, &buff[offset], buff.size() - offset);
 		if (read_len <= 0)
@@ -955,7 +972,7 @@ int enum_subscriptions(const char *path, std::vector<enum_folder_t> &pfile,
 	while (true) {
 		pfd_read.fd = pback->sockd;
 		pfd_read.events = POLLIN|POLLPRI;
-		if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+		if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 			return MIDB_RDWR_ERROR;
 		auto read_len = read(pback->sockd, &buff[offset], buff.size() - offset);
 		if (read_len <= 0)
@@ -1145,22 +1162,22 @@ static bool get_digest_integer(const Json::Value &jv, const char *tag, int &i)
 
 static unsigned int di_to_flagbits(const Json::Value &jv)
 {
-	unsigned int fl = 0, v;
+	unsigned int fl = 0;
 	if (jv.type() != Json::ValueType::objectValue)
 		return fl;
-	if (jv.isMember("replied") && (v = jv["replied"].asUInt()) != 0)
+	if (jv.isMember("replied") && jv["replied"].asUInt() != 0)
 		fl |= FLAG_ANSWERED;
-	if (jv.isMember("unsent") && (v = jv["unsent"].asUInt()) != 0)
+	if (jv.isMember("unsent") && jv["unsent"].asUInt() != 0)
 		fl |= FLAG_DRAFT;
-	if (jv.isMember("flag") && (v = jv["flag"].asUInt()) != 0)
+	if (jv.isMember("flag") && jv["flag"].asUInt() != 0)
 		fl |= FLAG_FLAGGED;
-	if (jv.isMember("deleted") && (v = jv["deleted"].asUInt()) != 0)
+	if (jv.isMember("deleted") && jv["deleted"].asUInt() != 0)
 		fl |= FLAG_DELETED;
-	if (jv.isMember("read") && (v = jv["read"].asUInt()) != 0)
+	if (jv.isMember("read") && jv["read"].asUInt() != 0)
 		fl |= FLAG_SEEN;
-	if (jv.isMember("recent") && (v = jv["recent"].asUInt()) != 0)
+	if (jv.isMember("recent") && jv["recent"].asUInt() != 0)
 		fl |= FLAG_RECENT;
-	if (jv.isMember("forwarded") && (v = jv["forwarded"].asUInt()) != 0)
+	if (jv.isMember("forwarded") && jv["forwarded"].asUInt() != 0)
 		fl |= FLAG_FORWARDED;
 	return fl;
 }
@@ -1189,7 +1206,7 @@ int list_deleted(const char *path, const std::string &folder, XARRAY *pxarray,
 	while (true) {
 		pfd_read.fd = pback->sockd;
 		pfd_read.events = POLLIN|POLLPRI;
-		if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+		if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 			return MIDB_RDWR_ERROR;
 		auto read_len = read(pback->sockd, &buff[offset], buff.size() - offset);
 		if (read_len <= 0)
@@ -1299,7 +1316,8 @@ int fetch_simple_uid(const char *path, const std::string &folder,
 	
 	for (const auto &seq : list) {
 		auto pseq = &seq;
-		auto cbuf = fmt::format("P-SIMU {} {} {} {}\r\n",
+		/* K: ask for keywords to be reported */
+		auto cbuf = fmt::format("P-SIMU {} {} {} {} K\r\n",
 		            path, folder, pseq->lo, pseq->hi);
 		auto wrret = write(pback->sockd, cbuf.c_str(), cbuf.size());
 		if (wrret < 0 || static_cast<size_t>(wrret) != cbuf.size())
@@ -1311,7 +1329,7 @@ int fetch_simple_uid(const char *path, const std::string &folder,
 		while (true) {
 			pfd_read.fd = pback->sockd;
 			pfd_read.events = POLLIN|POLLPRI;
-			if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+			if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 				return MIDB_RDWR_ERROR;
 			auto read_len = read(pback->sockd, &buff[offset], buff.size() - offset);
 			if (read_len <= 0)
@@ -1357,6 +1375,19 @@ int fetch_simple_uid(const char *path, const std::string &folder,
 								*pspace++ = '\0';
 								*pspace1++ = '\0';
 								*pspace2++ = '\0';
+								/*
+								 * Terminate the "(flags)" group so s_to_flagbits does
+								 * not scan size or the optional trailing base64
+								 * keyword blob. The 5th token is the keywords.
+								 */
+								std::string kw;
+								char *pspace3 = strchr(pspace2, ' ');
+								if (pspace3 != nullptr) {
+									*pspace3++ = '\0';
+									char *pspace4 = strchr(pspace3, ' ');
+									if (pspace4 != nullptr)
+										kw = base64_decode(pspace4 + 1);
+								}
 								int uid = strtol(pspace1, nullptr, 0);
 								if (pxarray->append(MITEM{}, uid) >= 0) {
 									auto num = pxarray->get_capacity();
@@ -1365,6 +1396,7 @@ int fetch_simple_uid(const char *path, const std::string &folder,
 									pitem->uid = uid;
 									try {
 										pitem->mid = pspace;
+										pitem->keywords = std::move(kw);
 									} catch (const std::bad_alloc &) {
 										b_format_error = TRUE;
 									}
@@ -1382,7 +1414,7 @@ int fetch_simple_uid(const char *path, const std::string &folder,
 					line_pos = 0;
 				} else if (buff[i] != '\r' || i != offset - 1) {
 					temp_line[line_pos++] = buff[i];
-					if (line_pos >= 128)
+					if (line_pos >= 1000)
 						return MIDB_RDWR_ERROR;
 				}
 			}
@@ -1443,7 +1475,7 @@ int fetch_detail_uid(const char *path, const std::string &folder,
 		while (true) {
 			pfd_read.fd = pback->sockd;
 			pfd_read.events = POLLIN|POLLPRI;
-			if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+			if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 				return MIDB_RDWR_ERROR;
 			auto read_len = read(pback->sockd, &buff[offset], buff.size() - offset);
 			if (read_len <= 0)
@@ -1496,6 +1528,7 @@ int fetch_detail_uid(const char *path, const std::string &folder,
 						MITEM mitem;
 						if (get_digest(digest, "file", mitem.mid) &&
 						    get_digest_integer(digest, "uid", mitem.uid)) {
+							mitem.keywords = digest.isMember("keywords") ? digest["keywords"].asString() : "";
 							mitem.digest_off = pxarray->m_dpool.size();
 							mitem.digest_len = digest_sv.size();
 							pxarray->m_dpool.append(digest_sv);
@@ -1634,7 +1667,8 @@ int unset_flags(const char *path, const std::string &folder,
 }
 	
 int get_flags(const char *path, const std::string &folder,
-    const std::string &mid_string, unsigned int *pflag_bits, int *perrno)
+    const std::string &mid_string, unsigned int *pflag_bits, int *perrno,
+    std::string *keywords)
 {
 	char buff[1024];
 
@@ -1649,8 +1683,24 @@ int get_flags(const char *path, const std::string &folder,
 	if (0 == strncmp(buff, "TRUE", 4)) {
 		pback.reset();
 		*pflag_bits = 0;
-		if (buff[4] == ' ')
+		/*
+		 * Response: TRUE (<flags>)[ <base64-keywords>]. Bound the flag
+		 * scan at ')' because the base64 keyword blob may contain flag
+		 * letters, then decode any trailing keyword field.
+		 */
+		auto close = buff[4] == ' ' ? strchr(buff + 5, ')') : nullptr;
+		if (close != nullptr) {
+			*pflag_bits = s_to_flagbits(std::string_view(buff + 5, close - (buff + 5)));
+			if (keywords != nullptr && close[1] == ' ') {
+				auto kw_beg = close + 2;
+				auto kw_end = kw_beg;
+				while (*kw_end != '\0' && *kw_end != '\r' && *kw_end != '\n')
+					++kw_end;
+				*keywords = base64_decode(std::string_view(kw_beg, kw_end - kw_beg));
+			}
+		} else if (buff[4] == ' ') {
 			*pflag_bits = s_to_flagbits(buff + 5);
+		}
 		return MIDB_RESULT_OK;
 	} else if (0 == strncmp(buff, "FALSE ", 6)) {
 		pback.reset();
@@ -1660,6 +1710,75 @@ int get_flags(const char *path, const std::string &folder,
 	return MIDB_RDWR_ERROR;
 }
 	
+int set_keywords(const char *path, const std::string &folder,
+    const std::string &mid_string, const std::string &keywords, int *perrno) try
+{
+	auto pback = get_connection(path);
+	if (pback == nullptr)
+		return MIDB_NO_SERVER;
+	auto cbufsize = g_midb_command_buffer_size.load();
+	auto buff = std::make_unique<char[]>(cbufsize);
+	/* keywords are arbitrary atoms, so transmit them base64-encoded */
+	auto length = gx_snprintf(buff.get(), cbufsize, "M-SKWD %s %s %s %s\r\n",
+	              path, folder.c_str(), mid_string.c_str(),
+	              base64_encode(keywords).c_str());
+	auto ret = rw_command(pback->sockd, buff.get(), length, cbufsize);
+	if (ret != 0)
+		return ret;
+	if (strncmp(buff.get(), "TRUE", 4) == 0) {
+		pback.reset();
+		return MIDB_RESULT_OK;
+	} else if (strncmp(buff.get(), "FALSE ", 6) == 0) {
+		pback.reset();
+		*perrno = strtol(&buff[6], nullptr, 0);
+		return MIDB_RESULT_ERROR;
+	}
+	return MIDB_RDWR_ERROR;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-1922: ENOMEM");
+	return MIDB_RDWR_ERROR;
+}
+
+int get_folder_keywords(const char *path, const std::string &folder,
+    std::vector<std::string> &out, int *perrno) try
+{
+	auto pback = get_connection(path);
+	if (pback == nullptr)
+		return MIDB_NO_SERVER;
+	auto cbufsize = g_midb_command_buffer_size.load();
+	auto buff = std::make_unique<char[]>(cbufsize);
+	/* folder is already base64 (selected_folder); pass raw like get_flags() */
+	auto length = gx_snprintf(buff.get(), cbufsize, "P-KWLS %s %s\r\n",
+	              path, folder.c_str());
+	auto ret = rw_command(pback->sockd, buff.get(), length, cbufsize);
+	if (ret != 0)
+		return ret;
+	if (strncmp(buff.get(), "TRUE", 4) == 0) {
+		pback.reset();
+		out.clear();
+		/* TRUE[ <base64>]...  split trailing tokens, base64-decode each */
+		char *p = buff.get() + 4;
+		while (*p == ' ') {
+			++p;
+			char *e = p;
+			while (*e != '\0' && *e != ' ' && *e != '\r' && *e != '\n')
+				++e;
+			if (e != p)
+				out.emplace_back(base64_decode(std::string_view(p, e - p)));
+			p = e;
+		}
+		return MIDB_RESULT_OK;
+	} else if (strncmp(buff.get(), "FALSE ", 6) == 0) {
+		pback.reset();
+		*perrno = strtol(&buff[6], nullptr, 0);
+		return MIDB_RESULT_ERROR;
+	}
+	return MIDB_RDWR_ERROR;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-2155: ENOMEM");
+	return MIDB_LOCAL_ENOMEM;
+}
+
 int copy_mail(const char *path, const std::string &src_folder,
     const std::string &mid_string, const std::string &dst_folder,
     std::string &dst_mid, int *perrno) try
@@ -1701,7 +1820,7 @@ static ssize_t read_line(int sockd, char *buff, size_t length)
 	while (true) {
 		pfd_read.fd = sockd;
 		pfd_read.events = POLLIN|POLLPRI;
-		if (poll(&pfd_read, 1, SOCKET_TIMEOUT_MS) != 1)
+		if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
 			return -ETIMEDOUT;
 		auto read_len = read(sockd, buff + offset,  length - offset);
 		if (read_len < 0)
@@ -1719,6 +1838,48 @@ static ssize_t read_line(int sockd, char *buff, size_t length)
 		if (length == offset)
 			return -ENOBUFS;
 	}
+}
+
+/**
+ * Like read_line(), but reads one CRLF-terminated logical line of *unbounded*
+ * length into a growable std::string. Used by the SEARCH path, where the midb
+ * server emits the entire match set (potentially several MB for folders with
+ * hundreds of thousands of messages) as a single line. The fixed-buffer
+ * read_line() rejected such responses with -ENOBUFS, which surfaced to IMAP
+ * clients as error 1921 ("Too many messages in folder ...") and made large
+ * folders unsearchable (and thus unusable in clients like Thunderbird that
+ * SEARCH on folder open). Memory is bounded to one reusable staging buffer
+ * plus the result string the caller needs anyway.
+ *
+ * Returns 1 on a complete line (CRLF stripped, stored in @out), 0 on orderly
+ * peer close before a line terminator, or a negative errno on poll/read error.
+ */
+static ssize_t read_line_dyn(int sockd, std::string &out) try
+{
+	static constexpr size_t stage_size = 64 * 1024;
+	auto stage = std::make_unique<char[]>(stage_size);
+	struct pollfd pfd_read;
+
+	out.clear();
+	while (true) {
+		pfd_read.fd = sockd;
+		pfd_read.events = POLLIN | POLLPRI;
+		if (poll(&pfd_read, 1, MIDB_CMD_TIMEOUT_MS) != 1)
+			return -ETIMEDOUT;
+		auto read_len = read(sockd, stage.get(), stage_size);
+		if (read_len < 0)
+			return read_len;
+		else if (read_len == 0)
+			return 0;
+		out.append(stage.get(), read_len);
+		if (out.size() >= 2 && out[out.size()-2] == '\r' &&
+		    out[out.size()-1] == '\n') {
+			out.resize(out.size() - 2);
+			return 1;
+		}
+	}
+} catch (const std::bad_alloc &) {
+	return -ENOMEM;
 }
 
 static int connect_midb(const char *ip_addr, uint16_t port)

@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -20,6 +21,7 @@
 #include <unistd.h>
 #ifdef __GLIBC__
 #	include <execinfo.h>
+#	include <malloc.h>
 #endif
 #include <netinet/in.h>
 #if defined(__linux__) && defined(__GLIBC__) && __GLIBC__ == 2 && __GLIBC_MINOR__ >= 30
@@ -100,6 +102,50 @@ errno_t filedes_limit_bump(size_t max)
 	mlog(LV_NOTICE, "system: maximum file descriptors: %zu",
 		static_cast<size_t>(rl.rlim_cur));
 	return 0;
+}
+
+/**
+ * Hand free top-of-arena pages back to the OS. glibc only trims the main arena
+ * automatically; the per-thread arenas it spins up under concurrency keep
+ * their freed pages mapped, so RSS otherwise stays at the high-water of the
+ * busiest burst (reusable, not leaked, but resident) until the process exits.
+ */
+void *heap_reaper::thread_entry()
+{
+	pthread_setname_np(pthread_self(), "heap_reaper");
+	do {
+		auto secs = m_intv.load();
+		if (secs == 0)
+			break;
+		sleep(secs);
+#ifdef __GLIBC__
+		malloc_trim(0);
+#endif
+	} while (true);
+	return nullptr;
+}
+
+heap_reaper::heap_reaper(unsigned int sec) : m_intv(sec)
+{
+	/* this function has to die */
+#ifdef __GLIBC__
+	if (sec == 0)
+		return;
+	auto entry = [](void *a) { return static_cast<heap_reaper *>(a)->thread_entry(); };
+	auto ret = pthread_create4(&m_thr_id, nullptr, entry, this);
+	if (ret != 0)
+		mlog(LV_WARN, "cannot start heap reaper thread: %s", strerror(ret));
+#endif
+}
+
+heap_reaper::~heap_reaper()
+{
+	m_intv = 0;
+	if (!pthread_equal(m_thr_id, {})) {
+		pthread_kill(m_thr_id, SIGALRM);
+		pthread_join(m_thr_id, nullptr);
+		m_thr_id = {};
+	}
 }
 
 /**
@@ -414,11 +460,7 @@ errno_t poll_ctx::addmod(unsigned int mask, int fd, void *ctx, bool add)
 		ev[nev++].filter = EVFILT_WRITE;
 	auto ret = kevent(m_epfd, ev, nev, nullptr, 0, nullptr);
 #endif
-	if (ret == 0)
-		return 0;
-	errno_t se = errno;
-	mlog(LV_ERR, "poll_ctx::%s: %s\n", add ? "add" : "mod", strerror(se));
-	return se;
+	return ret == 0 ? 0 : errno;
 }
 
 errno_t poll_ctx::del(int fd)
@@ -431,11 +473,7 @@ errno_t poll_ctx::del(int fd)
 	EV_SET(&ev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
 	auto ret = kevent(m_epfd, ev, std::size(ev), nullptr, 0, nullptr);
 #endif
-	if (ret == 0)
-		return 0;
-	errno_t se = errno;
-	mlog(LV_ERR, "poll_ctx::del: %s\n", strerror(se));
-	return se;
+	return ret == 0 ? 0 : errno;
 }
 
 int poll_ctx::wait(const struct timespec *timeout, int max_ev)

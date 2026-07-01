@@ -72,6 +72,10 @@ static constexpr std::pair<unsigned int, const char *> g_default_code_table[] = 
 	{1728, "OK UID FETCH completed"},
 	{1729, "OK ID completed"},
 	{1730, "OK UID EXPUNGE completed"},
+	{1731, "OK ENABLE completed"},
+	{1732, "OK NAMESPACE completed"},
+	{1733, "OK MOVE completed"},
+	{1734, "OK UID MOVE completed"},
 	{1800, "BAD command not supported or parameter error"},
 	{1801, "BAD TLS negotiation only begin in not authenticated state"},
 	{1802, "BAD must issue a STARTTLS command first"},
@@ -119,6 +123,8 @@ static constexpr std::pair<unsigned int, const char *> g_default_code_table[] = 
 	{1924, "NO DELETE subfolders first"},
 	{1925, "NO [NONEXISTENT] Folder does not exist"},
 	{1926, "NO CREATE: folder already exists"},
+	{1927, "NO MOVE failed"},
+	{1928, "NO UID MOVE failed"},
 	{2000 | MIDB_E_UNKNOWN_COMMAND, "midb: unknown command"},
 	{2000 | MIDB_E_PARAMETER_ERROR, "midb: command parameter error"},
 	{2000 | MIDB_E_HASHTABLE_FULL, "Unable to read midb.sqlite, see midb logs"},
@@ -147,6 +153,7 @@ static constexpr std::pair<unsigned int, const char *> g_default_code_table[] = 
 	{2000 | MIDB_E_MDB_PARTIAL, "exmdb: RPC completed with partial result"},
 	{2000 | MIDB_E_MDB_SETFOLDERPROPS, "exmdb: set_folder_props RPC failed"},
 	{2000 | MIDB_E_MDB_SETMSGPROPS, "exmdb: set_msg_props RPC failed"},
+	{2000 | MIDB_E_MDB_SETMSGRD, "exmdb: set_message_read_state RPC failed"},
 	{2000 | MIDB_E_MDB_WRITEMESSAGE, "exmdb: write_message RPC failed"},
 	{2000 | MIDB_E_MNG_CTMATCH, "midb: ct_match failed"},
 	{2000 | MIDB_E_MNG_SORTFOLDER, "midb: sort_folder failed"},
@@ -157,6 +164,7 @@ static constexpr std::pair<unsigned int, const char *> g_default_code_table[] = 
 	{2000 | MIDB_E_SSGETID, "User unresolvable"},
 	{2000 | MIDB_E_ACCESS_DENIED, "Access denied"},
 	{2000 | MIDB_E_NOTPERMITTED, "Operation not permitted"},
+	{2000 | MIDB_E_NO_FOLDER_TRYCREATE, "folder does not exist"},
 };
 
 static std::unordered_map<unsigned int, std::string> g_def_code_table;

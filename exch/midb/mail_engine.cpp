@@ -25,6 +25,7 @@
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <fmt/core.h>
 #include <libHX/ctype_helper.h>
@@ -33,7 +34,9 @@
 #include <libHX/string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <vmime/addressList.hpp>
 #include <vmime/header.hpp>
+#include <vmime/mailboxGroup.hpp>
 #include <gromox/atomic.hpp>
 #include <gromox/database.h>
 #include <gromox/dbop.h>
@@ -130,6 +133,7 @@ using CONDITION_TREE_NODE = ct_node;
 struct KEYWORD_ENUM {
 	MJSON *pjson = nullptr;
 	BOOL b_result = false;
+	bool b_body_only = false;
 	const char *charset = nullptr;
 	const char *keyword = nullptr;
 };
@@ -166,6 +170,7 @@ unsigned int g_midb_cache_interval, g_midb_reload_interval;
 unsigned long long g_midb_busy_timeout_ns;
 
 static constexpr time_duration DB_LOCK_TIMEOUT = std::chrono::seconds(60);
+static constexpr size_t SYNC_COMMIT_CHUNK = 4096; /* multiple sqlite transactions for big operations */
 static size_t g_table_size;
 static gromox::atomic_bool g_midb_stop; /* stop signal for scanning thread */
 static pthread_t g_scan_tid;
@@ -240,7 +245,7 @@ static uint64_t me_get_digest(sqlite3 *psqlite, const char *mid_string,
 	}
 	auto pstmt = gx_sql_prep(psqlite, "SELECT uid, recent, read,"
 	             " unsent, flagged, replied, forwarded, deleted,"
-	             " folder_id FROM messages WHERE mid_string=?");
+	             " folder_id, keywords FROM messages WHERE mid_string=?");
 	if (pstmt == nullptr)
 		return 0;
 	sqlite3_bind_text(pstmt, 1, mid_string, -1, SQLITE_STATIC);
@@ -256,6 +261,7 @@ static uint64_t me_get_digest(sqlite3 *psqlite, const char *mid_string,
 	digest["replied"]   = Json::Value::UInt64(pstmt.col_int64(5));
 	digest["forwarded"] = Json::Value::UInt64(pstmt.col_int64(6));
 	digest["deleted"]   = Json::Value::UInt64(pstmt.col_int64(7));
+	digest["keywords"]  = pstmt.col_text(9);
 	return folder_id;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1139: ENOMEM");
@@ -263,22 +269,16 @@ static uint64_t me_get_digest(sqlite3 *psqlite, const char *mid_string,
 }
 
 static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
-    const char *mime_string) try
+    std::string_view sv_in) try
 {
-	int i, buff_len;
-	int offset;
-	int last_pos, begin_pos, end_pos;
 	ENCODE_STRING encode_string;
-	char temp_buff[1024];
 
-	buff_len = strlen(mime_string);
+	auto buff_len = sv_in.size();
 	auto ret_string = std::make_unique<char[]>(2 * (buff_len + 1));
-	auto in_buff = deconst(mime_string);
+	auto in_buff = sv_in.data();
 	auto out_buff = ret_string.get();
-	offset = 0;
-	begin_pos = -1;
-	end_pos = -1;
-	last_pos = 0;
+	size_t i, offset = 0, last_pos = 0;
+	int begin_pos = -1, end_pos = -1;
 	for (i=0; i<buff_len-1&&offset<2*buff_len+1; i++) {
 		if (-1 == begin_pos && '=' == in_buff[i] && '?' == in_buff[i + 1]) {
 			begin_pos = i;
@@ -302,12 +302,9 @@ static std::unique_ptr<char[]> me_ct_decode_mime(const char *charset,
 			auto tmp_len = strlen(encode_string.title);
 			std::string tmp_string;
 			if (strcasecmp(encode_string.encoding, "base64") == 0) {
-				size_t decode_len = 0;
-				decode64(encode_string.title, tmp_len,
-				         temp_buff, std::size(temp_buff), &decode_len);
-				temp_buff[decode_len] = '\0';
-				tmp_string = me_ct_to_utf8(encode_string.charset, temp_buff);
+				tmp_string = me_ct_to_utf8(encode_string.charset, base64_decode(encode_string.title));
 			} else if (strcasecmp(encode_string.encoding, "quoted-printable") == 0) {
+				char temp_buff[1024];
 				auto decode_len = qpnl_decode_sized({encode_string.title, tmp_len},
 				                  temp_buff, std::size(temp_buff));
 				if (decode_len < 0)
@@ -370,6 +367,8 @@ static void me_ct_enum_mime(MJSON_MIME *pmime, void *param) try
 		if (xl < 0)
 			return;
 		content.resize(xl);
+	} else if (penum->b_body_only) {
+		content = std::string(ctview);
 	}
 
 	auto charset = pmime->get_charset();
@@ -378,6 +377,84 @@ static void me_ct_enum_mime(MJSON_MIME *pmime, void *param) try
 		penum->b_result = TRUE;
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1970: ENOMEM");
+}
+
+static bool match_addr_vmime(const vmime::mailbox &m, const char *keyword)
+{
+	EMAIL_ADDR ea(m);
+	if (*ea.display_name != '\0' &&
+	    strcasestr(ea.display_name, keyword) != nullptr)
+		return true;
+	if (*ea.addr != '\0' && strcasestr(ea.addr, keyword) != nullptr)
+		return true;
+	/*
+	 * Dovecot would always match a `SEARCH FROM <`. That suggests it
+	 * performs some kind of normalization with the header. Something
+	 * similar in vmime would go like this:
+	 *
+	 * auto rg = m.generate();
+	 * return rg.size() > 0 && strcasestr(rg.c_str(), keyword) != nullptr;
+	 *
+	 * except that vmime's normalization will, for a mailbox without a
+	 * displayname, not add <> around the address when there is no need to.
+	 */
+	return false;
+}
+
+/**
+ * From/To/Cc/Bcc keywords should match against the envelope address structure,
+ * not the raw header octets (RFC 3501 §6.4.4). Try the existing raw RFC
+ * 2047-decoded substring match first (keeps display-name / comment-as-name /
+ * substring hits), then a vmime-parsed form so that commented/folded addresses
+ * like "<u (c)@ (c) d.org>" still match the contiguous "u@d.org".
+ */
+static bool me_ct_match_addr(const char *charset, const char *raw,
+    const char *keyword) try
+{
+	auto rs = me_ct_decode_mime(charset, raw);
+	if (rs != nullptr && strcasestr(rs.get(), keyword) != nullptr)
+		return true;
+	vmime::addressList al;
+	try {
+		al.parse(raw);
+	} catch (const vmime::exception &) {
+		return false;
+	}
+	for (const auto &a : al.getAddressList()) {
+		auto grp = vmime::dynamicCast<vmime::mailboxGroup>(a);
+		if (grp != nullptr) {
+			for (const auto &m : grp->getMailboxList())
+				if (match_addr_vmime(*m, keyword))
+					return true;
+			continue;
+		}
+		auto mb = vmime::dynamicCast<vmime::mailbox>(a);
+		if (mb != nullptr && match_addr_vmime(*mb, keyword))
+			return true;
+	}
+	return false;
+} catch (const std::bad_alloc &) {
+	return false;
+}
+
+/**
+ * Converts a date string to unixtime, truncating/ignoring time and zone and
+ * normalizing to midnight UTC. This is for facilitating
+ * SENTBEFORE/SENTON/SENTSINCE comparisons (RFC 3501 §6.4.4) that ignore those
+ * parts of the date. (This lines up with the code in `me_ct_build_internal`,
+ * which also turns dates into a TZ-less midnight via timegm).
+ */
+static bool me_ct_sent_date(const char *date_str, time_t *out)
+{
+	struct tm tmp_tm{};
+	auto p = strptime(date_str, "%a, %d %b %Y", &tmp_tm);
+	if (p == nullptr)
+		p = strptime(date_str, "%d %b %Y", &tmp_tm);
+	if (p == nullptr)
+		return false;
+	tmp_tm.tm_hour = tmp_tm.tm_min = tmp_tm.tm_sec = 0;
+	*out = timegm(&tmp_tm);
+	return *out != static_cast<time_t>(-1);
 }
 
 static bool me_ct_search_head(const char *charset, const char *mid_string,
@@ -407,20 +484,35 @@ static bool me_ct_search_head(const char *charset, const char *mid_string,
 enum ctm_field {
 	CTM_MSGID, CTM_MODTIME, CTM_UID, CTM_RECENT, CTM_READ, CTM_UNSENT,
 	CTM_FLAGGED, CTM_REPLIED, CTM_FWD, CTM_DELETED, CTM_RCVDTIME,
-	CTM_FOLDERID, CTM_SIZE,
+	CTM_FOLDERID, CTM_SIZE, CTM_KEYWORDS,
 };
 
+static bool kw_test(const char *kw, const std::string &ct_keyword)
+{
+	if (kw == nullptr)
+		return false;
+	std::string_view sv = kw;
+	const std::string_view want = ct_keyword;
+	for (size_t pos = 0; pos < sv.size(); ) {
+		auto sp = sv.find(' ', pos);
+		if (sp == sv.npos)
+			sp = sv.size();
+		auto tok = sv.substr(pos, sp - pos);
+		if (tok.size() == want.size() &&
+		    strncasecmp(tok.data(), want.data(), tok.size()) == 0)
+			return true;
+		pos = sp + 1;
+	}
+	return false;
+}
+
 static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
-    sqlite3_stmt *pstmt_message, const char *mid_string, int id, int total_mail,
+    xstmt &stm, const char *mid_string, int id, int total_mail,
     uint32_t uidnext, const CONDITION_TREE *ptree) try
 {
 	size_t sp = 0;
 	bool b_loaded, b_result, b_result1;
 	midb_conj conjunction;
-	time_t tmp_time;
-	size_t temp_len;
-	char temp_buff[1024];
-	char temp_buff1[1024];
 	KEYWORD_ENUM keyword_enum;
 	std::vector<const CONDITION_TREE *> trees;
 	std::vector<CONDITION_TREE::const_iterator> nodes;
@@ -466,399 +558,390 @@ static bool me_ct_match_mail(sqlite3 *psqlite, const char *charset,
 			PUSH_MATCH(ptree, pnode, conjunction, b_result)
 			ptree = &*ptree_node->pbranch;
 			goto PROC_BEGIN;
-		} else {
-			switch (ptree_node->condition) {
-			case midb_cond::all:
-			case midb_cond::keyword:
-			case midb_cond::unkeyword:
+		}
+		switch (ptree_node->condition) {
+		case midb_cond::all:
+			b_result1 = true;
+			break;
+		case midb_cond::keyword:
+		case midb_cond::unkeyword: {
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			auto kw = stm.col_text(CTM_KEYWORDS);
+			bool found = kw_test(kw, ptree_node->ct_keyword);
+			b_result1 = ptree_node->condition == midb_cond::keyword ? found : !found;
+			break;
+		}
+		case midb_cond::answered:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_REPLIED) != 0)
 				b_result1 = true;
-				break;
-			case midb_cond::answered:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
+			break;
+		case midb_cond::bcc: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
 					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_REPLIED) != 0)
-					b_result1 = true;
-				break;
-			case midb_cond::bcc:
-				/* we do not support BCC field in mail digest,
-					BCC should not recorded in mail head */
-				break;
-			case midb_cond::before:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				tmp_time = rop_util_nttime_to_unix(
-					sqlite3_column_int64(pstmt_message, CTM_RCVDTIME));
-				if (tmp_time < ptree_node->ct_time)
-					b_result1 = true;
-				break;
-			case midb_cond::body: {
-				if (!b_loaded) {
-					if (me_get_digest(psqlite, mid_string, digest) == 0)
-						break;
-					b_loaded = true;
-				}
-				MJSON temp_mjson;
-				snprintf(temp_buff, 256, "%s/eml",
-						cu_get_maildir());
-				if (!temp_mjson.load_from_json(digest))
-					break;
-				temp_mjson.path = temp_buff;
-				keyword_enum.pjson = &temp_mjson;
-				keyword_enum.b_result = FALSE;
-				keyword_enum.charset = charset;
-				keyword_enum.keyword = ptree_node->ct_keyword.c_str();
-				temp_mjson.enum_mime(me_ct_enum_mime, &keyword_enum);
-				if (keyword_enum.b_result)
-					b_result1 = true;
-				break;
+				b_loaded = true;
 			}
-			case midb_cond::cc: {
-				if (!b_loaded) {
-					if (me_get_digest(psqlite, mid_string, digest) == 0)
-						break;
-					b_loaded = true;
-				}
-				if (!get_digest(digest, "cc", temp_buff, std::size(temp_buff)) ||
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) != 0)
+			std::string val;
+			if (!get_digest(digest, "bcc", val))
+				break;
+			if (me_ct_match_addr(charset, base64_decode(val).c_str(),
+			    ptree_node->ct_keyword.c_str()))
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::before: {
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			auto tmp_time = rop_util_nttime_to_unix(stm.col_int64(CTM_RCVDTIME));
+			if (tmp_time < ptree_node->ct_time)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::body: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
 					break;
-				temp_buff1[temp_len] = '\0';
-				auto rs = me_ct_decode_mime(charset, temp_buff1);
+				b_loaded = true;
+			}
+			MJSON temp_mjson;
+			if (!temp_mjson.load_from_json(digest))
+				break;
+			temp_mjson.path = cu_get_maildir() + "/eml"s;
+			keyword_enum.pjson = &temp_mjson;
+			keyword_enum.b_result = FALSE;
+			keyword_enum.charset = charset;
+			keyword_enum.keyword = ptree_node->ct_keyword.c_str();
+			keyword_enum.b_body_only = true;
+			temp_mjson.enum_mime(me_ct_enum_mime, &keyword_enum);
+			if (keyword_enum.b_result)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::cc: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (!get_digest(digest, "cc", val))
+				break;
+			if (me_ct_match_addr(charset, base64_decode(val).c_str(),
+			    ptree_node->ct_keyword.c_str()))
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::deleted:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_DELETED) != 0)
+				b_result1 = true;
+			break;
+		case midb_cond::draft:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_UNSENT) != 0)
+				b_result1 = true;
+			break;
+		case midb_cond::flagged:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_FLAGGED) != 0)
+				b_result1 = true;
+			break;
+		case midb_cond::from: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (!get_digest(digest, "from", val))
+				break;
+			if (me_ct_match_addr(charset, base64_decode(val).c_str(),
+			    ptree_node->ct_keyword.c_str()))
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::header:
+			b_result1 = me_ct_search_head(charset, mid_string,
+				ptree_node->ct_headers[0],
+				ptree_node->ct_headers[1]);
+			break;
+		case midb_cond::id:
+			b_result1 = ct_hint_seq(ptree_node->ct_seq, id, total_mail);
+			break;
+		case midb_cond::larger:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_uint64(CTM_SIZE) > ptree_node->ct_size)
+				b_result1 = true;
+			break;
+		case midb_cond::is_new:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_RECENT) != 0 &&
+			    stm.col_int64(CTM_READ) == 0)
+				b_result1 = true;
+			break;
+		case midb_cond::old:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_RECENT) == 0)
+				b_result1 = true;
+			break;
+		case midb_cond::on: {
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			auto tmp_time = rop_util_nttime_to_unix(stm.col_int64(CTM_RCVDTIME));
+			if (tmp_time >= ptree_node->ct_time &&
+			    tmp_time < ptree_node->ct_time + 86400)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::recent:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_RECENT) != 0)
+				b_result1 = true;
+			break;
+		case midb_cond::seen:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_READ) != 0)
+				b_result1 = true;
+			break;
+		case midb_cond::sent_before: {
+			/*
+			 * Surely this could be optimized by adding
+			 * dedicated recv_time/snd_time columns to
+			 * midb.sqlite3(?) in addition to the existing
+			 * mod_time.
+			 */
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (!get_digest(digest, "date", val))
+				break;
+			time_t tmp_time{};
+			if (me_ct_sent_date(base64_decode(val).c_str(), &tmp_time) &&
+			    tmp_time < ptree_node->ct_time)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::sent_on: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (!get_digest(digest, "date", val))
+				break;
+			time_t tmp_time{};
+			if (me_ct_sent_date(base64_decode(val).c_str(), &tmp_time) &&
+			    tmp_time >= ptree_node->ct_time &&
+			    tmp_time < ptree_node->ct_time + 86400)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::sent_since: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (!get_digest(digest, "date", val))
+				break;
+			time_t tmp_time{};
+			if (me_ct_sent_date(base64_decode(val).c_str(), &tmp_time) &&
+			    tmp_time >= ptree_node->ct_time)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::since: {
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			auto tmp_time = rop_util_nttime_to_unix(stm.col_int64(CTM_RCVDTIME));
+			if (tmp_time >= ptree_node->ct_time)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::smaller:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_uint64(CTM_SIZE) < ptree_node->ct_size)
+				b_result1 = true;
+			break;
+		case midb_cond::subject: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (!get_digest(digest, "subject", val))
+				break;
+			auto rs = me_ct_decode_mime(charset, base64_decode(val).c_str());
+			if (rs != nullptr && strcasestr(rs.get(),
+			    ptree_node->ct_keyword.c_str()) != nullptr)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::text: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
+					break;
+				b_loaded = true;
+			}
+			std::string val;
+			if (get_digest(digest, "cc", val)) {
+				auto rs = me_ct_decode_mime(charset, base64_decode(val).c_str());
 				if (rs != nullptr && strcasestr(rs.get(),
 				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
-				break;
 			}
-			case midb_cond::deleted:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_DELETED) != 0)
-					b_result1 = true;
+			if (b_result1)
 				break;
-			case midb_cond::draft:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_UNSENT) != 0)
-					b_result1 = true;
-				break;
-			case midb_cond::flagged:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_FLAGGED) != 0)
-					b_result1 = true;
-				break;
-			case midb_cond::from: {
-				if (!b_loaded) {
-					if (me_get_digest(psqlite, mid_string, digest) == 0)
-						break;
-					b_loaded = true;
-				}
-				if (!get_digest(digest, "from", temp_buff, std::size(temp_buff)) ||
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) != 0)
-					break;
-				temp_buff1[temp_len] = '\0';
-				auto rs = me_ct_decode_mime(charset, temp_buff1);
+			if (get_digest(digest, "from", val)) {
+				auto rs = me_ct_decode_mime(charset, base64_decode(val).c_str());
 				if (rs != nullptr && strcasestr(rs.get(),
 				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
-				break;
 			}
-			case midb_cond::header:
-				b_result1 = me_ct_search_head(charset, mid_string,
-					ptree_node->ct_headers[0],
-					ptree_node->ct_headers[1]);
+			if (b_result1)
 				break;
-			case midb_cond::id:
-				b_result1 = ct_hint_seq(ptree_node->ct_seq, id, total_mail);
-				break;
-			case midb_cond::larger:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (gx_sql_col_uint64(pstmt_message, 12) >
-				    ptree_node->ct_size)
-					b_result1 = true;
-				break;
-			case midb_cond::is_new:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_RECENT) != 0 &&
-				    sqlite3_column_int64(pstmt_message, CTM_READ) == 0)
-					b_result1 = true;
-				break;
-			case midb_cond::old:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_RECENT) == 0)
-					b_result1 = true;
-				break;
-			case midb_cond::on:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				tmp_time = rop_util_nttime_to_unix(
-					sqlite3_column_int64(pstmt_message, CTM_RCVDTIME));
-				if (tmp_time >= ptree_node->ct_time &&
-				    tmp_time < ptree_node->ct_time + 86400)
-					b_result1 = true;
-				break;
-			case midb_cond::recent:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_RECENT) != 0)
-					b_result1 = true;
-				break;
-			case midb_cond::seen:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_READ) != 0)
-					b_result1 = true;
-				break;
-			case midb_cond::sent_before:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				tmp_time = rop_util_nttime_to_unix(
-					sqlite3_column_int64(pstmt_message, CTM_MODTIME));
-				if (tmp_time < ptree_node->ct_time)
-					b_result1 = true;
-				break;
-			case midb_cond::sent_on:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				tmp_time = rop_util_nttime_to_unix(
-					sqlite3_column_int64(pstmt_message, CTM_MODTIME));
-				if (tmp_time >= ptree_node->ct_time &&
-				    tmp_time < ptree_node->ct_time + 86400)
-					b_result1 = true;
-				break;
-			case midb_cond::sent_since:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				tmp_time = rop_util_nttime_to_unix(
-					sqlite3_column_int64(pstmt_message, CTM_MODTIME));
-				if (tmp_time >= ptree_node->ct_time)
-					b_result1 = true;
-				break;
-			case midb_cond::since:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				tmp_time = rop_util_nttime_to_unix(
-					sqlite3_column_int64(pstmt_message, CTM_RCVDTIME));
-				if (tmp_time >= ptree_node->ct_time)
-					b_result1 = true;
-				break;
-			case midb_cond::smaller:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (gx_sql_col_uint64(pstmt_message, 12) < ptree_node->ct_size)
-					b_result1 = true;
-				break;
-			case midb_cond::subject: {
-				if (!b_loaded) {
-					if (me_get_digest(psqlite, mid_string, digest) == 0)
-						break;
-					b_loaded = true;
-				}
-				if (!get_digest(digest, "subject", temp_buff, std::size(temp_buff)) ||
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) != 0)
-					break;
-				temp_buff1[temp_len] = '\0';
-				auto rs = me_ct_decode_mime(charset, temp_buff1);
+			if (get_digest(digest, "subject", val)) {
+				auto rs = me_ct_decode_mime(charset, base64_decode(val).c_str());
 				if (rs != nullptr && strcasestr(rs.get(),
 				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
-				break;
 			}
-			case midb_cond::text: {
-				if (!b_loaded) {
-					if (me_get_digest(psqlite, mid_string, digest) == 0)
-						break;
-					b_loaded = true;
-				}
-				if (get_digest(digest, "cc", temp_buff, std::size(temp_buff)) &&
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) == 0) {
-					temp_buff1[temp_len] = '\0';
-					auto rs = me_ct_decode_mime(charset, temp_buff1);
-					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword.c_str()) != nullptr)
-						b_result1 = true;
-				}
-				if (b_result1)
-					break;
-				if (get_digest(digest, "from", temp_buff, std::size(temp_buff)) &&
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) == 0) {
-					temp_buff1[temp_len] = '\0';
-					auto rs = me_ct_decode_mime(charset, temp_buff1);
-					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword.c_str()) != nullptr)
-						b_result1 = true;
-				}
-				if (b_result1)
-					break;
-				if (get_digest(digest, "subject", temp_buff, std::size(temp_buff)) &&
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) == 0) {
-					temp_buff1[temp_len] = '\0';
-					auto rs = me_ct_decode_mime(charset, temp_buff1);
-					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword.c_str()) != nullptr)
-						b_result1 = true;
-				}
-				if (b_result1)
-					break;
-				if (get_digest(digest, "to", temp_buff, std::size(temp_buff)) &&
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) == 0) {
-					temp_buff1[temp_len] = '\0';
-					auto rs = me_ct_decode_mime(charset, temp_buff1);
-					if (rs != nullptr && strcasestr(rs.get(),
-					    ptree_node->ct_keyword.c_str()) != nullptr)
-						b_result1 = true;
-				}
-				if (b_result1)
-					break;
-				MJSON temp_mjson;
-				snprintf(temp_buff, 256, "%s/eml",
-						cu_get_maildir());
-				if (!temp_mjson.load_from_json(digest))
-					break;
-				temp_mjson.path = temp_buff;
-				keyword_enum.pjson = &temp_mjson;
-				keyword_enum.b_result = FALSE;
-				keyword_enum.charset = charset;
-				keyword_enum.keyword = ptree_node->ct_keyword.c_str();
-				temp_mjson.enum_mime(me_ct_enum_mime, &keyword_enum);
-				if (keyword_enum.b_result)
-					b_result1 = true;
+			if (b_result1)
 				break;
-			}
-			case midb_cond::to: {
-				if (!b_loaded) {
-					if (me_get_digest(psqlite, mid_string, digest) == 0)
-						break;
-					b_loaded = true;
-				}
-				if (!get_digest(digest, "to", temp_buff, std::size(temp_buff)) ||
-				    decode64(temp_buff, strlen(temp_buff),
-				    temp_buff1, std::size(temp_buff1), &temp_len) != 0)
-					break;
-				temp_buff1[temp_len] = '\0';
-				auto rs = me_ct_decode_mime(charset, temp_buff1);
+			if (get_digest(digest, "to", val)) {
+				auto rs = me_ct_decode_mime(charset, base64_decode(val).c_str());
 				if (rs != nullptr && strcasestr(rs.get(),
 				    ptree_node->ct_keyword.c_str()) != nullptr)
 					b_result1 = true;
-				break;
 			}
-			case midb_cond::unanswered:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
+			if (b_result1)
+				break;
+			MJSON temp_mjson;
+			if (!temp_mjson.load_from_json(digest))
+				break;
+			temp_mjson.path = cu_get_maildir() + "/eml"s;
+			keyword_enum.pjson = &temp_mjson;
+			keyword_enum.b_result = FALSE;
+			keyword_enum.charset = charset;
+			keyword_enum.keyword = ptree_node->ct_keyword.c_str();
+			keyword_enum.b_body_only = false;
+			temp_mjson.enum_mime(me_ct_enum_mime, &keyword_enum);
+			if (keyword_enum.b_result)
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::to: {
+			if (!b_loaded) {
+				if (me_get_digest(psqlite, mid_string, digest) == 0)
 					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_REPLIED) == 0)
-					b_result1 = true;
-				break;
-			case midb_cond::uid:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				b_result1 = ct_hint_seq(ptree_node->ct_seq,
-					sqlite3_column_int64(pstmt_message, CTM_UID),
-					uidnext);
-				break;
-			case midb_cond::undeleted:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_DELETED) == 0)
-					b_result1 = true;
-				break;
-			case midb_cond::undraft:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_UNSENT) == 0)
-					b_result1 = true;
-				break;
-			case midb_cond::unflagged:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_FLAGGED) == 0)
-					b_result1 = true;
-				break;
-			case midb_cond::unseen:
-				sqlite3_reset(pstmt_message);
-				sqlite3_bind_text(pstmt_message,
-					1, mid_string, -1, SQLITE_STATIC);
-				if (gx_sql_step(pstmt_message) != SQLITE_ROW)
-					break;
-				if (sqlite3_column_int64(pstmt_message, CTM_READ) == 0)
-					b_result1 = true;
-				break;
-			default:
-				mlog(LV_DEBUG, "mail_engine: condition stat %u unknown!",
-					static_cast<unsigned int>(ptree_node->condition));
-				break;
+				b_loaded = true;
 			}
+			std::string val;
+			if (!get_digest(digest, "to", val))
+				break;
+			if (me_ct_match_addr(charset, base64_decode(val).c_str(),
+			    ptree_node->ct_keyword.c_str()))
+				b_result1 = true;
+			break;
+		}
+		case midb_cond::unanswered:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_REPLIED) == 0)
+				b_result1 = true;
+			break;
+		case midb_cond::uid:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			b_result1 = ct_hint_seq(ptree_node->ct_seq,
+				    stm.col_int64(CTM_UID), uidnext);
+			break;
+		case midb_cond::undeleted:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_DELETED) == 0)
+				b_result1 = true;
+			break;
+		case midb_cond::undraft:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_UNSENT) == 0)
+				b_result1 = true;
+			break;
+		case midb_cond::unflagged:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_FLAGGED) == 0)
+				b_result1 = true;
+			break;
+		case midb_cond::unseen:
+			stm.reset();
+			stm.bind_text(1, mid_string);
+			if (stm.step() != SQLITE_ROW)
+				break;
+			if (stm.col_int64(CTM_READ) == 0)
+				b_result1 = true;
+			break;
+		default:
+			mlog(LV_DEBUG, "mail_engine: condition stat %u unknown!",
+				static_cast<unsigned int>(ptree_node->condition));
+			break;
 		}
 		}
 		
@@ -1019,6 +1102,7 @@ static std::optional<CONDITION_TREE> me_ct_build_internal(const char *charset,
 			i ++;
 			if (i >= argv.size())
 				return {};
+			keyword = argv[i].data();
 		} else {
 			ptree_node->conjunction = midb_conj::c_and;
 		}
@@ -1027,7 +1111,7 @@ static std::optional<CONDITION_TREE> me_ct_build_internal(const char *charset,
 			i ++;
 			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_keyword = me_ct_to_utf8(charset, keyword);
+			ptree_node->ct_keyword = me_ct_to_utf8(charset, argv[i].data());
 		} else if (array_find_istr(kwlist2, keyword)) {
 			if (i + 1 > argv.size())
 				return {};
@@ -1036,7 +1120,7 @@ static std::optional<CONDITION_TREE> me_ct_build_internal(const char *charset,
 			if (i + 1 > argv.size())
 				return {};
 			memset(&tmp_tm, 0, sizeof(tmp_tm));
-			if (strptime(keyword, "%d-%b-%Y", &tmp_tm) == nullptr)
+			if (strptime(argv[i].data(), "%d-%b-%Y", &tmp_tm) == nullptr)
 				return {};
 			tmp_tm.tm_wday = -1;
 			ptree_node->ct_time = timegm(&tmp_tm);
@@ -1079,11 +1163,11 @@ static std::optional<CONDITION_TREE> me_ct_build_internal(const char *charset,
 			i ++;
 			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_headers[0] = keyword;
+			ptree_node->ct_headers[0] = argv[i];
 			i ++;
 			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_headers[1] = keyword;
+			ptree_node->ct_headers[1] = argv[i];
 		} else if (strcasecmp(keyword, "LARGER") == 0 ||
 		    strcasecmp(keyword, "SMALLER") == 0) {
 			ptree_node->condition = strcasecmp(keyword, "LARGER") == 0 ?
@@ -1091,14 +1175,14 @@ static std::optional<CONDITION_TREE> me_ct_build_internal(const char *charset,
 			i ++;
 			if (i + 1 > argv.size())
 				return {};
-			ptree_node->ct_size = strtol(keyword, nullptr, 0);
+			ptree_node->ct_size = strtol(argv[i].data(), nullptr, 0);
 		} else if (strcasecmp(keyword, "UID") == 0) {
 			ptree_node->condition = midb_cond::uid;
 			i ++;
 			if (i + 1 > argv.size())
 				return {};
 			imap_seq_list r;
-			if (parse_imap_seq(r, keyword) != 0)
+			if (parse_imap_seq(r, argv[i].data()) != 0)
 				return {};
 			ptree_node->ct_seq = std::move(r);
 		} else {
@@ -1129,18 +1213,17 @@ static bool ct_hint_seq(const imap_seq_list &list,
     unsigned int num, unsigned int max_uid)
 {
 	for (const auto &seq : list) {
-		if (seq.hi == SEQ_STAR) {
-			if (seq.lo == SEQ_STAR) {
-				if (num == max_uid)
-					return true;
-			} else {
-				if (num >= seq.lo)
-					return true;
-			}
-		} else {
-			if (seq.hi >= num && seq.lo <= num)
-				return true;
-		}
+		uint32_t lo = seq.lo == SEQ_STAR ? max_uid : seq.lo;
+		uint32_t hi = seq.hi == SEQ_STAR ? max_uid : seq.hi;
+		/*
+		 * Resolution of STAR may reduce @hi to below @lo. Order is
+		 * irrelevant (RFC 3501 §6.4.8/§9) and needs to be reversed for
+		 * the sake of testing for lo<=n<=hi.
+		 */
+		if (lo > hi)
+			std::swap(lo, hi);
+		if (lo <= num && num <= hi)
+			return true;
 	}
 	return false;
 }
@@ -1170,7 +1253,7 @@ static std::optional<std::vector<int>> me_ct_match(const char *charset,
 	/* Match this column list to ctm_field */
 	auto pstmt_message = gx_sql_prep(psqlite, "SELECT message_id, mod_time, "
 	                     "uid, recent, read, unsent, flagged, replied, forwarded,"
-	                     "deleted, received, folder_id, size FROM messages "
+	                     "deleted, received, folder_id, size, keywords FROM messages "
 	                     "WHERE mid_string=?");
 	if (pstmt_message == nullptr)
 		return {};
@@ -1209,52 +1292,79 @@ static uint64_t me_get_folder_id(IDB_ITEM *pidb, std::string_view name)
 	return me_get_folder_id_raw(pidb, base64_decode(name));
 }
 
-static void me_extract_digest_fields(const Json::Value &digest, char *subject,
-    size_t subjsize, char *from, size_t fromsize, char *rcpt, size_t rcptsize,
+static void me_extract_digest_fields(const Json::Value &digest,
+    std::string &subject, std::string &from, std::string &rcpt,
     size_t *psize)
 {
-	size_t out_len;
-	char temp_buff[64*1024];
-	char temp_buff1[64*1024];
+	std::string val;
 	
-	subject[0] = '\0';
-	if (get_digest(digest, "subject", temp_buff, std::size(temp_buff)) &&
-	    decode64(temp_buff, strlen(temp_buff), subject, subjsize, &out_len) != 0)
-		/* Decode failed */
-		subject[0] = '\0';
-	from[0] = '\0';
-	if (get_digest(digest, "from", temp_buff, std::size(temp_buff)) &&
-	    decode64(temp_buff, strlen(temp_buff), temp_buff1,
-	    std::size(temp_buff1), &out_len) == 0) {
-		EMAIL_ADDR temp_address(temp_buff1);
-		gx_strlcpy(from, temp_address.addr, fromsize);
+	subject.clear();
+	if (get_digest(digest, "subject", val))
+		subject = base64_decode(val);
+	from.clear();
+	if (get_digest(digest, "from", val)) {
+		EMAIL_ADDR temp_address(base64_decode(val).c_str());
+		from = temp_address.addr;
 	}
-	rcpt[0] = '\0';
-	if (get_digest(digest, "to", temp_buff, std::size(temp_buff)) &&
-	    decode64(temp_buff, strlen(temp_buff), temp_buff1,
-	    std::size(temp_buff1), &out_len) == 0) {
-		for (size_t i = 0; i < out_len; ++i) {
-			if (',' == temp_buff1[i] ||
-			    ';' == temp_buff1[i]) {
-				temp_buff1[i] = '\0';
+	rcpt.clear();
+	if (get_digest(digest, "to", val)) {
+		val = base64_decode(val);
+		for (size_t i = 0; i < val.size(); ++i) {
+			if (val[i] == ',' || val[i] == ';') {
+				val[i] = '\0';
 				break;
 			}
 		}
-		HX_strrtrim(temp_buff1);
-		EMAIL_ADDR temp_address(temp_buff1);
-		gx_strlcpy(rcpt, temp_address.addr, rcptsize);
+		HX_strrtrim(val.data());
+		EMAIL_ADDR temp_address(val.c_str());
+		rcpt = temp_address.addr;
 	}
 	*psize = 0;
-	if (get_digest(digest, "size", temp_buff, std::size(temp_buff)))
-		*psize = strtoull(temp_buff, nullptr, 0);
+	if (get_digest(digest, "size", val))
+		*psize = strtoull(val.c_str(), nullptr, 0);
+}
+
+static inline bool atom_special(char c)
+{
+	/*
+	 * For a slightly better user experience reading translated keyword
+	 * names, ban brackets symmetrically.
+	 */
+	return c == '(' || c == ')' || c == '{' || c == '}' || c == ' ' ||
+	       (c >= 0x00 && c <= 0x1F) || c == 0x7F || c == '%' || c == '*' ||
+	       c == '"' || c == '\\' || c == '[' || c == ']';
+}
+
+/**
+ * Obtain message object categories and turn it into a single space-separated
+ * string.
+ */
+static std::string me_get_categories(const char *dir, message_content &mct)
+{
+	std::string kw;
+	const PROPERTY_NAME name = {MNID_STRING, PS_PUBLIC_STRINGS, 0, deconst("Keywords")};
+	const PROPNAME_ARRAY req = {1, deconst(&name)};
+	PROPID_ARRAY rsp{};
+	if (!exmdb_client->get_named_propids(dir, false, &req, &rsp) ||
+	    rsp.size() != 1 || rsp[0] == 0)
+		return kw;
+	auto sa = mct.proplist.get<const STRING_ARRAY>(PROP_TAG(PT_MV_UNICODE, rsp[0]));
+	if (sa == nullptr)
+		return kw;
+	for (std::string categ : *sa) {
+		std::replace_if(categ.begin(), categ.end(), [](char c) { return !atom_special(c); }, '_');
+		if (!kw.empty())
+			kw += ' ';
+		kw += std::move(categ);
+	}
+	return kw;
 }
 
 static bool me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
     uint64_t message_id, sqlite3 *db, syncmessage_entry e) try
 {
-	char from[UADDR_SIZE], rcpt[UADDR_SIZE];
-	char subject[1024];
 	MESSAGE_CONTENT *pmsgctnt;
+	std::string keywords;
 	
 	auto dir = cu_get_maildir();
 	std::string djson;
@@ -1285,6 +1395,11 @@ static bool me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 				dir, LLU{message_id});
 			return false;
 		}
+		/*
+		 * Obtain message object categories and turn it into a single
+		 * space-separated string.
+		 */
+		keywords = me_get_categories(dir, *pmsgctnt);
 		auto log_id = dir + ":m"s + std::to_string(message_id);
 		MAIL imail;
 		oxcmail_converter cvt;
@@ -1325,12 +1440,11 @@ static bool me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 	bool b_read   = e.msg_flags & MSGFLAG_READ;
 	djson.clear();
 	size_t size = 0;
-	me_extract_digest_fields(digest, subject,
-		std::size(subject), from, std::size(from), rcpt,
-		std::size(rcpt), &size);
+	std::string from, rcpt, subject;
+	me_extract_digest_fields(digest, subject, from, rcpt, &size);
 	stm_insert.reset();
 	stm_insert.bind_int64(1, message_id);
-	stm_insert.bind_text(2, e.midstr.c_str());
+	stm_insert.bind_text(2, e.midstr);
 	stm_insert.bind_int64(3, e.mod_time);
 	stm_insert.bind_int64(4, *puidnext);
 	stm_insert.bind_int64(5, b_unsent);
@@ -1340,6 +1454,7 @@ static bool me_insert_message(xstmt &stm_insert, uint32_t *puidnext,
 	stm_insert.bind_text(9, rcpt);
 	stm_insert.bind_int64(10, size);
 	stm_insert.bind_int64(11, e.recv_time);
+	stm_insert.bind_text(12, keywords);
 	if (stm_insert.step() != SQLITE_DONE)
 		mlog(LV_ERR, "E-2075: sqlite_step not finished");
 	auto qstr = "UPDATE messages SET flagged=" + std::to_string(e.flagged);
@@ -1392,7 +1507,37 @@ static bool me_sync_message(IDB_ITEM *pidb, xstmt &stm_insert,
 	return me_insert_message(stm_insert, puidnext, message_id, pidb->psqlite, e);
 }
 
-static BOOL me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id) try
+/**
+ * Commit the in-progress resync transaction and start a fresh one. This
+ * function is used to checkpoint a long operation like X-RSYF at chunk
+ * boundaries. The function also distinguishes SQLITE_FULL from other error
+ * codes, so that an operator sees the real cause (disk/WAL exhaustion) rather
+ * than a generic failure. On any commit error, the transaction is left for the
+ * caller's xtransaction dtor to roll back.
+ *
+ * Returns a bool indicating the success of the entire commit—rebegin cycle.
+ */
+static bool me_sync_checkpoint(sqlite3 *db, xtransaction &xact, const char *dir)
+{
+	auto ret = xact.commit();
+	if (ret == SQLITE_FULL) {
+		mlog(LV_ERR, "E-2456: sync_mailbox %s: disk or WAL full while committing resync; aborting", dir);
+		return false;
+	} else if (ret != SQLITE_OK) {
+		mlog(LV_ERR, "E-2457: sync_mailbox %s: commit failed during resync: %s",
+			dir, sqlite3_errstr(ret));
+		return false;
+	}
+	xact = gx_sql_begin(db, txn_mode::write);
+	if (!xact) {
+		mlog(LV_ERR, "E-2458: sync_mailbox %s: could not reopen transaction after checkpoint", dir);
+		return false;
+	}
+	return true;
+}
+
+static bool me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id,
+    xtransaction *xact = nullptr) try
 {
 	TARRAY_SET rows;
 	uint32_t uidnext;
@@ -1463,8 +1608,8 @@ static BOOL me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id) try
 		return FALSE;
 	snprintf(sql_string, std::size(sql_string), "INSERT INTO messages (message_id, "
 		"folder_id, mid_string, mod_time, uid, unsent, read, subject,"
-		" sender, rcpt, size, received) VALUES (?, %llu, ?, ?, ?, ?, "
-		"?, ?, ?, ?, ?, ?)", LLU{folder_id});
+		" sender, rcpt, size, received, keywords) VALUES (?, %llu, ?, ?, ?, ?, "
+		"?, ?, ?, ?, ?, ?, ?)", LLU{folder_id});
 	auto stm_insert_msg = gx_sql_prep(pidb->psqlite, sql_string);
 	if (stm_insert_msg == nullptr)
 		return FALSE;
@@ -1493,6 +1638,47 @@ static BOOL me_sync_contents(IDB_ITEM *pidb, uint64_t folder_id) try
 		if (++procmsgs % 512 == 0)
 			mlog(LV_NOTICE, "sync_contents %s fld %llu progress: %zu/%zu",
 			        dir, LLU{folder_id}, procmsgs, totalmsgs);
+		/*
+		 * Checkpoint long resyncs so the WAL and the write-lock hold
+		 * stay bounded. The prepared statements survive the
+		 * COMMIT/BEGIN. The folder's commit_max is only advanced once
+		 * the whole folder is done (in me_sync_mailbox), so an
+		 * interrupted resync simply reprocesses this folder next time
+		 * rather than recording it as up to date with partial
+		 * contents.
+		 */
+		if (xact != nullptr && procmsgs % SYNC_COMMIT_CHUNK == 0) {
+			/*
+			 * Reset any statement cursor still positioned on a
+			 * row; SQLite refuses to COMMIT while a statement is
+			 * active.
+			 */
+			stm_select_msg.reset();
+			stm_insert_msg.reset();
+			stm_upd_msg.reset();
+			/*
+			 * Persist folders.uidnext together with this chunk.
+			 * The committed message rows already carry assigned
+			 * uids; if we commit them without advancing the folder
+			 * counter and the resync is then interrupted, the
+			 * rerun would reassign uids starting from the stale
+			 * counter and collide with the retained rows (the
+			 * messages.uid index is not unique, so the collision
+			 * would be silent). Advancing it here keeps the
+			 * durable rows and the counter consistent at every
+			 * commit boundary.
+			 */
+			if (uidnext != uidnext1) {
+				snprintf(sql_string, std::size(sql_string),
+				         "UPDATE folders SET uidnext=%u WHERE folder_id=%llu",
+				         uidnext, LLU{folder_id});
+				if (gx_sql_exec(pidb->psqlite, sql_string) != SQLITE_OK)
+					return false;
+				uidnext1 = uidnext;
+			}
+			if (!me_sync_checkpoint(pidb->psqlite, *xact, dir))
+				return false;
+		}
 	}
 	if (g_midb_stop)
 		return true;
@@ -1686,7 +1872,7 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 	if (stm_select == nullptr)
 		return false;
 	auto stm_insert = gx_sql_prep(pidb->psqlite, "INSERT INTO folders (folder_id, "
-	                  "parent_fid, commit_max, name) VALUES (?, ?, ?, ?)");
+	                  "parent_fid, commit_max, name, unsub) VALUES (?, ?, ?, ?, ?)");
 	if (stm_insert == nullptr)
 		return false;
 	for (const auto &[folder_id, entry] : syncfolderlist) {
@@ -1712,6 +1898,8 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 			stm_insert.bind_int64(2, parent_fid);
 			stm_insert.bind_int64(3, commit_max);
 			stm_insert.bind_text(4, encoded_name);
+			/* Only INBOX gets to be subscribed by default */
+			stm_insert.bind_int64(5, folder_id == PRIVATE_FID_INBOX ? 0 : 1);
 			auto rx = stm_insert.step();
 			if (rx == SQLITE_CONSTRAINT) {
 				mlog(LV_ERR, "E-1224: XXX: Not implemented: midb is unable to cope with folder deletions that occurred while midb was not connected to exmdb");
@@ -1741,7 +1929,9 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 			if (stm_select.col_uint64(2) == commit_max && !force_resync)
 				continue;	
 		}
-		if (!me_sync_contents(pidb, folder_id))
+		/* Cleanup so me_sync_contents can end the transaction */
+		stm_select.reset();
+		if (!me_sync_contents(pidb, folder_id, &pidb_transact))
 			return false;
 		if (!b_new) {
 			auto qstr = fmt::format("UPDATE folders SET commit_max={}"
@@ -1783,8 +1973,13 @@ static BOOL me_sync_mailbox(IDB_ITEM *pidb, bool force_resync = false) try
 		}
 		pstmt.finalize();
 	}
-	if (pidb_transact.commit() != SQLITE_OK)
+	auto cret = pidb_transact.commit();
+	if (cret == SQLITE_FULL) {
+		mlog(LV_ERR, "E-2406: sync_mailbox %s: disk or WAL full while committing resync; aborting", dir);
 		return false;
+	} else if (cret != SQLITE_OK) {
+		return false;
+	}
 	}
 	cl_err.release();
 	if (!exmdb_client->subscribe_notification(dir,
@@ -1809,7 +2004,21 @@ static IDB_REF me_peek_idb(const char *path)
 	auto pidb = &it->second;
 	pidb->reference ++;
 	hhold.unlock();
-	pidb->giant_lock.lock();
+	/*
+	 * Bound the wait like me_get_idb does. The exmdb notification dispatch
+	 * is serial per connection, so an unbounded lock() here would let one
+	 * store stuck in a long resync stall new-mail notifications for every
+	 * other store on that connection. On timeout the caller (X-RSYM /
+	 * midb_notif_handler) treats it as "not peekable right now" and a
+	 * later (re)sync reconciles the missed delta.
+	 */
+	if (!pidb->giant_lock.try_lock_for(DB_LOCK_TIMEOUT)) {
+		hhold.lock();
+		pidb->reference --;
+		hhold.unlock();
+		mlog(LV_ERR, "E-2405: mail_engine: timed out peeking a reference on %s", path);
+		return {};
+	}
 	if (pidb->psqlite != nullptr)
 		return IDB_REF(pidb);
 	pidb->last_time = 0;
@@ -2296,7 +2505,7 @@ static int me_mcopy(std::span<char *> argv, int sockd) try
 	/* Match this column list to ctm_field */
 	auto pstmt = gx_sql_prep(pidb->psqlite, "SELECT message_id, mod_time, "
 	             "uid, recent, read, unsent, flagged, replied, forwarded,"
-	             "deleted, received, folder_id, size FROM messages "
+	             "deleted, received, folder_id, size, keywords FROM messages "
 	             "WHERE mid_string=?");
 	if (pstmt == nullptr)
 		return MIDB_E_SQLPREP;
@@ -2305,6 +2514,7 @@ static int me_mcopy(std::span<char *> argv, int sockd) try
 	    pstmt.col_uint64(CTM_FOLDERID) != src_fid)
 		return MIDB_E_NO_MESSAGE;
 	uint64_t src_mid = pstmt.col_uint64(CTM_MSGID), message_id = 0;
+	std::string src_kw = znul(pstmt.col_text(CTM_KEYWORDS));
 	pstmt.finalize();
 	if (!exmdb_client->allocate_message_id(argv[1],
 	    rop_util_make_eid_ex(1, dst_fid), &message_id))
@@ -2332,6 +2542,24 @@ static int me_mcopy(std::span<char *> argv, int sockd) try
 		pstmt.bind_int64(1, rop_util_get_gc_value(message_id));
 		if (pstmt.step() == SQLITE_ROW) {
 			mid_string = "TRUE "s + pstmt.col_text(0) + "\r\n";
+			pstmt.finalize();
+			/*
+			 * exmdb carried PidNameKeywords to the copied message,
+			 * but the async midb insert took the cached-digest path
+			 * (the source ext file is hardlinked) and left the midb
+			 * keywords column empty. Mirror the source row's value
+			 * onto the dst row while we still hold the lock; no exmdb
+			 * round-trip is needed since the store already agrees.
+			 */
+			if (!src_kw.empty()) {
+				auto stm_kw = gx_sql_prep(pidb->psqlite, "UPDATE messages "
+				              "SET keywords=? WHERE message_id=?");
+				if (stm_kw != nullptr) {
+					stm_kw.bind_text(1, src_kw);
+					stm_kw.bind_int64(2, rop_util_get_gc_value(message_id));
+					stm_kw.step();
+				}
+			}
 			break;
 		}
 		pstmt.reset();
@@ -2626,7 +2854,7 @@ static int me_pfddt(std::span<char *> argv, int sockd)
 	size_t unreads = pstmt.step() == SQLITE_ROW ? pstmt.col_uint64(0) : 0;
 	pstmt.finalize();
 	snprintf(sql_string, std::size(sql_string), "SELECT count(message_id) FROM"
-	          " messages WHERE folder_id=%llu AND recent=0", LLU{folder_id});
+	          " messages WHERE folder_id=%llu AND recent!=0", LLU{folder_id});
 	pstmt = gx_sql_prep(pidb->psqlite, sql_string);
 	if (pstmt == nullptr)
 		return MIDB_E_SQLPREP;
@@ -2636,6 +2864,44 @@ static int me_pfddt(std::span<char *> argv, int sockd)
 	auto temp_len = gx_snprintf(temp_buff, std::size(temp_buff), "TRUE %zu %zu %zu %llu %llu\r\n",
 	                total, recents, unreads, LLU{folder_id},
 	                LLU{uidnext + 1});
+	return cmd_write(sockd, temp_buff, temp_len);
+}
+
+/**
+ * Folder aggregate octet size and \Deleted count, for the IMAP4rev2 STATUS
+ * SIZE and DELETED items (computed on demand, so the common P-FDDT summary
+ * path is unaffected).
+ *
+ * Request:
+ * 	P-FDSZ <store-dir> <folder-name>
+ * Response:
+ * 	TRUE <total-octets> <#deleted>
+ */
+static int me_pfdsz(std::span<char *> argv, int sockd)
+{
+	char temp_buff[256], sql_string[1024];
+
+	auto pidb = me_get_idb(argv[1]);
+	if (pidb == nullptr)
+		return MIDB_E_HASHTABLE_FULL;
+	auto folder_id = me_get_folder_id(pidb.get(), argv[2]);
+	if (folder_id == 0)
+		return MIDB_E_NO_FOLDER_TRYCREATE;
+	snprintf(sql_string, std::size(sql_string),
+	         "SELECT COALESCE(SUM(size), 0), "
+	         "COUNT(CASE WHEN deleted!=0 THEN 1 END) "
+	         "FROM messages WHERE folder_id=%llu", LLU{folder_id});
+	auto stm = gx_sql_prep(pidb->psqlite, sql_string);
+	if (stm == nullptr)
+		return MIDB_E_SQLPREP;
+	if (stm.step() != SQLITE_ROW)
+		return MIDB_E_NO_FOLDER;
+	uint64_t total_size = stm.col_uint64(0);
+	size_t deleted = stm.col_uint64(1);
+	stm.finalize();
+	pidb.reset();
+	auto temp_len = gx_snprintf(temp_buff, std::size(temp_buff),
+	                "TRUE %llu %zu\r\n", LLU{total_size}, deleted);
 	return cmd_write(sockd, temp_buff, temp_len);
 }
 
@@ -2726,7 +2992,7 @@ namespace {
 struct simu_node {
 	uint32_t uid;
 	unsigned int size;
-	std::string flags, mid_string;
+	std::string flags, mid_string, keywords;
 };
 
 }
@@ -2758,6 +3024,7 @@ static int simu_query(IDB_ITEM *pidb, const char *sql_string,
 			sn.flags += midb_flag::forwarded;
 		sn.flags += ')';
 		sn.size = pstmt.col_uint64(10);
+		sn.keywords = znul(pstmt.col_text(11));
 		temp_list.push_back(std::move(sn));
 	}
 	return 0;
@@ -2770,7 +3037,7 @@ static int simu_query(IDB_ITEM *pidb, const char *sql_string,
  * Give summary of messages present in folder (via IMAP UID)
  *
  * Request:
- * 	P-SIMU <store-dir> <folder-name> <uid(min)> <uid(max)>
+ * 	P-SIMU <store-dir> <folder-name> <uid(min)> <uid(max)> [<request-keywords>]
  * Response:
  * 	TRUE <#msgcount>
  * 	- <midstr> <uid> <flags> <size>  // repeat x #msgcount
@@ -2781,6 +3048,7 @@ static int simu_query(IDB_ITEM *pidb, const char *sql_string,
 static int me_psimu(std::span<char *> argv, int sockd) try
 {
 	int total_mail = 0;
+	bool want_kw = argv.size() >= 6;
 	
 	seq_node::value_type first = strtol(argv[3], nullptr, 0), last = strtol(argv[4], nullptr, 0);
 	if (first < 1 && first != SEQ_STAR)
@@ -2800,24 +3068,24 @@ static int me_psimu(std::span<char *> argv, int sockd) try
 	if (first == SEQ_STAR && last == SEQ_STAR)
 		/* "MAX:MAX" */
 		qstr = "SELECT 0, mid_string, uid, replied, unsent, flagged,"
-		       " deleted, read, recent, forwarded, size"
+		       " deleted, read, recent, forwarded, size, keywords"
 		       " FROM messages WHERE folder_id=" + std::to_string(folder_id) +
 		       " ORDER BY uid DESC LIMIT 1";
 	else if (first == SEQ_STAR)
 		/* "MAX:99" */
 		qstr = fmt::format("SELECT 0, mid_string, uid, replied, unsent, "
-		       "flagged, deleted, read, recent, forwarded, size "
+		       "flagged, deleted, read, recent, forwarded, size, keywords "
 		       "FROM messages WHERE folder_id={} AND uid<={} "
 		       "ORDER BY uid DESC LIMIT 1", folder_id, last);
 	else if (last == SEQ_STAR)
 		/* "99:MAX" */
 		qstr = fmt::format("SELECT 0, mid_string, uid, replied, unsent, "
-		       "flagged, deleted, read, recent, forwarded, size "
+		       "flagged, deleted, read, recent, forwarded, size, keywords "
 		       "FROM messages WHERE folder_id={} AND uid>={} ORDER BY uid",
 		       folder_id, first);
 	else
 		qstr = fmt::format("SELECT 0, mid_string, uid, replied, unsent, "
-		       "flagged, deleted, read, recent, forwarded, size "
+		       "flagged, deleted, read, recent, forwarded, size, keywords "
 		       "FROM messages WHERE folder_id={} AND uid>={} AND uid<={} "
 		       "ORDER BY uid", folder_id, first, last);
 
@@ -2832,7 +3100,7 @@ static int me_psimu(std::span<char *> argv, int sockd) try
 		 * any assigned UID value".
 		 */
 		qstr = "SELECT 0, mid_string, uid, replied, unsent, flagged,"
-		       " deleted, read, recent, forwarded, size"
+		       " deleted, read, recent, forwarded, size, keywords"
 		       " FROM messages WHERE folder_id=" + std::to_string(folder_id) +
 		       " ORDER BY uid DESC LIMIT 1";
 		iret = simu_query(pidb.get(), qstr.c_str(), total_mail, temp_list);
@@ -2844,8 +3112,11 @@ static int me_psimu(std::span<char *> argv, int sockd) try
 	rsp.reserve(65536);
 	rsp += "TRUE " + std::to_string(temp_list.size()) + "\r\n";
 	for (const auto &sn : temp_list) {
-		rsp += fmt::format("- {} {} {} {}\r\n", sn.mid_string, sn.uid,
+		rsp += fmt::format("- {} {} {} {}", sn.mid_string, sn.uid,
 		       sn.flags, sn.size);
+		if (want_kw && !sn.keywords.empty())
+			rsp += " " + base64_encode(sn.keywords);
+		rsp += "\r\n";
 		if (rsp.size() < rsp.capacity() / 2)
 			continue;
 		auto ret = cmd_write(sockd, rsp.c_str(), rsp.size());
@@ -2995,13 +3266,12 @@ static int me_pdtlu(std::span<char *> argv, int sockd) try
 	if (ret != 0)
 		return ret;
 	for (const auto &dt : temp_list) {
-		temp_len = gx_snprintf(temp_buff, std::size(temp_buff), "- ");
 		Json::Value digest;
 		if (me_get_digest(pidb->psqlite, dt.c_str(), digest) == 0)
 			digest = Json::objectValue;
 		auto djson = json_to_str(digest);
-		djson.insert(0, temp_buff);
-		djson.append("\r\n");
+		djson.insert(0, "- ", 2);
+		djson.append("\r\n", 2);
 		ret = cmd_write(sockd, djson.c_str(), djson.size());
 		if (ret != 0)
 			return ret;
@@ -3245,6 +3515,103 @@ static int me_prflg(std::span<char *> argv, int sockd) try
 	return MIDB_E_NO_MEMORY;
 }
 
+static int me_set_categories(const char *dir, uint64_t msg_id,
+    std::vector<std::string> &&vec)
+{
+	const PROPERTY_NAME kw_name = {MNID_STRING, PS_PUBLIC_STRINGS, 0, deconst("Keywords")};
+	const PROPNAME_ARRAY kw_req = {1, deconst(&kw_name)};
+	PROPID_ARRAY kw_rsp{};
+	if (!exmdb_client->get_named_propids(dir, TRUE, &kw_req, &kw_rsp) ||
+	    kw_rsp.size() != 1 || kw_rsp[0] == 0)
+		return MIDB_E_MDB_SETMSGPROPS;
+	const proptag_t tags[] = {PROP_TAG(PT_MV_UNICODE, kw_rsp[0])};
+	if (vec.empty()) {
+		if (!exmdb_client->remove_message_properties(dir, CP_ACP,
+		    rop_util_make_eid_ex(1, msg_id), tags))
+			return MIDB_E_MDB_SETMSGPROPS;
+		return MIDB_I_SUCCESS;
+	}
+
+	std::vector<char *> ptrs;
+	for (auto &k : vec)
+		ptrs.push_back(k.data());
+	STRING_ARRAY sa = {static_cast<uint32_t>(ptrs.size()), ptrs.data()};
+	const TAGGED_PROPVAL tp[] = {{tags[0], deconst(&sa)}};
+	const TPROPVAL_ARRAY ta = {std::size(tp), deconst(tp)};
+	PROBLEM_ARRAY problems;
+	if (!exmdb_client->set_message_properties(dir, nullptr,
+	    CP_ACP, rop_util_make_eid_ex(1, msg_id), &ta, &problems))
+		return MIDB_E_MDB_SETMSGPROPS;
+	return MIDB_I_SUCCESS;
+}
+
+/**
+ * Set the custom IMAP keywords (MAPI categories, PidNameKeywords) on a
+ * message. The keyword set passed in fully replaces any prior set. The caller
+ * is responsible for computing the result set for any +/- operations it
+ * effectively wants to do.
+ *
+ * Request:
+ * 	M-SKWD <store-dir> <folder-name> <mid> <base64(keywords)>
+ * Response:
+ * 	TRUE
+ */
+static int me_mskwd(std::span<char *> argv, int sockd) try
+{
+	/*
+	 * An empty keyword set can be used to clear the set. Because
+	 * base64_encode("") is a zero-length string, the parser rightfully
+	 * sees the line as 4 args and some excess whitespace.
+	 */
+	auto keywords = argv.size() >= 5 ? base64_decode(argv[4]) : std::string();
+	auto pidb = me_get_idb(argv[1]);
+	if (pidb == nullptr)
+		return MIDB_E_HASHTABLE_FULL;
+	auto folder_id = me_get_folder_id(pidb.get(), argv[2]);
+	if (folder_id == 0)
+		return MIDB_E_NO_FOLDER;
+
+	/* This exists to save a roundtrip to istore when the value does not change */
+	auto stm = gx_sql_prep(pidb->psqlite, "SELECT message_id,"
+	           " folder_id, keywords FROM messages WHERE mid_string=?");
+	if (stm == nullptr)
+		return MIDB_E_SQLPREP;
+	stm.bind_text(1, argv[3]);
+	if (stm.step() != SQLITE_ROW || stm.col_uint64(1) != folder_id)
+		return MIDB_E_NO_MESSAGE;
+	uint64_t msg_id = stm.col_uint64(0);
+	std::string old_kw = znul(stm.col_text(2));
+	stm.finalize();
+	if (old_kw == keywords)
+		return cmd_write(sockd, "TRUE\r\n");
+
+	/*
+	 * Send changes to the information store first. It is the "source of
+	 * truth". Only once that succeeds is the midb column refreshed, so
+	 * that a change notification re-syncing from exmdb in between cannot
+	 * resurrect the prior keyword set.
+	 */
+	auto err = me_set_categories(argv[1], msg_id, gx_split(old_kw, ' '));
+	if (err != MIDB_I_SUCCESS)
+		return err;
+
+	/* exmdb committed; now refresh the midb cache column. */
+	stm = gx_sql_prep(pidb->psqlite, "UPDATE messages"
+	      " SET keywords=? WHERE mid_string=?");
+	if (stm == nullptr)
+		return MIDB_E_SQLPREP;
+	stm.bind_text(1, keywords);
+	stm.bind_text(2, argv[3]);
+	if (stm.step() != SQLITE_DONE)
+		return MIDB_E_DISK_ERROR;
+	stm.finalize();
+	pidb.reset();
+	return cmd_write(sockd, "TRUE\r\n");
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-2172: ENOMEM");
+	return MIDB_E_NO_MEMORY;
+}
+
 /**
  * Get flags on message from midb.sqlite without contacting exmdb.
  * You better hope that the change notification socket is working,
@@ -3267,7 +3634,7 @@ static int me_pgflg(std::span<char *> argv, int sockd) try
 	if (folder_id == 0)
 		return MIDB_E_NO_FOLDER;
 	auto pstmt = gx_sql_prep(pidb->psqlite, "SELECT folder_id, recent, "
-	             "read, unsent, flagged, replied, forwarded, deleted "
+	             "read, unsent, flagged, replied, forwarded, deleted, keywords "
 	             "FROM messages WHERE mid_string=?");
 	if (pstmt == nullptr)
 		return MIDB_E_SQLPREP;
@@ -3283,12 +3650,85 @@ static int me_pgflg(std::span<char *> argv, int sockd) try
 	if (pstmt.col_int64(7) != 0) ans += midb_flag::deleted;
 	if (pstmt.col_int64(2) != 0) ans += midb_flag::seen;
 	if (pstmt.col_int64(1) != 0) ans += midb_flag::recent;
+	ans += ")";
+	/*
+	 * Append the custom keywords base64-encoded after the flag group so
+	 * the caller can report a consistent flag set (incl. keywords) in
+	 * async FETCH notifications. base64 may contain flag letters, so it
+	 * must stay outside the parentheses the flag parser scans.
+	 */
+	std::string kw = znul(pstmt.col_text(8));
+	if (!kw.empty())
+		ans += " " + base64_encode(kw);
+	/*
+	 * If the response line is extended in the future by more data items,
+	 * we will have to either shift keywords to the back, or emit `=`
+	 * (illegal encoding that leads to nothing when using error-ignoring
+	 * forms of the decoder).
+	 */
 	pstmt.finalize();
 	pidb.reset();
-	ans += ")\r\n";
+	ans += "\r\n";
 	return cmd_write(sockd, ans.c_str(), ans.size());
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-2419: ENOMEM");
+	return MIDB_E_NO_MEMORY;
+}
+
+/**
+ * List the distinct custom keywords present across all messages in a folder.
+ *
+ * Request:
+ * 	P-KWLS <store-dir> <folder-name>
+ * Response:
+ * 	TRUE[ <base64(keyword)>]...
+ */
+static int me_pkwls(std::span<char *> argv, int sockd) try
+{
+	auto pidb = me_get_idb(argv[1]);
+	if (pidb == nullptr)
+		return MIDB_E_HASHTABLE_FULL;
+	auto folder_id = me_get_folder_id(pidb.get(), argv[2]);
+	if (folder_id == 0)
+		return MIDB_E_NO_FOLDER;
+	auto stm = gx_sql_prep(pidb->psqlite, "SELECT DISTINCT keywords "
+	           "FROM messages WHERE folder_id=? AND keywords IS NOT NULL "
+	           "AND keywords!=''");
+	if (stm == nullptr)
+		return MIDB_E_SQLPREP;
+	stm.bind_int64(1, folder_id);
+	std::vector<std::string> kwset;
+	while (stm.step() == SQLITE_ROW) {
+		std::string_view row = znul(stm.col_text(0));
+		for (size_t pos = 0; pos < row.size(); ) {
+			auto sp = row.find(' ', pos);
+			if (sp == std::string_view::npos)
+				sp = row.size();
+			if (sp > pos) {
+				std::string tok(row.substr(pos, sp - pos));
+				if (std::find(kwset.cbegin(), kwset.cend(), tok) == kwset.cend())
+					kwset.push_back(std::move(tok));
+			}
+			pos = sp + 1;
+		}
+	}
+	stm.finalize();
+	pidb.reset();
+	std::string rsp = "TRUE";
+	rsp.reserve(4096);
+	for (const auto &kw : kwset) {
+		rsp += " " + base64_encode(kw);
+		if (rsp.size() < 32 * 1024)
+			continue;
+		auto wr = cmd_write(sockd, rsp.c_str(), rsp.size());
+		if (wr != 0)
+			return wr;
+		rsp.clear();
+	}
+	rsp += "\r\n";
+	return cmd_write(sockd, rsp.c_str(), rsp.size());
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-2536: ENOMEM");
 	return MIDB_E_NO_MEMORY;
 }
 
@@ -3313,11 +3753,12 @@ static int me_psrhl(std::span<char *> argv, int sockd) try
 	
 	auto tmp_len = strlen(argv[4]);
 	if (tmp_len >= sizeof(tmp_buff) ||
-	    decode64(argv[4], tmp_len, tmp_buff, std::size(tmp_buff), &decode_len) != 0)
+	    base64_decode_sized({argv[4], tmp_len}, tmp_buff,
+	    std::size(tmp_buff), &decode_len) != 0)
 		return MIDB_E_PARAMETER_ERROR;
 	parg = tmp_buff;
-	while (*parg != '\0' && parg - tmp_buff >= 0 &&
-	       static_cast<size_t>(parg - tmp_buff) < decode_len) {
+	while (parg - tmp_buff >= 0 &&
+	       static_cast<size_t>(parg - tmp_buff) + 1 < decode_len) {
 		tmp_argv.emplace_back(parg);
 		parg += strlen(parg) + 1;
 	}
@@ -3387,11 +3828,12 @@ static int me_psrhu(std::span<char *> argv, int sockd) try
 	
 	auto tmp_len = strlen(argv[4]);
 	if (tmp_len >= sizeof(tmp_buff) ||
-	    decode64(argv[4], tmp_len, tmp_buff, std::size(tmp_buff), &decode_len) != 0)
+	    base64_decode_sized({argv[4], tmp_len}, tmp_buff,
+	    std::size(tmp_buff), &decode_len) != 0)
 		return MIDB_E_PARAMETER_ERROR;
 	parg = tmp_buff;
-	while (*parg != '\0' && parg - tmp_buff >= 0 &&
-	       static_cast<size_t>(parg - tmp_buff) < decode_len) {
+	while (parg - tmp_buff >= 0 &&
+	       static_cast<size_t>(parg - tmp_buff) + 1 < decode_len) {
 		tmp_argv.emplace_back(parg);
 		parg += strlen(parg) + 1;
 	}
@@ -3578,8 +4020,8 @@ static void notif_msg_added(IDB_ITEM *pidb,
 		return;
 	qstr = fmt::format("INSERT INTO messages ("
 		"message_id, folder_id, mid_string, mod_time, uid, "
-		"unsent, read, subject, sender, rcpt, size, received)"
-		" VALUES (?, {}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", folder_id);
+		"unsent, read, subject, sender, rcpt, size, received, keywords)"
+		" VALUES (?, {}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", folder_id);
 	pstmt = gx_sql_prep(pidb->psqlite, qstr.c_str());
 	if (pstmt == nullptr)
 		return;	
@@ -3672,12 +4114,14 @@ static BOOL notif_folder_added(IDB_ITEM *pidb,
 		temp_name = std::move(decoded_name) + "/"s + str;
 	}
 	auto stm = gx_sql_prep(pidb->psqlite, "INSERT INTO folders (folder_id, parent_fid, "
-	           "commit_max, name) VALUES (?, ?, ?, ?)");
+	           "commit_max, name, unsub) VALUES (?, ?, ?, ?, ?)");
+	/* Only INBOX gets to be subscribed by default */
 	if (stm == nullptr ||
 	    stm.bind_int64(1, folder_id) != SQLITE_OK ||
 	    stm.bind_int64(2, parent_id) != SQLITE_OK ||
 	    stm.bind_int64(3, commit_max) != SQLITE_OK ||
 	    stm.bind_text(4, temp_name) != SQLITE_OK ||
+	    stm.bind_int64(5, folder_id == PRIVATE_FID_INBOX ? 0 : 1) != SQLITE_OK ||
 	    stm.step() != SQLITE_DONE)
 		return FALSE;
 	return TRUE;
@@ -4071,15 +4515,18 @@ static constexpr struct {
 	{"M-PING", {me_mping, 2}},
 	{"P-UNID", {me_punid, 4}},
 	{"P-FDDT", {me_pfddt, 3}},
+	{"P-FDSZ", {me_pfdsz, 3}},
 	{"P-SUBF", {me_psubf, 3}},
 	{"P-UNSF", {me_punsf, 3}},
 	{"P-SUBL", {me_psubl, 2}},
-	{"P-SIMU", {me_psimu, 5}},
+	{"P-SIMU", {me_psimu, 5, 6}},
 	{"P-DELL", {me_pdell, 3}},
 	{"P-DTLU", {me_pdtlu, 5}},
 	{"P-SFLG", {me_psflg, 5}},
 	{"P-RFLG", {me_prflg, 5}},
+	{"M-SKWD", {me_mskwd, 4, 5}},
 	{"P-GFLG", {me_pgflg, 4}},
+	{"P-KWLS", {me_pkwls, 3}},
 	{"P-SRHL", {me_psrhl, 5}},
 	{"P-SRHU", {me_psrhu, 5}},
 	{"X-UNLD", {me_xunld, 2}},

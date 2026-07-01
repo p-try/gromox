@@ -15,14 +15,15 @@
 #include <fcntl.h>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
 #include <string>
 #include <unistd.h>
 #include <utility>
 #include <vector>
 #include <fmt/core.h>
-#include <libHX/io.h>
 #include <libHX/ctype_helper.h>
+#include <libHX/io.h>
 #include <libHX/scope.hpp>
 #include <libHX/string.h>
 #include <sys/stat.h>
@@ -137,6 +138,20 @@ const dir_tree *dir_tree::match(const char *path) const
 		curr = &it->second;
 	}
 	return curr;
+}
+
+/**
+ * Collect (full_name, has_children) for every node in the subtree, so a tree
+ * built from subscribed names exposes the synthesized intermediate ancestors.
+ */
+static void dir_tree_collect(const dir_tree &node, const std::string &prefix,
+    std::vector<std::pair<std::string, bool>> &out)
+{
+	for (const auto &[token, child] : node.entries) {
+		auto full = prefix.empty() ? token : prefix + "/" + token;
+		out.emplace_back(full, child.has_children());
+		dir_tree_collect(child, full, out);
+	}
 }
 
 static const builtin_folder *special_folder(uint64_t fid)
@@ -342,6 +357,14 @@ static BOOL icp_parse_fetch_args(mdi_list &plist, BOOL *pb_detail, BOOL *pb_data
 		    strcasecmp(kw, "INTERNALDATE") == 0 ||
 		    strcasecmp(kw, "RFC822.SIZE") == 0) {
 			*pb_detail = TRUE;
+		} else if (strcasecmp(kw, "FLAGS") == 0) {
+			/*
+			 * Custom keywords are only conveyed in the detailed
+			 * digest (P-DTLU response), not the simple (P-SIMU)
+			 * listing. A bare FETCH FLAGS thus needs the detail
+			 * code path.
+			 */
+			*pb_detail = TRUE;
 		} else if (strncasecmp(kw, "BODY[", 5) == 0 ||
 		    strncasecmp(kw, "BODY.PEEK[", 10) == 0) {
 			if (strcasestr(kw, "FIELDS") == nullptr)
@@ -363,10 +386,11 @@ static BOOL icp_parse_fetch_args(mdi_list &plist, BOOL *pb_detail, BOOL *pb_data
 	return false;
 }
 
-static std::string icp_convert_flags_string(int flag_bits)
+static std::string icp_convert_flags_string(int flag_bits,
+    const std::string &keywords = "", bool rev2 = false)
 {
 	std::string out = "(";
-	if (flag_bits & FLAG_RECENT)
+	if (!rev2 && flag_bits & FLAG_RECENT)
 		out += "\\Recent ";
 	if (flag_bits & FLAG_ANSWERED)
 		out += "\\Answered ";
@@ -380,12 +404,59 @@ static std::string icp_convert_flags_string(int flag_bits)
 		out += "\\Draft ";
 	if (flag_bits & FLAG_FORWARDED)
 		out += "$Forwarded ";
+	if (!keywords.empty()) {
+		/* keywords is a space-separated list of custom IMAP atoms */
+		out += keywords;
+		out += ' ';
+	}
 	if (out.size() > 1)
 		/* There is more than just the opening parenthesis, so there must be a space */
 		out.back() = ')';
 	else
 		out += ")";
 	return out;
+}
+
+/*
+ * System flags advertised in untagged `* FLAGS` lines. Keep this identical to
+ * the SELECT/EXAMINE response in icp_selex().
+ */
+#define IMAP_FLAGS_SYSTEM "\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded"
+
+/**
+ * Produce a keyword pre-announcement line (RFC 3501 §7.2.6).
+ *
+ * @kw_space: string with space-separated atoms
+ *
+ * Tokenizes @kw_space and records any token not yet announced to this session.
+ * If the announced set grew, emit one `* FLAGS (system flags + the full
+ * announced set)` line. The line only contains plain atoms, never "\*".
+ */
+std::string icp_make_kwannounce_line(imap_context &ctx, std::string_view kw_space)
+{
+	bool grew = false;
+	for (size_t pos = 0; pos < kw_space.size(); ) {
+		auto sp = kw_space.find(' ', pos);
+		if (sp == std::string_view::npos)
+			sp = kw_space.size();
+		if (sp > pos) {
+			std::string tok(kw_space.substr(pos, sp - pos));
+			if (std::find(ctx.announced_keywords.cbegin(),
+			    ctx.announced_keywords.cend(), tok) ==
+			    ctx.announced_keywords.cend()) {
+				ctx.announced_keywords.emplace_back(std::move(tok));
+				grew = true;
+			}
+		}
+		pos = sp + 1;
+	}
+	if (!grew)
+		return "";
+	std::string line = "* FLAGS (" IMAP_FLAGS_SYSTEM;
+	for (const auto &k : ctx.announced_keywords)
+		line += " " + k;
+	line += ")\r\n";
+	return line;
 }
 
 static int icp_match_field(mjson_io &io, const char *cmd_tag,
@@ -554,7 +625,7 @@ static int pstruct_text(MJSON *pjson,
 		       pbody, pjson->get_mail_filename(),
 		       pmime->get_content_offset() + offset, length);
 	else
-		buf += fmt::format("BODY{} <<{{rfc822}}{}|{}|{}\r\n",
+		buf += fmt::format("BODY{} <<{{rfc822}}{}/{}|{}|{}\r\n",
 		       pbody, storage_path,
 		       pjson->get_mail_filename(),
 		       pmime->get_content_offset() + offset, length);
@@ -580,7 +651,7 @@ static int pstruct_else(imap_context &ctx, MJSON *pjson,
 			std::string content;
 			if (exmdb_client->imapfile_read(ctx.maildir, "eml",
 			    pjson->get_mail_filename(), &content))
-				ctx.io_actor.place(eml_path, std::move(content));
+				ctx.io_actor.place(eml_path, std::move(content), true);
 		}
 	} else {
 		eml_path = ctx.maildir + "/tmp/imap.rfc822/"s + storage_path + "/" + pjson->get_mail_filename();
@@ -672,7 +743,7 @@ static int icp_process_fetch_item(imap_context &ctx,
 		if (!ctx.io_actor.exists(eml_file)) {
 			std::string content;
 			if (exmdb_client->imapfile_read(ctx.maildir, "eml", pitem->mid, &content))
-				ctx.io_actor.place(eml_file, std::move(content));
+				ctx.io_actor.place(eml_file, std::move(content), true);
 		}
 	};
 
@@ -741,7 +812,10 @@ static int icp_process_fetch_item(imap_context &ctx,
 			else
 				buf += std::move(b2);
 		} else if (strcasecmp(kw, "FLAGS") == 0) {
-			auto fs = icp_convert_flags_string(pitem->flag_bits);
+			auto line = icp_make_kwannounce_line(ctx, pitem->keywords);
+			if (line.size() > 0)
+				ctx.stream.write(line.c_str(), line.size());
+			auto fs = icp_convert_flags_string(pitem->flag_bits, pitem->keywords, ctx.enabled_rev2);
 			buf += "FLAGS ";
 			buf += std::move(fs);
 		} else if (strcasecmp(kw, "INTERNALDATE") == 0) {
@@ -765,7 +839,7 @@ static int icp_process_fetch_item(imap_context &ctx,
 					pcontext->selected_folder, pitem->mid,
 					FLAG_SEEN, nullptr, &errnum);
 				pitem->flag_bits |= FLAG_SEEN;
-				imap_parser_bcast_flags(*pcontext, pitem->uid);
+				imap_parser_bcast_flags(*pcontext, pitem->uid, bcastfl::include_self);
 			}
 		} else if (strcasecmp(kw, "RFC822.HEADER") == 0) {
 			auto pmime = mjson.get_mime("");
@@ -794,7 +868,7 @@ static int icp_process_fetch_item(imap_context &ctx,
 					pcontext->selected_folder, pitem->mid,
 					FLAG_SEEN, nullptr, &errnum);
 				pitem->flag_bits |= FLAG_SEEN;
-				imap_parser_bcast_flags(*pcontext, pitem->uid);
+				imap_parser_bcast_flags(*pcontext, pitem->uid, bcastfl::include_self);
 			}
 		} else if (strcasecmp(kw, "UID") == 0) {
 			buf += "UID ";
@@ -856,13 +930,23 @@ static int icp_process_fetch_item(imap_context &ctx,
 					pcontext->selected_folder, pitem->mid,
 					FLAG_SEEN, nullptr, &errnum);
 				pitem->flag_bits |= FLAG_SEEN;
-				imap_parser_bcast_flags(*pcontext, pitem->uid);
+				imap_parser_bcast_flags(*pcontext, pitem->uid, bcastfl::include_self);
 			}
 		}
 	}
 	buf += ")\r\n";
 	if (pcontext->stream.write(buf.data(), buf.size()) != STREAM_WRITE_OK)
 		return 1922;
+	/*
+	 * The response for this message is now buffered in ctx.stream (message
+	 * bodies as <<{file}>>/<<{rfc822}>> placeholders). The top-level .eml
+	 * scratch copies cached while assembling it are no longer needed — the
+	 * wrdat writer re-reads them from storage — so drop them before moving
+	 * to the next message. Without this, "FETCH 1:* ..." over a large
+	 * folder would hold every message body resident until the whole
+	 * response had been streamed out.
+	 */
+	ctx.io_actor.drop_reconstructible();
 	if (!pcontext->b_readonly && pitem->flag_bits & FLAG_RECENT) {
 		pitem->flag_bits &= ~FLAG_RECENT;
 		if (!(pitem->flag_bits & FLAG_SEEN)) {
@@ -878,23 +962,96 @@ static int icp_process_fetch_item(imap_context &ctx,
 	return 1918;
 }
 
+/**
+ * Split STORE flag atoms into the standard IMAP system flags (returned as a
+ * bitmask) and custom keywords (returned verbatim). The pseudo-keyword "\*" is
+ * not settable and is rejected. Returns false on an unparsable system flag
+ * (e.g. some unknown '\'-prefixed atom).
+ */
+static bool icp_classify_store_flags(const std::vector<std::string> &atoms,
+    int &flag_bits, std::vector<std::string> &kw_list)
+{
+	for (const auto &kw_s : atoms) {
+		auto keyword = kw_s.c_str();
+		if (strcasecmp(keyword, "\\Answered") == 0)
+			flag_bits |= FLAG_ANSWERED;
+		else if (strcasecmp(keyword, "\\Flagged") == 0)
+			flag_bits |= FLAG_FLAGGED;
+		else if (strcasecmp(keyword, "\\Deleted") == 0)
+			flag_bits |= FLAG_DELETED;
+		else if (strcasecmp(keyword, "\\Seen") == 0)
+			flag_bits |= FLAG_SEEN;
+		else if (strcasecmp(keyword, "\\Draft") == 0)
+			flag_bits |= FLAG_DRAFT;
+		else if (strcasecmp(keyword, "\\Recent") == 0)
+			flag_bits |= FLAG_RECENT;
+		else if (strcasecmp(keyword, "$Forwarded") == 0)
+			flag_bits |= FLAG_FORWARDED;
+		else if (strcmp(keyword, "\\*") == 0)
+			/* "\*" denotes "any keyword permitted", not settable */
+			return false;
+		else if (keyword[0] == '\\')
+			/* unknown system flag */
+			return false;
+		else if (!kw_s.empty())
+			/* custom keyword (e.g. $keyword1, NIL, ...) */
+			kw_list.emplace_back(kw_s);
+	}
+	return true;
+}
+
+static std::string icp_join_keywords(const std::vector<std::string> &kw_list)
+{
+	std::string out;
+	for (const auto &k : kw_list) {
+		if (!out.empty())
+			out += ' ';
+		out += k;
+	}
+	return out;
+}
+
+/**
+ * Retrieve the current custom keyword set for a single message (by seqid) from
+ * midb. Used to compute the resulting set for +FLAGS/-FLAGS, since the simple
+ * fetch path does not carry keywords.
+ */
+static std::string icp_get_keywords(imap_context &ctx, int id)
+{
+	imap_seq_list seq;
+	seq.insert(id, id);
+	XARRAY xa;
+	int errnum = 0;
+	if (midb_agent::fetch_detail_uid(ctx.maildir, ctx.selected_folder,
+	    seq, &xa, &errnum) != MIDB_RESULT_OK)
+		return "";
+	auto item = xa.get_item(0);
+	return item != nullptr ? item->keywords : "";
+}
+
 static void icp_store_flags(const char *cmd, const std::string &mid,
-    int id, unsigned int uid, unsigned int flag_bits, imap_context &ctx)
+    int id, unsigned int uid, unsigned int flag_bits,
+    const std::vector<std::string> &kw_list, imap_context &ctx)
 {
 	auto pcontext = &ctx;
 	int errnum;
 	char buff[1024];
 	int string_length;
+	std::string kw_result; /* the resulting keyword set, for the FETCH echo */
 	
 	string_length = 0;
 	if (0 == strcasecmp(cmd, "FLAGS") ||
 		0 == strcasecmp(cmd, "FLAGS.SILENT")) {
 		midb_agent::unset_flags(pcontext->maildir, pcontext->selected_folder,
-			mid, FLAG_ALL, nullptr, &errnum);
+			mid, FLAG_SETTABLE, nullptr, &errnum);
 		midb_agent::set_flags(pcontext->maildir, pcontext->selected_folder,
 			mid, flag_bits, nullptr, &errnum);
+		/* FLAGS replaces the keyword set wholesale (empty clears it). */
+		kw_result = icp_join_keywords(kw_list);
+		midb_agent::set_keywords(pcontext->maildir, pcontext->selected_folder,
+			mid, kw_result, &errnum);
 		if (0 == strcasecmp(cmd, "FLAGS")) {
-			auto fs = icp_convert_flags_string(flag_bits);
+			auto fs = icp_convert_flags_string(flag_bits, kw_result, ctx.enabled_rev2);
 			if (uid != 0)
 				string_length = gx_snprintf(buff, std::size(buff),
 					"* %d FETCH (FLAGS %s UID %d)\r\n",
@@ -908,10 +1065,31 @@ static void icp_store_flags(const char *cmd, const std::string &mid,
 		0 == strcasecmp(cmd, "+FLAGS.SILENT")) {
 		midb_agent::set_flags(pcontext->maildir, pcontext->selected_folder,
 			mid, flag_bits, nullptr, &errnum);
+		if (!kw_list.empty()) {
+			/* union of current and requested keywords */
+			auto cur = icp_get_keywords(ctx, id);
+			std::vector<std::string> merged;
+			for (size_t pos = 0; pos < cur.size(); ) {
+				auto sp = cur.find(' ', pos);
+				if (sp == std::string::npos)
+					sp = cur.size();
+				if (sp > pos)
+					merged.emplace_back(cur.substr(pos, sp - pos));
+				pos = sp + 1;
+			}
+			for (const auto &k : kw_list)
+				if (std::find(merged.cbegin(), merged.cend(), k) == merged.cend())
+					merged.emplace_back(k);
+			kw_result = icp_join_keywords(merged);
+			midb_agent::set_keywords(pcontext->maildir,
+				pcontext->selected_folder, mid, kw_result, &errnum);
+		}
 		if (0 == strcasecmp(cmd, "+FLAGS") && 
 			MIDB_RESULT_OK == midb_agent::get_flags(pcontext->maildir,
 		    pcontext->selected_folder, mid, &flag_bits, &errnum)) {
-			auto fs = icp_convert_flags_string(flag_bits);
+			if (kw_result.empty())
+				kw_result = icp_get_keywords(ctx, id);
+			auto fs = icp_convert_flags_string(flag_bits, kw_result, ctx.enabled_rev2);
 			if (uid != 0)
 				string_length = gx_snprintf(buff, std::size(buff),
 					"* %d FETCH (FLAGS %s UID %d)\r\n",
@@ -925,10 +1103,31 @@ static void icp_store_flags(const char *cmd, const std::string &mid,
 		0 == strcasecmp(cmd, "-FLAGS.SILENT")) {
 		midb_agent::unset_flags(pcontext->maildir, pcontext->selected_folder,
 			mid, flag_bits, nullptr, &errnum);
+		if (!kw_list.empty()) {
+			/* current minus requested keywords */
+			auto cur = icp_get_keywords(ctx, id);
+			std::vector<std::string> kept;
+			for (size_t pos = 0; pos < cur.size(); ) {
+				auto sp = cur.find(' ', pos);
+				if (sp == std::string::npos)
+					sp = cur.size();
+				if (sp > pos) {
+					auto tok = cur.substr(pos, sp - pos);
+					if (std::find(kw_list.cbegin(), kw_list.cend(), tok) == kw_list.cend())
+						kept.emplace_back(std::move(tok));
+				}
+				pos = sp + 1;
+			}
+			kw_result = icp_join_keywords(kept);
+			midb_agent::set_keywords(pcontext->maildir,
+				pcontext->selected_folder, mid, kw_result, &errnum);
+		}
 		if (0 == strcasecmp(cmd, "-FLAGS") &&
 			MIDB_RESULT_OK == midb_agent::get_flags(pcontext->maildir,
 		    pcontext->selected_folder, mid, &flag_bits, &errnum)) {
-			auto fs = icp_convert_flags_string(flag_bits);
+			if (kw_result.empty() && kw_list.empty())
+				kw_result = icp_get_keywords(ctx, id);
+			auto fs = icp_convert_flags_string(flag_bits, kw_result, ctx.enabled_rev2);
 			if (uid != 0)
 				string_length = gx_snprintf(buff, std::size(buff),
 					"* %d FETCH (FLAGS %s UID %d)\r\n",
@@ -939,8 +1138,12 @@ static void icp_store_flags(const char *cmd, const std::string &mid,
 					id, fs.c_str());
 		}
 	}
-	if (string_length != 0)
+	if (string_length != 0) {
+		auto line = icp_make_kwannounce_line(*pcontext, kw_result);
+		if (line.size() > 0)
+			imap_parser_safe_write(pcontext, line.c_str(), line.size());
 		imap_parser_safe_write(pcontext, buff, string_length);
+	}
 }
 
 static BOOL icp_convert_imaptime(const char *str_time, time_t *ptime)
@@ -985,13 +1188,19 @@ static BOOL icp_wildcard_match(const char *folder, const char *mask)
  * See sysfolder_to_imapfolder for some notes.
  */
 static BOOL icp_imapfolder_to_sysfolder(const char *imap_folder,
-    std::string &sys_folder) try
+    std::string &sys_folder, bool utf8) try
 {
 	std::string t;
-	t.resize(strlen(imap_folder));
-	if (mutf7_to_utf8(imap_folder, strlen(imap_folder), t.data(), t.size() + 1) < 0)
-		return FALSE;
-	t.resize(strlen(t.c_str()));
+	if (utf8) {
+		/* rev2 mailbox names are UTF-8 */
+		t = imap_folder;
+	} else {
+		t.resize(strlen(imap_folder));
+		if (mutf7_to_utf8(imap_folder, strlen(imap_folder), t.data(),
+		    t.size() + 1) < 0)
+			return false;
+		t.resize(strlen(t.c_str()));
+	}
 	if (t.size() > 0 && t.back() == '/')
 		t.pop_back();
 	if (strncasecmp(t.c_str(), "inbox", 5) == 0 &&
@@ -1005,7 +1214,7 @@ static BOOL icp_imapfolder_to_sysfolder(const char *imap_folder,
 }
 
 static BOOL icp_sysfolder_to_imapfolder(const enum_folder_t &sys_folder,
-    std::string &imap_folder) try
+    std::string &imap_folder, bool utf8) try
 {
 	if (sys_folder.first == PRIVATE_FID_INBOX) {
 		imap_folder = "INBOX";
@@ -1014,6 +1223,10 @@ static BOOL icp_sysfolder_to_imapfolder(const enum_folder_t &sys_folder,
 	auto t = base64_decode(sys_folder.second);
 	if (t.empty())
 		return FALSE;
+	if (utf8) {
+		imap_folder = std::move(t);
+		return TRUE;
+	}
 	imap_folder.resize(utf8_to_mb_len(t.c_str()));
 	if (utf8_to_mutf7(t.c_str(), t.size(), imap_folder.data(), imap_folder.size() + 1) <= 0)
 		return FALSE;
@@ -1024,12 +1237,12 @@ static BOOL icp_sysfolder_to_imapfolder(const enum_folder_t &sys_folder,
 	return false;
 }
 
-static void icp_convert_folderlist(std::vector<enum_folder_t> &pfile) try
+static void icp_convert_folderlist(std::vector<enum_folder_t> &pfile, bool utf8) try
 {
 	std::string o;
-	
+
 	for (auto &e : pfile)
-		if (icp_sysfolder_to_imapfolder(e, o))
+		if (icp_sysfolder_to_imapfolder(e, o, utf8))
 			e.second = std::move(o);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1814: ENOMEM");
@@ -1055,11 +1268,58 @@ int icp_capability(std::span<std::string> argv, imap_context &ctx) try
 	if (pcontext->proto_stat == iproto_stat::select)
 		imap_parser_echo_modify(pcontext, NULL);
 	/* IMAP_CODE_2170001: OK CAPABILITY completed */
-	char ext_str[128];
+	char ext_str[256];
 	capability_list(ext_str, std::size(ext_str), pcontext);
 	auto buf = fmt::format("* CAPABILITY {}\r\n{} {}",
 	           ext_str, argv[0], resource_get_imap_code(1701, 1));
 	imap_parser_safe_write(pcontext, buf.c_str(), buf.size());
+	return DISPATCH_CONTINUE;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-2425: ENOMEM");
+	return 1918;
+}
+
+/**
+ * This is for the ENABLE command (RFC 5161/9051), which is only valid once
+ * authenticated. It enables the capabilities the server recognises and
+ * silently ignores the rest. (An `ENABLE QRESYNC` against a server without
+ * QRESYNC still succeeds with an empty `* ENABLED` line.) The only capability
+ * Gromox acts on is IMAP4rev2.
+ */
+int icp_enable(std::span<std::string> argv, imap_context &ctx) try
+{
+	if (!ctx.is_authed())
+		return 1804;
+	if (argv.size() < 3)
+		return 1800;
+	std::string enabled;
+	for (size_t i = 2; i < argv.size(); ++i) {
+		if (strcasecmp(argv[i].c_str(), "IMAP4REV2") == 0) {
+			ctx.enabled_rev2 = true;
+			enabled += " IMAP4rev2";
+		}
+		/* unrecognised capabilities are ignored, never an error */
+	}
+	auto buf = fmt::format("* ENABLED{}\r\n{} {}", enabled,
+	           argv[0], resource_get_imap_code(1731, 1));
+	imap_parser_safe_write(&ctx, buf.c_str(), buf.size());
+	return DISPATCH_CONTINUE;
+} catch (const std::bad_alloc &) {
+	return 1918;
+}
+
+/**
+ * NAMESPACE (RFC 2342, part of the IMAP4rev2 capability set). Gromox exposes a
+ * single personal namespace rooted at "" with a "/" hierarchy delimiter and no
+ * "other users" or shared namespaces. Valid once authenticated.
+ */
+int icp_namespace(std::span<std::string> argv, imap_context &ctx) try
+{
+	if (!ctx.is_authed())
+		return 1804;
+	auto buf = fmt::format("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n{} {}",
+	           argv[0], resource_get_imap_code(1732, 1));
+	imap_parser_safe_write(&ctx, buf.c_str(), buf.size());
 	return DISPATCH_CONTINUE;
 } catch (const std::bad_alloc &) {
 	return 1918;
@@ -1138,7 +1398,7 @@ static int icp_username2(const char *cmdbuf, imap_context &ctx)
 	auto pcontext = &ctx;
 	size_t temp_len;
 	
-	if (decode64_ex(cmdbuf, strlen(cmdbuf),
+	if (base64nl_decode_sized(cmdbuf,
 	    pcontext->username, std::size(pcontext->username),
 	    &temp_len) != 0) {
 		pcontext->proto_stat = iproto_stat::noauth;
@@ -1181,7 +1441,7 @@ static int icp_password2(const char *cmdbuf, imap_context &ctx) try
 	char temp_password[256];
 	
 	pcontext->proto_stat = iproto_stat::noauth;
-	if (decode64_ex(cmdbuf, strlen(cmdbuf),
+	if (base64nl_decode_sized(cmdbuf,
 	    temp_password, std::size(temp_password), &temp_len) != 0)
 		return 1820 | DISPATCH_TAG;
 
@@ -1231,7 +1491,7 @@ static int icp_password2(const char *cmdbuf, imap_context &ctx) try
 		std::size(pcontext->defcharset));
 	pcontext->proto_stat = iproto_stat::auth;
 	imap_parser_log_info(pcontext, LV_DEBUG, "LOGIN ok");
-	char caps[128];
+	char caps[256];
 	capability_list(caps, std::size(caps), pcontext);
 	auto buf = fmt::format("{} OK [CAPABILITY {}] Logged in\r\n",
 		   tag_or_bug(pcontext->tag_string), caps);
@@ -1395,9 +1655,18 @@ static int icp_selex(std::span<std::string> argv, imap_context &ctx, bool readon
     
 	if (!pcontext->is_authed())
 		return 1804;
-	if (argv.size() < 3 || argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name))
+	if (argv.size() < 3 || argv[2].size() == 0 || argv[2].size() >= 1024)
 		return 1800;
+	if (!icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name,
+	    ctx.enabled_rev2))
+		/* Undecodable (e.g. bad modified-UTF-7) name: no such mailbox. */
+		return 1925;
+	/*
+	 * RFC 9051 §6.3.2: Switching mailboxes closes the prior one and the
+	 * client gets a `* OK [CLOSED]` before the new mailbox's data. Capture
+	 * the state before the deselect below clears proto_stat.
+	 */
+	bool was_selected = ctx.proto_stat == iproto_stat::select;
 	if (iproto_stat::select == pcontext->proto_stat) {
 		imap_parser_remove_select(pcontext);
 		pcontext->proto_stat = iproto_stat::auth;
@@ -1418,16 +1687,41 @@ static int icp_selex(std::span<std::string> argv, imap_context &ctx, bool readon
 	pcontext->b_readonly = readonly;
 	imap_parser_add_select(pcontext);
 
+	/*
+	 * Seed this session's announced keyword list from the folder's
+	 * distinct custom keywords. RFC 3501 §7.2.6: Only plain keyword atoms
+	 * are allowed here. "\*" is PERMANENTFLAGS-only and emitting it could
+	 * make strict clients disconnect. A failure to query keywords degrades
+	 * gracefully and will just emit the usual built-in keywords.
+	 */
+	std::vector<std::string> kw;
+	int kwerr = 0;
+	midb_agent::get_folder_keywords(pcontext->maildir,
+		pcontext->selected_folder, kw, &kwerr);
+	pcontext->announced_keywords = kw;
+	ctx.saved_uids.clear();
+	std::string kw_join;
+	for (const auto &k : kw)
+		kw_join += " " + k;
+
+	std::string recent_line;
+	if (!ctx.enabled_rev2)
+		recent_line = fmt::format("* {} RECENT\r\n", ctx.contents.n_recent);
+	/* RFC 9051 §6.3.2: announce the prior mailbox is closed when switching. */
+	auto closed_line = ctx.enabled_rev2 && was_selected ?
+	                   "* OK [CLOSED] previous mailbox closed\r\n" : "";
 	auto buf = fmt::format(
+		"{}"
 		"* {} EXISTS\r\n"
-		"* {} RECENT\r\n"
-		"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded)\r\n"
+		"{}"
+		"* FLAGS ({}{})\r\n"
 		"* OK {}\r\n",
-		pcontext->contents.n_exists(),
-		pcontext->contents.n_recent, readonly ?
+		closed_line, pcontext->contents.n_exists(),
+		recent_line, IMAP_FLAGS_SYSTEM, kw_join, readonly ?
 		"[PERMANENTFLAGS ()] no permanent flags permitted" :
-		"[PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded)] limited");
-	if (pcontext->contents.firstunseen != 0)
+		"[PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft $Forwarded \\*)] limited");
+	/* RFC 9051 §6.3.2 removed the [UNSEEN] response code from SELECT/EXAMINE. */
+	if (!ctx.enabled_rev2 && ctx.contents.firstunseen != 0)
 		buf += fmt::format("* OK [UNSEEN {}] message {} is first unseen\r\n",
 			pcontext->contents.firstunseen,
 			pcontext->contents.firstunseen);
@@ -1435,7 +1729,7 @@ static int icp_selex(std::span<std::string> argv, imap_context &ctx, bool readon
 	auto s_command  = readonly ? "EXAMINE" : "SELECT";
 	buf += fmt::format("* OK [UIDVALIDITY {}] UIDs valid\r\n"
 	       "* OK [UIDNEXT {}] predicted next UID\r\n", uidvalid, uidnext);
-	if (g_rfc9051_enable)
+	if (ctx.enabled_rev2)
 		buf += fmt::format("* LIST () \"/\" {}\r\n", quote_encode(argv[2]));
 	buf += fmt::format("{} OK [{}] {} completed\r\n",
 		argv[0], s_readonly, s_command);
@@ -1469,7 +1763,7 @@ int icp_create(std::span<std::string> argv, imap_context &ctx)
 	auto ret = m2icode(ssr, errnum);
 	if (ret != 0)
 		return ret;
-	icp_convert_folderlist(folder_list);
+	icp_convert_folderlist(folder_list, ctx.enabled_rev2);
 	std::string sys_name = argv[2]; // Go back to non-encoded string
 	if (sys_name.size() > 0 && sys_name.back() == '/')
 		sys_name.pop_back();
@@ -1487,7 +1781,8 @@ int icp_create(std::span<std::string> argv, imap_context &ctx)
 			continue;
 		}
 		std::string converted_name;
-		if (!icp_imapfolder_to_sysfolder(sys_name.c_str(), converted_name))
+		if (!icp_imapfolder_to_sysfolder(sys_name.c_str(),
+		    converted_name, ctx.enabled_rev2))
 			return 1800;
 		ssr = midb_agent::make_folder(pcontext->maildir,
 		      converted_name, &errnum);
@@ -1510,7 +1805,8 @@ int icp_delete(std::span<std::string> argv, imap_context &ctx)
 	if (!pcontext->is_authed())
 		return 1804;
 	if (argv.size() < 3 || argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), encoded_name))
+	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), encoded_name,
+	    ctx.enabled_rev2))
 		return 1800;
 
 	{
@@ -1520,16 +1816,21 @@ int icp_delete(std::span<std::string> argv, imap_context &ctx)
 		auto ret = m2icode(ssr, errnum);
 		if (ret != 0)
 			return ret;
-		icp_convert_folderlist(folder_list);
+		icp_convert_folderlist(folder_list, ctx.enabled_rev2);
 		dir_tree folder_tree;
 		folder_tree.load_from_memfile(std::move(folder_list));
 		auto dh = folder_tree.match(argv[2].c_str());
 		if (dh == nullptr)
 			return 1925;
+		/*
+		 * Disallow deleting names with inferior hierarchical names
+		 * (RFC 3501 §6.3.4).
+		 */
 		if (dh->has_children())
 			return 1924;
 	}
 
+	/* This call is a recursive hard-delete */
 	auto ssr = midb_agent::remove_folder(pcontext->maildir,
 	           encoded_name, &errnum);
 	auto ret = m2icode(ssr, errnum);
@@ -1551,8 +1852,8 @@ int icp_rename(std::span<std::string> argv, imap_context &ctx)
 	if (argv.size() < 4 || argv[2].size() == 0 || argv[2].size() >= 1024 ||
 	    argv[3].size() == 0 || argv[3].size() >= 1024)
 		return 1800;
-	if (!icp_imapfolder_to_sysfolder(argv[2].c_str(), encoded_name) ||
-	    !icp_imapfolder_to_sysfolder(argv[3].c_str(), encoded_name1))
+	if (!icp_imapfolder_to_sysfolder(argv[2].c_str(), encoded_name, ctx.enabled_rev2) ||
+	    !icp_imapfolder_to_sysfolder(argv[3].c_str(), encoded_name1, ctx.enabled_rev2))
 		return 1800;
 	if (strpbrk(argv[3].c_str(), "%*?") != nullptr)
 		return 1910;
@@ -1575,7 +1876,7 @@ int icp_subscribe(std::span<std::string> argv, imap_context &ctx)
 	if (!pcontext->is_authed())
 		return 1804;
 	if (argv.size() < 3 || argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name))
+	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name, ctx.enabled_rev2))
 		return 1800;
 	auto ssr = midb_agent::subscribe_folder(pcontext->maildir,
 	           sys_name, &errnum);
@@ -1596,7 +1897,7 @@ int icp_unsubscribe(std::span<std::string> argv, imap_context &ctx)
 	if (!pcontext->is_authed())
 		return 1804;
 	if (argv.size() < 3 || argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name))
+	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name, ctx.enabled_rev2))
 		return 1800;
 	auto ssr = midb_agent::unsubscribe_folder(pcontext->maildir,
 	           sys_name, &errnum);
@@ -1608,6 +1909,162 @@ int icp_unsubscribe(std::span<std::string> argv, imap_context &ctx)
 	return 1710;
 }
 
+/**
+ * Build a ``* STATUS <display> (<items>)\r\n`` line for one folder. The output
+ * is shared by the STATUS command and LIST-STATUS (RFC 9051 §6.3.10).
+ * @sys_name is the base64 midb folder name; @display is the already-quoted
+ * name for the wire. SIZE and DELETED (RFC 8438) are fetched lazily; RECENT is
+ * rejected once rev2 is on. Returns an IMAP code (0 = ok).
+ */
+static int icp_status_line(imap_context &ctx, const std::string &sys_name,
+    const std::string &display, std::span<std::string> items,
+    std::string &out) try
+{
+	int errnum;
+	size_t exists = 0, recent = 0, unseen = 0;
+	uint32_t uidvalid = 0, uidnext = 0;
+	auto ssr = midb_agent::summary_folder(ctx.maildir, sys_name,
+	           &exists, &recent, &unseen, &uidvalid, &uidnext, &errnum);
+	auto ret = m2icode(ssr, errnum);
+	if (ret != 0)
+		return ret;
+	size_t fsize = 0, fdeleted = 0;
+	bool have_sizes = false;
+	auto obtain_sizes = [&]() -> int {
+		if (have_sizes)
+			return 0;
+		auto sr = midb_agent::folder_sizes(ctx.maildir, sys_name,
+		          &fsize, &fdeleted, &errnum);
+		auto ic = m2icode(sr, errnum);
+		if (ic == 0)
+			have_sizes = true;
+		return ic;
+	};
+	out = fmt::format("* STATUS {} (", display);
+	bool b_first = true;
+	for (const auto &arg_s : items) {
+		auto keyword = arg_s.c_str();
+		if (!b_first)
+			out += ' ';
+		else
+			b_first = false;
+		if (strcasecmp(keyword, "MESSAGES") == 0) {
+			out += fmt::format("MESSAGES {}", exists);
+		} else if (strcasecmp(keyword, "RECENT") == 0) {
+			if (ctx.enabled_rev2)
+				return 1800; /* RFC 9051 removed RECENT */
+			out += fmt::format("RECENT {}", recent);
+		} else if (strcasecmp(keyword, "UIDNEXT") == 0) {
+			out += fmt::format("UIDNEXT {}", uidnext);
+		} else if (strcasecmp(keyword, "UIDVALIDITY") == 0) {
+			out += fmt::format("UIDVALIDITY {}", uidvalid);
+		} else if (strcasecmp(keyword, "UNSEEN") == 0) {
+			out += fmt::format("UNSEEN {}", unseen);
+		} else if (strcasecmp(keyword, "SIZE") == 0) {
+			auto ic = obtain_sizes();
+			if (ic != 0)
+				return ic;
+			out += fmt::format("SIZE {}", fsize);
+		} else if (strcasecmp(keyword, "DELETED") == 0) {
+			auto ic = obtain_sizes();
+			if (ic != 0)
+				return ic;
+			out += fmt::format("DELETED {}", fdeleted);
+		} else {
+			return 1800;
+		}
+	}
+	out += ")\r\n";
+	return 0;
+} catch (const std::bad_alloc &) {
+	return 1915;
+}
+
+/* LIST selection options (RFC 9051 §6.3.9 / RFC 5258 §3.1) */
+enum { LSEL_SUBSCRIBED = 1, LSEL_REMOTE = 2, LSEL_RECURSIVE = 4, LSEL_SPECIALUSE = 8 };
+
+/* LIST return options (RFC 9051 §6.3.9 / RFC 5258 §3.2, RFC 5819 LIST-STATUS) */
+enum { LRET_SUBSCRIBED = 1, LRET_CHILDREN = 2, LRET_SPECIALUSE = 4, LRET_STATUS = 8 };
+
+/**
+ * Parse a "(...)" LIST option list into flags. is_return selects the return
+ * option vocabulary (SUBSCRIBED CHILDREN SPECIAL-USE STATUS(...)) vs. the
+ * selection vocabulary (SUBSCRIBED REMOTE RECURSIVEMATCH SPECIAL-USE).
+ * STATUS's own "(...)" item list is captured into @status_items. Unknown
+ * options will led to false being returned.
+ */
+static bool icp_parse_list_opts(const std::string &tok, bool is_return,
+    unsigned int &flags, std::vector<std::string> &status_items)
+{
+	if (tok.size() < 2 || tok.front() != '(' || tok.back() != ')')
+		return false;
+	auto in = tok.substr(1, tok.size() - 2);
+	size_t i = 0;
+	while (i < in.size()) {
+		while (i < in.size() && in[i] == ' ')
+			++i;
+		if (i >= in.size())
+			break;
+		size_t s = i;
+		while (i < in.size() && in[i] != ' ' && in[i] != '(')
+			++i;
+		auto w = in.substr(s, i - s);
+		if (w.empty())
+			continue;
+		if (is_return && strcasecmp(w.c_str(), "STATUS") == 0) {
+			flags |= LRET_STATUS;
+			while (i < in.size() && in[i] == ' ')
+				++i;
+			if (i >= in.size() || in[i] != '(')
+				return false;
+			int depth = 0;
+			size_t st = i;
+			for (; i < in.size(); ++i) {
+				if (in[i] == '(')
+					++depth;
+				else if (in[i] == ')' && --depth == 0) {
+					++i;
+					break;
+				}
+			}
+			if (depth != 0)
+				return false;
+			auto sp = in.substr(st + 1, i - st - 2);
+			size_t k = 0;
+			while (k < sp.size()) {
+				while (k < sp.size() && sp[k] == ' ')
+					++k;
+				size_t ks = k;
+				while (k < sp.size() && sp[k] != ' ')
+					++k;
+				if (k > ks)
+					status_items.push_back(sp.substr(ks, k - ks));
+			}
+			continue;
+		}
+		if (strcasecmp(w.c_str(), "SUBSCRIBED") == 0) {
+			if (is_return)
+				flags |= LRET_SUBSCRIBED;
+			else
+				flags |= LSEL_SUBSCRIBED;
+		} else if (strcasecmp(w.c_str(), "SPECIAL-USE") == 0) {
+			if (is_return)
+				flags |= LRET_SPECIALUSE;
+			else
+				flags |= LSEL_SPECIALUSE;
+		} else if (is_return && strcasecmp(w.c_str(), "CHILDREN") == 0) {
+			flags |= LRET_CHILDREN;
+		} else if (!is_return && strcasecmp(w.c_str(), "REMOTE") == 0) {
+			flags |= LSEL_REMOTE;
+		} else if (!is_return && strcasecmp(w.c_str(), "RECURSIVEMATCH") == 0) {
+			flags |= LSEL_RECURSIVE;
+		} else {
+			return false;
+		}
+	}
+	return true;
+}
+
 int icp_list(std::span<std::string> argv, imap_context &ctx) try
 {
 	auto pcontext = &ctx;
@@ -1616,29 +2073,68 @@ int icp_list(std::span<std::string> argv, imap_context &ctx) try
 	if (!pcontext->is_authed())
 		return 1804;
 	/*
-	 * Return option (list all folder and in doing so, yield special-use flags):
-	 * 	LIST "" % RETURN (SPECIAL-USE)
-	 *
-	 * Selection option (list only special use folders):
-	 * 	LIST (SPECIAL-USE) "" %
+	 * LIST-EXTENDED (RFC 9051 §6.3.9 / RFC 5258, RFC 5819, RFC 6154):
+	 * 	LIST (SUBSCRIBED RECURSIVEMATCH SPECIAL-USE) "" "*"
+	 * 	LIST "" ("INBOX" "Work/%") RETURN (SUBSCRIBED CHILDREN
+	 * 	         SPECIAL-USE STATUS (MESSAGES UNSEEN))
+	 * The classic forms (LIST "" "*", LIST "" % RETURN (SPECIAL-USE),
+	 * LIST (SPECIAL-USE) "" %) keep their exact rev1 wire output.
 	 */
 	if (argv.size() < 3)
 		return 1800;
 	size_t apos = 2;
-	auto filter_special = strcasecmp(argv[2].c_str(), "(SPECIAL-USE)") == 0;
-	if (filter_special)
+	unsigned int sel = 0, ret_opt = 0;
+	std::vector<std::string> status_items, dummy;
+	if (!argv[2].empty() && argv[2].front() == '(') {
+		if (!icp_parse_list_opts(argv[2], false, sel, dummy))
+			return 1800;
 		++apos;
+	}
 	if (argv.size() < apos + 2)
 		return 1800;
 	const auto &reference = argv[apos++];
-	const auto &mboxname  = argv[apos++];
-	bool return_special = filter_special;
-	if (argv.size() >= apos + 2 && strcasecmp(argv[apos].c_str(), "RETURN") == 0 &&
-	    strcasecmp(argv[apos+1].c_str(), "(SPECIAL-USE)") == 0)
-		return_special = true;
-	if (reference.size() + mboxname.size() >= 1024)
+	/* Mailbox pattern: a single string, or "(pat1 pat2 ...)". */
+	std::vector<std::string> patterns;
+	const auto &mp = argv[apos++];
+	if (mp.size() >= 2 && mp.front() == '(' && mp.back() == ')') {
+		std::string in = mp.substr(1, mp.size() - 2);
+		size_t k = 0;
+		while (k < in.size()) {
+			while (k < in.size() && in[k] == ' ')
+				++k;
+			size_t ks = k;
+			while (k < in.size() && in[k] != ' ')
+				++k;
+			if (k > ks)
+				patterns.emplace_back(in.substr(ks, k - ks));
+		}
+	} else {
+		patterns.emplace_back(mp);
+	}
+	if (argv.size() >= apos + 2 && strcasecmp(argv[apos].c_str(), "RETURN") == 0) {
+		if (!icp_parse_list_opts(argv[apos + 1], true, ret_opt, status_items))
+			return 1800;
+		apos += 2;
+	}
+	bool want_special  = (sel & LSEL_SPECIALUSE) || (ret_opt & LRET_SPECIALUSE);
+	bool only_special  = sel & LSEL_SPECIALUSE;
+	bool want_sub_attr = (sel & LSEL_SUBSCRIBED) || (ret_opt & LRET_SUBSCRIBED);
+	bool only_sub      = sel & LSEL_SUBSCRIBED;
+	bool recursive     = sel & LSEL_RECURSIVE;
+	/*
+	 * RFC 5258 §3 / RFC 9051 §6.3.9.1: RECURSIVEMATCH is not a selection
+	 * option in its own right.
+	 */
+	if (recursive && (sel & ~(unsigned(LSEL_RECURSIVE) | unsigned(LSEL_REMOTE))) == 0)
 		return 1800;
-	if (mboxname.empty()) {
+	if (reference.size() >= 1024)
+		return 1800;
+	for (const auto &p : patterns)
+		if (reference.size() + p.size() >= 1024)
+			return 1800;
+
+	/* Lone empty pattern: hierarchy delimiter probe (RFC 3501 §6.3.9). */
+	if (patterns.size() == 1 && patterns[0].empty()) {
 		if (pcontext->proto_stat == iproto_stat::select)
 			imap_parser_echo_modify(pcontext, NULL);
 		/* IMAP_CODE_2170011: OK LIST completed */
@@ -1648,35 +2144,125 @@ int icp_list(std::span<std::string> argv, imap_context &ctx) try
 		return DISPATCH_CONTINUE;
 	}
 
-	auto search_pattern = std::string(reference) + mboxname;
 	std::vector<enum_folder_t> folder_list;
 	auto ssr = midb_agent::enum_folders(pcontext->maildir,
 	           folder_list, &errnum);
 	auto ret = m2icode(ssr, errnum);
 	if (ret != 0)
 		return ret;
-
-	icp_convert_folderlist(folder_list);
+	/*
+	 * Capture the midb (base64) names before icp_convert_folderlist
+	 * rewrites folder_list to the mutf7 display form, so LIST-STATUS can
+	 * query midb.
+	 */
+	std::map<uint64_t, std::string> midb_name;
+	if (ret_opt & LRET_STATUS)
+		for (const auto &e : folder_list)
+			midb_name.emplace(e.first, e.second);
+	icp_convert_folderlist(folder_list, ctx.enabled_rev2);
 	dir_tree folder_tree;
 	folder_tree.load_from_memfile(folder_list);
-	pcontext->stream.clear();
-	for (const auto &enf_entry : folder_list) {
-		const auto &sys_name = enf_entry.second;
-		auto special = special_folder(enf_entry.first);
-		if (filter_special && !special)
-			continue;
-		if (!icp_wildcard_match(sys_name.c_str(), search_pattern.c_str()))
-			continue;
-		auto pdir = folder_tree.match(sys_name.c_str());
-		auto have_cld = pdir != nullptr && pdir->has_children();
-		auto buf = fmt::format("* LIST (\\Has{}Children{}{}) \"/\" {}\r\n",
-		           have_cld ? "" : "No",
-		           return_special && special != nullptr ? " " : "",
-		           return_special && special != nullptr ? special->use_flags : "",
-		           quote_encode(sys_name));
-		if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
-			return 1922;
+
+	std::set<std::string, dir_tree::cmp> subscribed;
+	if (want_sub_attr || only_sub || recursive) {
+		std::vector<enum_folder_t> sub_list;
+		if (midb_agent::enum_subscriptions(ctx.maildir,
+		    sub_list, &errnum) == MIDB_RESULT_OK) {
+			icp_convert_folderlist(sub_list, ctx.enabled_rev2);
+			for (const auto &e : sub_list)
+				subscribed.insert(e.second);
+		}
 	}
+
+	auto match_any = [&](const std::string &name) {
+		for (const auto &p : patterns)
+			if (!p.empty() && icp_wildcard_match(name.c_str(),
+			    (std::string(reference) + p).c_str()))
+				return true;
+		return false;
+	};
+	std::set<std::string, dir_tree::cmp> emitted;
+	auto write_entry = [&](const std::string &sys_name, uint64_t fid, bool subbed,
+	    const builtin_folder *sp, const char *childinfo) -> int {
+		auto dir = folder_tree.match(sys_name.c_str());
+		auto have_cld = dir != nullptr && dir->has_children();
+		std::string attrs = have_cld ? "\\HasChildren" : "\\HasNoChildren";
+		if (want_sub_attr && subbed)
+			attrs += " \\Subscribed";
+		if (want_special && sp != nullptr) {
+			attrs += ' ';
+			attrs += sp->use_flags;
+		}
+		auto line = fmt::format("* LIST ({}) \"/\" {}{}\r\n", attrs,
+		            quote_encode(sys_name), childinfo != nullptr ? childinfo : "");
+		if (ctx.stream.write(line.c_str(), line.size()) != STREAM_WRITE_OK)
+			return 1922;
+		if (ret_opt & LRET_STATUS) {
+			/*
+			 * LIST-STATUS: a per-mailbox STATUS reply follows the
+			 * LIST line, queried against the midb (base64) name. A
+			 * STATUS failure for one mailbox is not fatal.
+			 */
+			auto it = midb_name.find(fid);
+			std::string sline;
+			if (it != midb_name.end() &&
+			    icp_status_line(ctx, it->second, quote_encode(sys_name),
+			    status_items, sline) == 0 &&
+			    ctx.stream.write(sline.c_str(), sline.size()) != STREAM_WRITE_OK)
+				return 1922;
+		}
+		return 0;
+	};
+
+	/*
+	 * RECURSIVEMATCH (RFC 5258 §3.5): a matching mailbox that does not
+	 * itself satisfy the SUBSCRIBED selection is still reported -- without
+	 * the \Subscribed attribute but tagged with CHILDINFO -- when it has a
+	 * subscribed descendant that is NOT itself returned by this command.
+	 * "Descendant" = any subscribed name strictly below "<name>/". A
+	 * subscribed descendant that also matches the pattern is returned in
+	 * its own right, so it must not additionally induce a CHILDINFO on the
+	 * parent.
+	 */
+	auto has_sub_descendant = [&](const std::string &name) {
+		auto prefix = name + "/";
+		for (const auto &s : subscribed)
+			if (s.size() > prefix.size() &&
+			    s.compare(0, prefix.size(), prefix) == 0 &&
+			    !match_any(s))
+				return true;
+		return false;
+	};
+
+	ctx.stream.clear();
+	for (const auto &enf : folder_list) {
+		const auto &sys_name = enf.second;
+		auto sp = special_folder(enf.first);
+		bool subbed = subscribed.find(sys_name) != subscribed.cend();
+		if (!match_any(sys_name))
+			continue;
+		if (only_special && sp == nullptr)
+			continue;
+		const char *childinfo = nullptr;
+		if (only_sub && !subbed) {
+			/*
+			 * Not subscribed: only include it under RECURSIVEMATCH, and
+			 * only if a subscribed descendant exists -- in which case it
+			 * is reported via CHILDINFO rather than as \Subscribed.
+			 */
+			if (!recursive || !has_sub_descendant(sys_name))
+				continue;
+			childinfo = " (CHILDINFO (\"SUBSCRIBED\"))";
+		}
+		if (!emitted.insert(sys_name).second)
+			continue;
+		/* subbed only contributes \Subscribed when it is a real match. */
+		auto rc = write_entry(sys_name, enf.first, childinfo == nullptr && subbed,
+		          sp, childinfo);
+		if (rc != 0)
+			return rc;
+	}
+
 	folder_list.clear();
 	if (pcontext->proto_stat == iproto_stat::select)
 		imap_parser_echo_modify(pcontext, &pcontext->stream);
@@ -1713,7 +2299,7 @@ int icp_xlist(std::span<std::string> argv, imap_context &ctx) try
 	auto ret = m2icode(ssr, errnum);
 	if (ret != 0)
 		return ret;
-	icp_convert_folderlist(folder_list);
+	icp_convert_folderlist(folder_list, ctx.enabled_rev2);
 	dir_tree folder_tree;
 	folder_tree.load_from_memfile(folder_list);
 	pcontext->stream.clear();
@@ -1774,27 +2360,40 @@ int icp_lsub(std::span<std::string> argv, imap_context &ctx) try
 	auto ret = m2icode(ssr, errnum);
 	if (ret != 0)
 		return ret;
-	icp_convert_folderlist(sub_list);
-	std::vector<enum_folder_t> folder_list;
-	midb_agent::enum_folders(pcontext->maildir, folder_list, &errnum);
-	icp_convert_folderlist(folder_list);
-	dir_tree folder_tree;
-	folder_tree.load_from_memfile(folder_list);
-	folder_list.clear();
-	pcontext->stream.clear();
+	icp_convert_folderlist(sub_list, ctx.enabled_rev2);
 
-	for (const auto &fentry : sub_list) {
-		const auto &sys_name = fentry.second;
+	/*
+	 * Membership set of exactly-subscribed names, folded the same way as
+	 * dir_tree so the \Noselect test matches the tree's own comparisons.
+	 */
+	std::set<std::string, dir_tree::cmp> subscribed;
+	for (const auto &fentry : sub_list)
+		subscribed.insert(fentry.second);
+	/*
+	 * The tree is built from subscriptions, so a non-subscribed
+	 * intermediate ancestor of a subscribed child materializes as a node
+	 * and can be reported with \Noselect (RFC 3501 §6.3.9).
+	 */
+	dir_tree sub_tree;
+	sub_tree.load_from_memfile(sub_list);
+	sub_list.clear();
+	std::vector<std::pair<std::string, bool>> nodes; /* full_name, has_children */
+	dir_tree_collect(sub_tree, "", nodes);
+
+	ctx.stream.clear();
+	for (const auto &[sys_name, have] : nodes) {
 		if (!icp_wildcard_match(sys_name.c_str(), search_pattern.c_str()))
 			continue;
-		auto pdir = folder_tree.match(sys_name.c_str());
-		auto have = pdir != nullptr && pdir->has_children();
-		auto buf  = fmt::format("* LSUB (\\Has{}Children) \"/\" {}\r\n",
-		            have ? "" : "No", quote_encode(sys_name));
+		std::string flags;
+		if (subscribed.find(sys_name) == subscribed.cend())
+			flags = "\\Noselect"; /* synthesized ancestor, not itself subscribed */
+		else
+			flags = have ? "\\HasChildren" : "\\HasNoChildren";
+		auto buf = fmt::format("* LSUB ({}) \"/\" {}\r\n",
+		           flags, quote_encode(sys_name));
 		if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
 			return 1922;
 	}
-	sub_list.clear();
 	if (pcontext->proto_stat == iproto_stat::select)
 		imap_parser_echo_modify(pcontext, &pcontext->stream);
 	/* IMAP_CODE_2170013: OK LSUB completed */
@@ -1811,50 +2410,23 @@ int icp_lsub(std::span<std::string> argv, imap_context &ctx) try
 int icp_status(std::span<std::string> argv, imap_context &ctx) try
 {
 	auto pcontext = &ctx;
-	int errnum;
-	BOOL b_first;
 	std::vector<std::string> temp_argv;
 	std::string sys_name;
     
 	if (!pcontext->is_authed())
 		return 1804;
 	if (argv.size() < 4 || argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name) ||
+	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name, ctx.enabled_rev2) ||
 	    argv[3][0] != '(' || argv[3].back() != ')')
 		return 1800;
 	if (parse_imap_args(&argv[3][1], argv[3].size() - 2, temp_argv) < 0)
 		return 1800;
 
-	size_t exists = 0, recent = 0, unseen = 0;
-	uint32_t uidvalid = 0, uidnext = 0;
-	auto ssr = midb_agent::summary_folder(pcontext->maildir, sys_name,
-	           &exists, &recent, &unseen, &uidvalid, &uidnext, &errnum);
-	auto ret = m2icode(ssr, errnum);
-	if (ret != 0)
-		return ret;
+	std::string buf;
+	auto rc = icp_status_line(ctx, sys_name, quote_encode(argv[2]), temp_argv, buf);
+	if (rc != 0)
+		return rc;
 	/* IMAP_CODE_2170014: OK STATUS completed */
-	auto buf = fmt::format("* STATUS {} (", quote_encode(argv[2]));
-	b_first = TRUE;
-	for (const auto &arg_s : temp_argv) {
-		auto keyword = arg_s.c_str();
-		if (!b_first)
-			buf += ' ';
-		else
-			b_first = FALSE;
-		if (strcasecmp(keyword, "MESSAGES") == 0)
-			buf += fmt::format("MESSAGES {}", exists);
-		else if (strcasecmp(keyword, "RECENT") == 0)
-			buf += fmt::format("RECENT {}", recent);
-		else if (strcasecmp(keyword, "UIDNEXT") == 0)
-			buf += fmt::format("UIDNEXT {}", uidnext);
-		else if (strcasecmp(keyword, "UIDVALIDITY") == 0)
-			buf += fmt::format("UIDVALIDITY {}", uidvalid);
-		else if (strcasecmp(keyword, "UNSEEN") == 0)
-			buf += fmt::format("UNSEEN {}", unseen);
-		else
-			return 1800;
-	}
-	buf += ")\r\n";
 	if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
 		return 1922;
 	if (pcontext->proto_stat == iproto_stat::select)
@@ -1880,7 +2452,7 @@ int icp_append(std::span<std::string> argv, imap_context &ctx) try
 	
 	if (argv.size() < 4 || argv.size() > 6 ||
 	    argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name))
+	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name, ctx.enabled_rev2))
 		return 1800;
 	if (argv.size() == 6) {
 		flags_string = &argv[3];
@@ -1958,6 +2530,14 @@ int icp_append(std::span<std::string> argv, imap_context &ctx) try
 	if (i == 10)
 		buf = fmt::format("{} {} {}", argv[0], imap_reply_str,
 		      imap_reply_str1);
+	else if (pcontext->proto_stat == iproto_stat::select &&
+	    pcontext->selected_folder == sys_name)
+		/*
+		 * This connection "sees" the very message it added,
+		 * so it is not recent to anyone else.
+		 */
+		midb_agent::unset_flags(pcontext->maildir, sys_name,
+			mid_string.c_str(), FLAG_RECENT, nullptr, &errnum);
 	imap_parser_safe_write(pcontext, buf.c_str(), buf.size());
 	return DISPATCH_CONTINUE;
 } catch (const std::bad_alloc &) {
@@ -1984,7 +2564,7 @@ static int icp_long_append_begin2(std::span<std::string> argv, imap_context &ctx
 	
 	if (argv.size() < 3 || argv.size() > 5 ||
 	    argv[2].size() == 0 || argv[2].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name))
+	    !icp_imapfolder_to_sysfolder(argv[2].c_str(), sys_name, ctx.enabled_rev2))
 		return 1800 | DISPATCH_BREAK;
 	if (argv.size() == 5) {
 		flags_string = &argv[3];
@@ -2182,7 +2762,7 @@ int icp_expunge(std::span<std::string> argv, imap_context &ctx) try
 				pitem->mid.c_str());
 	}
 	if (!exp_list.empty())
-		imap_parser_bcast_expunge(*pcontext, exp_list);
+		imap_parser_bcast_expunge(*pcontext, exp_list, pcontext->selected_folder);
 	imap_parser_echo_modify(pcontext, &pcontext->stream);
 	/* IMAP_CODE_2170026: OK EXPUNGE completed */
 	auto buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1726, 1));
@@ -2204,7 +2784,207 @@ int icp_unselect(std::span<std::string> argv, imap_context &ctx)
 	imap_parser_remove_select(pcontext);
 	pcontext->proto_stat = iproto_stat::auth;
 	pcontext->selected_folder.clear();
+	pcontext->announced_keywords.clear();
+	ctx.saved_uids.clear();
 	return 1718;
+}
+
+/* SEARCH RETURN options (RFC 4731 / RFC 9051 §6.4.4) */
+enum {
+	ESR_MIN = 0x1U,
+	ESR_MAX = 0x2U,
+	ESR_COUNT = 0x4U,
+	ESR_ALL = 0x8U,
+	ESR_SAVE = 0x10U,
+};
+
+/**
+ * Parse a "(MIN MAX COUNT ALL SAVE)" RETURN token into a flag set.
+ */
+static bool icp_parse_search_return(const std::string &tok, unsigned int &flags)
+{
+	if (tok.size() < 2 || tok.front() != '(' || tok.back() != ')')
+		return false;
+	flags = 0;
+	std::string inner = tok.substr(1, tok.size() - 2);
+	size_t i = 0;
+	while (i < inner.size()) {
+		while (i < inner.size() && inner[i] == ' ')
+			++i;
+		size_t s = i;
+		while (i < inner.size() && inner[i] != ' ')
+			++i;
+		if (i == s)
+			break;
+		auto w = inner.substr(s, i - s);
+		if (strcasecmp(w.c_str(), "MIN") == 0)
+			flags |= ESR_MIN;
+		else if (strcasecmp(w.c_str(), "MAX") == 0)
+			flags |= ESR_MAX;
+		else if (strcasecmp(w.c_str(), "COUNT") == 0)
+			flags |= ESR_COUNT;
+		else if (strcasecmp(w.c_str(), "ALL") == 0)
+			flags |= ESR_ALL;
+		else if (strcasecmp(w.c_str(), "SAVE") == 0)
+			flags |= ESR_SAVE; /* SEARCHRES deferred: parsed, not stored */
+		else
+			return false; /* unknown return option */
+	}
+	return true;
+}
+
+/**
+ * Collapse an ascending id list into RFC sequence-set form, e.g. "1:3,5,7:9".
+ */
+static std::string icp_seqset(const std::vector<uint32_t> &ids)
+{
+	std::string out;
+	for (size_t i = 0; i < ids.size(); ) {
+		size_t j = i;
+		while (j + 1 < ids.size() && ids[j+1] == ids[j] + 1)
+			++j;
+		if (!out.empty())
+			out += ',';
+		if (j == i)
+			out += std::to_string(ids[i]);
+		else
+			out += fmt::format("{}:{}", ids[i], ids[j]);
+		i = j + 1;
+	}
+	return out;
+}
+
+/**
+ * Build the untagged SEARCH response. rev2 (or any RETURN clause) gets an
+ * ESEARCH line: `* ESEARCH (TAG "<tag>") [UID] [MIN n] [MAX n] [COUNT n] [ALL
+ * seq-set]`. MIN/MAX/ALL are omitted on an empty result. COUNT reports 0.
+ * @id_list is midb's space-separated match list.
+ */
+static std::string icp_esearch_line(const char *tag, bool uid_mode,
+    const std::string &id_list, unsigned int flags)
+{
+	std::vector<uint32_t> ids; /* XXX: this should be a range_set<> */
+	const char *p = id_list.c_str();
+	while (*p != '\0') {
+		while (*p == ' ')
+			++p;
+		if (*p == '\0')
+			break;
+		char *end = nullptr;
+		auto v = strtoul(p, &end, 10);
+		if (end == p)
+			break;
+		ids.push_back(v);
+		p = end;
+	}
+	std::sort(ids.begin(), ids.end());
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+	std::string out = fmt::format("* ESEARCH (TAG \"{}\")", tag);
+	if (uid_mode)
+		out += " UID";
+	if (!ids.empty()) {
+		if (flags & ESR_MIN)
+			out += fmt::format(" MIN {}", ids.front());
+		if (flags & ESR_MAX)
+			out += fmt::format(" MAX {}", ids.back());
+		if (flags & ESR_COUNT)
+			out += fmt::format(" COUNT {}", ids.size());
+		if (flags & ESR_ALL) {
+			out += " ALL ";
+			out += icp_seqset(ids);
+		}
+	} else if (flags & ESR_COUNT) {
+		out += " COUNT 0";
+	}
+	return out;
+}
+
+/**
+ * Parse midb's space-separated id list into a vector.
+ * XXX: This should produce a range_set<> instead.
+ */
+static std::vector<uint32_t> icp_parse_idlist(const std::string &s)
+{
+	std::vector<uint32_t> v;
+	const char *p = s.c_str();
+	while (*p != '\0') {
+		while (*p == ' ')
+			++p;
+		if (*p == '\0')
+			break;
+		char *end = nullptr;
+		auto n = strtoul(p, &end, 10);
+		if (end == p)
+			break;
+		v.emplace_back(n);
+		p = end;
+	}
+	return v;
+}
+
+/**
+ * Render the saved SEARCH result ($, RFC 5182) as a sequence set string, i.e.
+ * UIDs when in @uid_mode, otherwise the current sequence numbers, with absent
+ * messages getting skipped.
+ */
+static std::string icp_searchres_set(imap_context &ctx, bool uid_mode)
+{
+	std::string out;
+	for (auto uid : ctx.saved_uids) {
+		unsigned int v;
+		if (uid_mode) {
+			v = uid;
+		} else {
+			auto it = ctx.contents.get_itemx(uid);
+			if (it == nullptr)
+				continue;
+			v = it->id;
+		}
+		if (!out.empty())
+			out += ',';
+		out += std::to_string(v);
+	}
+	return out;
+}
+
+/**
+ * Expand any `$` element of a sequence set @set in place with the saved SEARCH
+ * result. This is a no-op when `$` is absent, so ordinary sets are untouched.
+ * An empty saved result drops the `$` element, yielding an empty set, i.e. no
+ * matches.
+ */
+static void icp_subst_searchres(imap_context &ctx, std::string &set, bool uid_mode)
+{
+	if (set.find('$') == std::string::npos)
+		return;
+	auto repl = icp_searchres_set(ctx, uid_mode);
+	std::string out;
+	size_t i = 0;
+	while (i <= set.size()) {
+		auto c = set.find(',', i);
+		auto end = c == std::string::npos ? set.size() : c;
+		auto tok = set.substr(i, end - i);
+		const std::string &add = tok == "$" ? repl : tok;
+		if (!add.empty()) {
+			if (!out.empty())
+				out += ',';
+			out += add;
+		}
+		if (c == std::string::npos)
+			break;
+		i = c + 1;
+	}
+	set = std::move(out);
+}
+
+/**
+ * SEARCHRES helper function for UID commands. Expands "$" in @set (UID mode)
+ * in place, so that later uses like COPYUID see real UIDs.
+ */
+static const char *icp_uidseq(imap_context &ctx, std::string &set)
+{
+	icp_subst_searchres(ctx, set, true);
+	return set.c_str();
 }
 
 int icp_search(std::span<std::string> argv, imap_context &ctx)
@@ -2216,20 +2996,46 @@ int icp_search(std::span<std::string> argv, imap_context &ctx)
 		return 1805;
 	if (argv.size() < 3 || argv.size() > 1024)
 		return 1800;
+	unsigned int ret_flags = 0;
+	bool has_return = false;
+	size_t crit_off = 2;
+	if (argv.size() >= 4 && strcasecmp(argv[2].c_str(), "RETURN") == 0) {
+		if (!icp_parse_search_return(argv[3], ret_flags))
+			return 1800;
+		has_return = true;
+		crit_off = 4;
+	}
+	if ((ret_flags & (ESR_MIN | ESR_MAX | ESR_COUNT | ESR_ALL)) == 0 &&
+	    !(ret_flags & ESR_SAVE))
+		/* default / RETURN () -> ALL; SAVE-only -> none */
+		ret_flags |= ESR_ALL;
+
+	auto esearch = ctx.enabled_rev2 || has_return;
 	std::string buff;
 	auto ssr = midb_agent::search(pcontext->maildir,
 	           pcontext->selected_folder, pcontext->defcharset,
-	           argv.subspan(2), buff, &errnum);
-	buff.insert(0, "* SEARCH ");
+	           argv.subspan(crit_off), buff, &errnum);
 	auto result = m2icode(ssr, errnum);
 	if (result != 0)
 		return result;
-	buff.append("\r\n");
+	if (ret_flags & ESR_SAVE) {
+		/* SEARCHRES: save the matched UIDs (mapped from seq numbers). */
+		ctx.saved_uids.clear();
+		for (auto seq : icp_parse_idlist(buff)) {
+			auto it = ctx.contents.get_item(seq - 1);
+			if (it != nullptr)
+				ctx.saved_uids.push_back(it->uid);
+		}
+	}
+	std::string resp = esearch ?
+		icp_esearch_line(argv[0].c_str(), false, buff, ret_flags) :
+		"* SEARCH " + buff;
+	resp.append("\r\n");
 	pcontext->stream.clear();
-	if (pcontext->stream.write(buff.c_str(), buff.size()) != STREAM_WRITE_OK)
+	if (ctx.stream.write(resp.c_str(), resp.size()) != STREAM_WRITE_OK)
 		return 1922;
 	if (pcontext->proto_stat == iproto_stat::select)
-		imap_parser_echo_modify(pcontext, &pcontext->stream);
+		imap_parser_echo_modify(pcontext, &pcontext->stream, echomod::suppress_expunge);
 	/* IMAP_CODE_2170019: OK SEARCH completed */
 	buff = fmt::format("{} {}", argv[0], resource_get_imap_code(1719, 1));
 	if (pcontext->stream.write(buff.c_str(), buff.size()) != STREAM_WRITE_OK)
@@ -2245,9 +3051,16 @@ int icp_search(std::span<std::string> argv, imap_context &ctx)
  * @range_string:	sequence numbers, e.g. "1,2:3,4:*,*:5,*:*,*"
  * @uid_list:		split-up range
  */
-static errno_t parse_imap_seqx(const imap_context &ctx, const char *range_string,
+static errno_t parse_imap_seqx(imap_context &ctx, const char *range_string,
     imap_seq_list &uid_list) try
 {
+	/* SEARCHRES: expand "$" against the saved result (sequence numbers). */
+	std::string subst;
+	if (range_string != nullptr && strchr(range_string, '$') != nullptr) {
+		subst = range_string;
+		icp_subst_searchres(ctx, subst, false);
+		range_string = subst.c_str();
+	}
 	imap_seq_list seq_list;
 	auto err = parse_imap_seq(seq_list, range_string);
 	if (err != 0)
@@ -2336,7 +3149,7 @@ int icp_fetch(std::span<std::string> argv, imap_context &ctx)
 			return result;
 	}
 	xarray.clear();
-	imap_parser_echo_modify(pcontext, &pcontext->stream);
+	imap_parser_echo_modify(pcontext, &pcontext->stream, echomod::suppress_expunge);
 	/* IMAP_CODE_2170020: OK FETCH completed */
 	auto buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1720, 1));
 	if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
@@ -2377,7 +3190,7 @@ int icp_store(std::span<std::string> argv, imap_context &ctx)
 	    !store_flagkeyword(argv[3].c_str()))
 		return 1800;
 	if (argv[4].front() == '(' && argv[4].back() == ')') {
-		auto temp_argc = parse_imap_args(&argv[4][1], argv[4].size() - 2, temp_argv);
+		auto temp_argc = parse_imap_args(&argv[4][1], argv[4].size() - 2, temp_argv, true);
 		if (temp_argc == -1)
 			return 1800;
 	} else {
@@ -2386,25 +3199,9 @@ int icp_store(std::span<std::string> argv, imap_context &ctx)
 	if (pcontext->b_readonly)
 		return 1806;
 	flag_bits = 0;
-	for (const auto &kw_s : temp_argv) {
-		auto keyword = kw_s.c_str();
-		if (strcasecmp(keyword, "\\Answered") == 0)
-			flag_bits |= FLAG_ANSWERED;
-		else if (strcasecmp(keyword, "\\Flagged") == 0)
-			flag_bits |= FLAG_FLAGGED;
-		else if (strcasecmp(keyword, "\\Deleted") == 0)
-			flag_bits |= FLAG_DELETED;
-		else if (strcasecmp(keyword, "\\Seen") == 0)
-			flag_bits |= FLAG_SEEN;
-		else if (strcasecmp(keyword, "\\Draft") == 0)
-			flag_bits |= FLAG_DRAFT;
-		else if (strcasecmp(keyword, "\\Recent") == 0)
-			flag_bits |= FLAG_RECENT;			
-		else if (strcasecmp(keyword, "$Forwarded") == 0)
-			flag_bits |= FLAG_FORWARDED;
-		else
-			return 1807;
-	}
+	std::vector<std::string> kw_list;
+	if (!icp_classify_store_flags(temp_argv, flag_bits, kw_list))
+		return 1807;
 	XARRAY xarray;
 	auto ssr = midb_agent::fetch_simple_uid(pcontext->maildir,
 	           pcontext->selected_folder, list_uid, &xarray, &errnum);
@@ -2418,10 +3215,10 @@ int icp_store(std::span<std::string> argv, imap_context &ctx)
 		if (ct_item == nullptr)
 			continue;
 		icp_store_flags(argv[3].c_str(), pitem->mid,
-			ct_item->id, 0, flag_bits, ctx);
+			ct_item->id, 0, flag_bits, kw_list, ctx);
 		imap_parser_bcast_flags(*pcontext, pitem->uid);
 	}
-	imap_parser_echo_modify(pcontext, NULL);
+	imap_parser_echo_modify(pcontext, nullptr, echomod::suppress_expunge);
 	return 1721;
 }
 
@@ -2440,7 +3237,7 @@ int icp_copy(std::span<std::string> argv, imap_context &ctx) try
 		return 1805;
 	if (argv.size() < 4 || parse_imap_seqx(*pcontext, argv[2].c_str(), list_uid) != 0 ||
 	    argv[3].size() == 0 || argv[3].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[3].c_str(), sys_name))
+	    !icp_imapfolder_to_sysfolder(argv[3].c_str(), sys_name, ctx.enabled_rev2))
 		return 1800;
 	XARRAY xarray;
 	auto ssr = midb_agent::fetch_simple_uid(pcontext->maildir,
@@ -2537,19 +3334,38 @@ int icp_uid_search(std::span<std::string> argv, imap_context &ctx) try
 		return 1805;
 	if (argv.size() < 3 || argv.size() > 1024)
 		return 1800;
+	unsigned int ret_flags = 0;
+	bool has_return = false;
+	size_t crit_off = 3;
+	if (argv.size() >= 5 && strcasecmp(argv[3].c_str(), "RETURN") == 0) {
+		if (!icp_parse_search_return(argv[4], ret_flags))
+			return 1800;
+		has_return = true;
+		crit_off = 5;
+	}
+	if ((ret_flags & (ESR_MIN | ESR_MAX | ESR_COUNT | ESR_ALL)) == 0 &&
+	    !(ret_flags & ESR_SAVE))
+		ret_flags |= ESR_ALL;
+	auto esearch = ctx.enabled_rev2 || has_return;
 	std::string buff;
 	auto ssr = midb_agent::search_uid(pcontext->maildir,
 	           pcontext->selected_folder, pcontext->defcharset,
-	           argv.subspan(3), buff, &errnum);
-	buff.insert(0, "* SEARCH ");
+	           argv.subspan(crit_off), buff, &errnum);
 	auto ret = m2icode(ssr, errnum);
 	if (ret != 0)
 		return ret;
+	if (ret_flags & ESR_SAVE)
+		/* SEARCHRES: UID SEARCH already yields UIDs. */
+		ctx.saved_uids = icp_parse_idlist(buff);
+	std::string resp = esearch ?
+		icp_esearch_line(argv[0].c_str(), true, buff, ret_flags) :
+		"* SEARCH " + buff;
+	buff = std::move(resp);
 	buff.append("\r\n");
 	pcontext->stream.clear();
-	if (pcontext->stream.write(buff.c_str(), buff.size()) != STREAM_WRITE_OK)
+	if (ctx.stream.write(buff.c_str(), buff.size()) != STREAM_WRITE_OK)
 		return 1922;
-	imap_parser_echo_modify(pcontext, &pcontext->stream);
+	imap_parser_echo_modify(pcontext, &pcontext->stream, echomod::suppress_expunge);
 	/* IMAP_CODE_2170023: OK UID SEARCH completed */
 	buff = fmt::format("{} {}", argv[0], resource_get_imap_code(1723, 1));
 	if (pcontext->stream.write(buff.c_str(), buff.size()) != STREAM_WRITE_OK)
@@ -2575,7 +3391,7 @@ int icp_uid_fetch(std::span<std::string> argv, imap_context &ctx) try
 	
 	if (pcontext->proto_stat != iproto_stat::select)
 		return 1805;
-	if (argv.size() < 5 || parse_imap_seq(list_seq, argv[3].c_str()) != 0)
+	if (argv.size() < 5 || parse_imap_seq(list_seq, icp_uidseq(ctx, argv[3])) != 0)
 		return 1800;
 	std::vector<std::string> temp_argv;
 	if (!icp_parse_fetch_args(list_data, &b_detail,
@@ -2609,7 +3425,7 @@ int icp_uid_fetch(std::span<std::string> argv, imap_context &ctx) try
 			return ret;
 	}
 	xarray.clear();
-	imap_parser_echo_modify(pcontext, &pcontext->stream);
+	imap_parser_echo_modify(pcontext, &pcontext->stream, echomod::suppress_expunge);
 	/* IMAP_CODE_2170028: OK UID FETCH completed */
 	auto buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1728, 1));
 	if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
@@ -2636,12 +3452,12 @@ int icp_uid_store(std::span<std::string> argv, imap_context &ctx)
 
 	if (pcontext->proto_stat != iproto_stat::select)
 		return 1805;
-	if (argv.size() < 6 || parse_imap_seq(list_seq, argv[3].c_str()) != 0 ||
+	if (argv.size() < 6 || parse_imap_seq(list_seq, icp_uidseq(ctx, argv[3])) != 0 ||
 	    !store_flagkeyword(argv[4].c_str()))
 		return 1800;
 	std::vector<std::string> temp_argv;
 	if (argv[5].front() == '(' && argv[5].back() == ')') {
-		auto temp_argc = parse_imap_args(&argv[5][1], argv[5].size() - 2, temp_argv);
+		auto temp_argc = parse_imap_args(&argv[5][1], argv[5].size() - 2, temp_argv, true);
 		if (temp_argc == -1)
 			return 1800;
 	} else {
@@ -2650,25 +3466,9 @@ int icp_uid_store(std::span<std::string> argv, imap_context &ctx)
 	if (pcontext->b_readonly)
 		return 1806;
 	flag_bits = 0;
-	for (const auto &kw_s : temp_argv) {
-		auto keyword = kw_s.c_str();
-		if (strcasecmp(keyword, "\\Answered") == 0)
-			flag_bits |= FLAG_ANSWERED;
-		else if (strcasecmp(keyword, "\\Flagged") == 0)
-			flag_bits |= FLAG_FLAGGED;
-		else if (strcasecmp(keyword, "\\Deleted") == 0)
-			flag_bits |= FLAG_DELETED;
-		else if (strcasecmp(keyword, "\\Seen") == 0)
-			flag_bits |= FLAG_SEEN;
-		else if (strcasecmp(keyword, "\\Draft") == 0)
-			flag_bits |= FLAG_DRAFT;
-		else if (strcasecmp(keyword, "\\Recent") == 0)
-			flag_bits |= FLAG_RECENT;			
-		else if (strcasecmp(keyword, "$Forwarded") == 0)
-			flag_bits |= FLAG_FORWARDED;
-		else
-			return 1807;
-	}
+	std::vector<std::string> kw_list;
+	if (!icp_classify_store_flags(temp_argv, flag_bits, kw_list))
+		return 1807;
 	XARRAY xarray;
 	auto ssr = midb_agent::fetch_simple_uid(pcontext->maildir,
 	           pcontext->selected_folder, list_seq, &xarray, &errnum);
@@ -2682,10 +3482,10 @@ int icp_uid_store(std::span<std::string> argv, imap_context &ctx)
 		if (ct_item == nullptr)
 			continue;
 		icp_store_flags(argv[4].c_str(), pitem->mid,
-			ct_item->id, pitem->uid, flag_bits, ctx);
+			ct_item->id, pitem->uid, flag_bits, kw_list, ctx);
 		imap_parser_bcast_flags(*pcontext, pitem->uid);
 	}
-	imap_parser_echo_modify(pcontext, NULL);
+	imap_parser_echo_modify(pcontext, nullptr, echomod::suppress_expunge);
 	return 1724;
 }
 
@@ -2702,9 +3502,9 @@ int icp_uid_copy(std::span<std::string> argv, imap_context &ctx) try
 	
 	if (pcontext->proto_stat != iproto_stat::select)
 		return 1805;
-	if (argv.size() < 5 || parse_imap_seq(list_seq, argv[3].c_str()) != 0 ||
+	if (argv.size() < 5 || parse_imap_seq(list_seq, icp_uidseq(ctx, argv[3])) != 0 ||
 	    argv[4].size() == 0 || argv[4].size() >= 1024 ||
-	    !icp_imapfolder_to_sysfolder(argv[4].c_str(), sys_name))
+	    !icp_imapfolder_to_sysfolder(argv[4].c_str(), sys_name, ctx.enabled_rev2))
 		return 1800;
 	XARRAY xarray;
 	auto ssr = midb_agent::fetch_simple_uid(pcontext->maildir,
@@ -2786,6 +3586,240 @@ int icp_uid_copy(std::span<std::string> argv, imap_context &ctx) try
 	return 1918;
 }
 
+/**
+ * MOVE support (RFC 6851 / RFC 9051 §6.4.8). Copy the messages to the target,
+ * then expunge them from the (currently selected) source. Per RFC 6851 the
+ * COPYUID is sent in an untagged "* OK [COPYUID ...]" before the EXPUNGE
+ * responses, and the tagged reply carries no COPYUID. On a copy failure the
+ * partial target copies are rolled back and the source is left untouched.
+ */
+int icp_move(std::span<std::string> argv, imap_context &ctx) try
+{
+	unsigned int uid;
+	int errnum;
+	std::string sys_name;
+	imap_seq_list list_uid;
+
+	if (ctx.proto_stat != iproto_stat::select)
+		return 1805;
+	if (ctx.b_readonly)
+		return 1806;
+	if (argv.size() < 4 || parse_imap_seqx(ctx, argv[2].c_str(), list_uid) != 0 ||
+	    argv[3].size() == 0 || argv[3].size() >= 1024 ||
+	    !icp_imapfolder_to_sysfolder(argv[3].c_str(), sys_name, ctx.enabled_rev2))
+		return 1800;
+	XARRAY xarray;
+	auto ssr = midb_agent::fetch_simple_uid(ctx.maildir,
+	           ctx.selected_folder, list_uid, &xarray, &errnum);
+	auto result = m2icode(ssr, errnum);
+	if (result != 0)
+		return result;
+	uint32_t uidvalidity = 0;
+	if (midb_agent::summary_folder(ctx.maildir,
+	    sys_name, nullptr, nullptr, nullptr, &uidvalidity, nullptr,
+	    &errnum) != MIDB_RESULT_OK)
+		uidvalidity = 0;
+
+	bool b_copied = true, b_first = false;
+	auto num = xarray.get_capacity();
+	std::string uid_string, uid_string1;
+	std::vector<MITEM *> moved;
+	size_t i;
+	for (i = 0; i < num; ++i) {
+		auto xi = xarray.get_item(i);
+		auto pitem = ctx.contents.get_itemx(xi->uid);
+		if (pitem == nullptr)
+			continue;
+		std::string dst_mid = pitem->mid;
+		if (midb_agent::copy_mail(ctx.maildir,
+		    ctx.selected_folder, pitem->mid, sys_name,
+		    dst_mid, &errnum) != MIDB_RESULT_OK) {
+			b_copied = FALSE;
+			break;
+		}
+		moved.push_back(xi);
+		if (uidvalidity == 0)
+			continue;
+		unsigned int j;
+		for (j = 0; j < 10; j++) {
+			if (midb_agent::get_uid(ctx.maildir,
+			    sys_name, dst_mid, &uid) != MIDB_RESULT_OK) {
+				usleep(500000);
+				continue;
+			}
+			if (b_first) {
+				uid_string += ',';
+				uid_string1 += ',';
+			} else {
+				b_first = TRUE;
+			}
+			uid_string += std::to_string(xi->uid);
+			uid_string1 += std::to_string(uid);
+			break;
+		}
+		if (j == 10)
+			uidvalidity = 0;
+	}
+	if (!b_copied) {
+		/* roll back the copies already made to the target */
+		std::vector<MITEM *> exp_list;
+		while (i > 0) {
+			auto pitem = xarray.get_item(--i);
+			if (pitem->uid != 0)
+				exp_list.push_back(pitem);
+		}
+		midb_agent::remove_mail(ctx.maildir, sys_name, exp_list, &errnum);
+		ctx.stream.clear();
+		/* IMAP_CODE_2190027: NO MOVE failed */
+		auto buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1927, 1));
+		if (ctx.stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
+			return 1922;
+		ctx.write_offset = 0;
+		ctx.sched_stat = isched_stat::wrlst;
+		return DISPATCH_BREAK;
+	}
+	imrpc_build_env();
+	auto cl_0 = HX::make_scope_exit(imrpc_free_env);
+	midb_agent::remove_mail(ctx.maildir, ctx.selected_folder,
+		moved, &errnum);
+	for (auto pitem : moved)
+		if (!exmdb_client->imapfile_delete(ctx.maildir, "eml", pitem->mid))
+			mlog(LV_WARN, "W-2031: remove %s/eml/%s failed",
+				ctx.maildir, pitem->mid.c_str());
+	if (!moved.empty())
+		imap_parser_bcast_expunge(ctx, moved, ctx.selected_folder);
+	ctx.stream.clear();
+	std::string buf;
+	if (uidvalidity != 0) {
+		buf = fmt::format("* OK [COPYUID {} {} {}] moved\r\n",
+		      uidvalidity, uid_string, uid_string1);
+		if (ctx.stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
+			return 1922;
+	}
+	imap_parser_echo_modify(&ctx, &ctx.stream);
+	/* IMAP_CODE_2170033: OK MOVE completed */
+	buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1733, 1));
+	if (ctx.stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
+		return 1922;
+	ctx.write_offset = 0;
+	ctx.sched_stat = isched_stat::wrlst;
+	return DISPATCH_BREAK;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-2701: ENOMEM");
+	return 1918;
+}
+
+int icp_uid_move(std::span<std::string> argv, imap_context &ctx) try
+{
+	auto pcontext = &ctx;
+	unsigned int uid;
+	int errnum;
+	BOOL b_first, b_copied;
+	int i, j;
+	std::string sys_name;
+	imap_seq_list list_seq;
+
+	if (pcontext->proto_stat != iproto_stat::select)
+		return 1805;
+	if (pcontext->b_readonly)
+		return 1806;
+	if (argv.size() < 5 || parse_imap_seq(list_seq, icp_uidseq(ctx, argv[3])) != 0 ||
+	    argv[4].size() == 0 || argv[4].size() >= 1024 ||
+	    !icp_imapfolder_to_sysfolder(argv[4].c_str(), sys_name, ctx.enabled_rev2))
+		return 1800;
+	XARRAY xarray;
+	auto ssr = midb_agent::fetch_simple_uid(pcontext->maildir,
+	           pcontext->selected_folder, list_seq, &xarray, &errnum);
+	auto ret = m2icode(ssr, errnum);
+	if (ret != 0)
+		return ret;
+	uint32_t uidvalidity = 0;
+	if (midb_agent::summary_folder(pcontext->maildir,
+	    sys_name, nullptr, nullptr, nullptr, &uidvalidity,
+	    nullptr, &errnum) != MIDB_RESULT_OK)
+		uidvalidity = 0;
+	b_copied = TRUE;
+	b_first = FALSE;
+	int num = xarray.get_capacity();
+	std::string uid_string;
+	std::vector<MITEM *> moved;
+	for (i = 0; i < num; i++) {
+		auto pitem = xarray.get_item(i);
+		std::string dst_mid = pitem->mid;
+		if (midb_agent::copy_mail(pcontext->maildir,
+		    pcontext->selected_folder, pitem->mid, sys_name,
+		    dst_mid, &errnum) != MIDB_RESULT_OK) {
+			b_copied = FALSE;
+			break;
+		}
+		moved.push_back(pitem);
+		if (uidvalidity == 0)
+			continue;
+		for (j = 0; j < 10; j++) {
+			if (midb_agent::get_uid(pcontext->maildir,
+			    sys_name, dst_mid, &uid) != MIDB_RESULT_OK) {
+				usleep(500000);
+				continue;
+			}
+			if (b_first)
+				uid_string += ',';
+			else
+				b_first = TRUE;
+			uid_string += std::to_string(uid);
+			break;
+		}
+		if (j == 10)
+			uidvalidity = 0;
+	}
+	if (!b_copied) {
+		std::vector<MITEM *> exp_list;
+		for (; i > 0; i--) {
+			auto pitem = xarray.get_item(i - 1);
+			if (pitem->uid == 0)
+				continue;
+			exp_list.push_back(pitem);
+		}
+		midb_agent::remove_mail(pcontext->maildir, sys_name, exp_list, &errnum);
+		pcontext->stream.clear();
+		/* IMAP_CODE_2190028: NO UID MOVE failed */
+		auto buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1928, 1));
+		if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
+			return 1922;
+		pcontext->write_offset = 0;
+		pcontext->sched_stat = isched_stat::wrlst;
+		return DISPATCH_BREAK;
+	}
+	imrpc_build_env();
+	auto cl_0 = HX::make_scope_exit(imrpc_free_env);
+	midb_agent::remove_mail(pcontext->maildir, pcontext->selected_folder,
+		moved, &errnum);
+	for (auto pitem : moved)
+		if (!exmdb_client->imapfile_delete(ctx.maildir, "eml", pitem->mid))
+			mlog(LV_WARN, "W-2032: remove %s/eml/%s failed",
+				ctx.maildir, pitem->mid.c_str());
+	if (!moved.empty())
+		imap_parser_bcast_expunge(*pcontext, moved, pcontext->selected_folder);
+	pcontext->stream.clear();
+	std::string buf;
+	if (uidvalidity != 0) {
+		buf = fmt::format("* OK [COPYUID {} {} {}] moved\r\n",
+		      uidvalidity, argv[3], uid_string);
+		if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
+			return 1922;
+	}
+	imap_parser_echo_modify(pcontext, &pcontext->stream);
+	/* IMAP_CODE_2170034: OK UID MOVE completed */
+	buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1734, 1));
+	if (pcontext->stream.write(buf.c_str(), buf.size()) != STREAM_WRITE_OK)
+		return 1922;
+	pcontext->write_offset = 0;
+	pcontext->sched_stat = isched_stat::wrlst;
+	return DISPATCH_BREAK;
+} catch (const std::bad_alloc &) {
+	mlog(LV_ERR, "E-2702: ENOMEM");
+	return 1918;
+}
+
 int icp_uid_expunge(std::span<std::string> argv, imap_context &ctx) try
 {
 	auto pcontext = &ctx;
@@ -2797,7 +3831,7 @@ int icp_uid_expunge(std::span<std::string> argv, imap_context &ctx) try
 		return 1805;
 	if (pcontext->b_readonly)
 		return 1806;
-	if (argv.size() < 4 || parse_imap_seq(list_seq, argv[3].c_str()) != 0)
+	if (argv.size() < 4 || parse_imap_seq(list_seq, icp_uidseq(ctx, argv[3])) != 0)
 		return 1800;
 	XARRAY xarray;
 	auto ssr = midb_agent::list_deleted(pcontext->maildir,
@@ -2845,7 +3879,7 @@ int icp_uid_expunge(std::span<std::string> argv, imap_context &ctx) try
 				pitem->mid.c_str());
 	}
 	if (!exp_list.empty())
-		imap_parser_bcast_expunge(*pcontext, exp_list);
+		imap_parser_bcast_expunge(*pcontext, exp_list, pcontext->selected_folder);
 	imap_parser_echo_modify(pcontext, &pcontext->stream);
 	/* IMAP_CODE_2170026: OK UID EXPUNGE completed */
 	auto buf = fmt::format("{} {}", argv[0], resource_get_imap_code(1726, 1));
@@ -2872,8 +3906,21 @@ void icp_clsfld(imap_context &ctx) try
 	pcontext->proto_stat = iproto_stat::auth;
 	prev_selected = std::move(pcontext->selected_folder);
 	pcontext->selected_folder.clear();
+	pcontext->announced_keywords.clear();
+	ctx.saved_uids.clear();
 	if (pcontext->b_readonly)
 		return;
+	/*
+	 * RFC3501 §7.4.2: a read-write SELECT consumes \Recent. Clear it for the
+	 * folder's messages as the session leaves it so a later STATUS/SELECT
+	 * reports RECENT 0. (read-only EXAMINE returned above without clearing.)
+	 */
+	for (size_t ri = 0; ri < pcontext->contents.get_capacity(); ++ri) {
+		auto pitem = pcontext->contents.get_item(ri);
+		if (pitem != nullptr && pitem->flag_bits & FLAG_RECENT)
+			midb_agent::unset_flags(pcontext->maildir, prev_selected,
+				pitem->mid, FLAG_RECENT, nullptr, &errnum);
+	}
 	XARRAY xarray;
 	result = midb_agent::list_deleted(pcontext->maildir,
 	         prev_selected, &xarray, &errnum);
@@ -2957,8 +4004,7 @@ void icp_clsfld(imap_context &ctx) try
 		return;
 	}
 	if (b_deleted)
-		imap_parser_bcast_touch(pcontext,
-			pcontext->username, prev_selected);
+		imap_parser_bcast_expunge(*pcontext, exp_list, prev_selected);
 } catch (const std::bad_alloc &) {
 	mlog(LV_ERR, "E-1242: ENOMEM");
 }
@@ -2979,7 +4025,8 @@ int icp_dval(const char *tag, imap_context &ctx, unsigned int ret)
 		code = 1907;
 	auto str = resource_get_imap_code(code, 1);
 	char buff[1024];
-	tag = tag_or_bug((ret & DISPATCH_TAG) ? ctx.tag_string : tag);
+	tag = tag_or_bug((ret & DISPATCH_TAG) ? ctx.tag_string :
+	                 tag != nullptr ? tag : "*");
 	if (trycreate && strncmp(str, "NO ", 3) == 0)
 		str += 2; /* avoid double NO */
 	auto len = gx_snprintf(buff, std::size(buff), "%s%s %s%s", tag,

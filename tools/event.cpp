@@ -291,9 +291,8 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sact, nullptr);
 	sigaction(SIGTERM, &sact, nullptr);
 	printf("[system]: EVENT is now running\n");
-	while (!g_notify_stop) {
+	while (!g_notify_stop)
 		sleep(1);
-	}
 	return EXIT_SUCCESS;
 }
 
@@ -330,50 +329,58 @@ static void *ev_scanwork(void *param)
 			if (phost == ptail)
 				break;
 		}
-		hl_hold.unlock();
 	}
 	return NULL;
 }
 
 static int ev_acceptwork(generic_connection &&conn)
 {
-	ENQUEUE_NODE *penqueue;
+	enum { EW_OK, EW_ACL, EW_MAXCONN, EW_NOMEM };
+	ENQUEUE_NODE *penqueue = nullptr;
 
+	auto ret = [&]() {
 		if (std::find(g_acl_list.cbegin(), g_acl_list.cend(),
-		    conn.client_addr) == g_acl_list.cend()) {
-			if (HXio_fullwrite(conn.sockd, "FALSE Access denied\r\n", 19) < 0)
-				/* ignore */;
-			return 0;
-		}
+		    conn.client_addr) == g_acl_list.cend())
+			return EW_ACL;
 
 		std::unique_lock eq_hold(g_enqueue_lock);
-		if (g_enqueue_list.size() + 1 + g_enqueue_list1.size() >= g_threads_num) {
-			eq_hold.unlock();
-			if (HXio_fullwrite(conn.sockd, "FALSE Maximum number of connections reached!\r\n", 35) < 0)
-				/* ignore */;
-			return 0;
-		}
+		if (g_enqueue_list.size() + 1 + g_enqueue_list1.size() >= g_threads_num)
+			return EW_MAXCONN;
+
 		try {
 			g_enqueue_list1.emplace_back();
 			penqueue = &g_enqueue_list1.back();
 		} catch (const std::bad_alloc &) {
-			eq_hold.unlock();
-			if (HXio_fullwrite(conn.sockd, "FALSE Not enough memory\r\n", 25) < 0)
-				/* ignore */;
-			return 0;
+			return EW_NOMEM;
 		}
 
 		static_cast<generic_connection &>(*penqueue) = std::move(conn);
-		eq_hold.unlock();
+		return EW_OK;
+	}();
+	switch (ret) {
+	case EW_ACL:
+		if (HXio_fullwrite(conn.sockd, "FALSE Access denied\r\n", 19) < 0)
+			/* ignore */;
+		return 0;
+	case EW_MAXCONN:
+		if (HXio_fullwrite(conn.sockd, "FALSE Maximum number of connections reached!\r\n", 35) < 0)
+			/* ignore */;
+		return 0;
+	case EW_NOMEM:
+		if (HXio_fullwrite(conn.sockd, "FALSE Not enough memory\r\n", 25) < 0)
+			/* ignore */;
+		return 0;
+	case EW_OK:
 		if (HXio_fullwrite(penqueue->sockd, "OK\r\n", 4) < 0)
 			penqueue->reset();
 		g_enqueue_waken_cond.notify_one();
-
-	return 0;
+		return 0;
+	default:
+		return -1;
+	}
 }
 
 using eq_iter_t = std::list<ENQUEUE_NODE>::iterator;
-using eq_lock_t = std::unique_lock<std::mutex>;
 
 static void q_id(eq_iter_t eq_node)
 {
@@ -382,7 +389,7 @@ static void q_id(eq_iter_t eq_node)
 	penqueue->sk_write("TRUE\r\n");
 }
 
-static int q_listen(eq_iter_t eq_node, std::unique_lock<std::mutex> &eq_hold)
+static int q_listen(eq_iter_t eq_node)
 {
 	auto penqueue = &*eq_node;
 	HOST_NODE *phost = nullptr;
@@ -431,7 +438,8 @@ static int q_listen(eq_iter_t eq_node, std::unique_lock<std::mutex> &eq_hold)
 	hl_hold.unlock();
 	pdequeue->sk_write("TRUE\r\n");
 	g_dequeue_waken_cond.notify_one();
-	eq_hold.lock();
+
+	std::unique_lock eq_hold(g_enqueue_lock);
 	g_enqueue_list.erase(eq_node);
 	return 2;
 }
@@ -494,11 +502,11 @@ static void q_unselect(eq_iter_t eq_node) try
 	eq_node->sk_write("FALSE\r\n");
 }
 
-static int q_quit(eq_iter_t eq_node, eq_lock_t &eq_hold)
+static int q_quit(eq_iter_t eq_node)
 {
 	auto penqueue = &*eq_node;
 	penqueue->sk_write("BYE\r\n");
-	eq_hold.lock();
+	std::unique_lock eq_hold(g_enqueue_lock);
 	g_enqueue_list.erase(eq_node);
 	return 2;
 }
@@ -564,27 +572,31 @@ enum { X_STOP, X_LOOP };
 
 static int ev_enqwork_1()
 {
+	decltype(g_enqueue_list1)::iterator eq_node{};
+	ENQUEUE_NODE *penqueue = nullptr;
+
+	{
 	std::unique_lock eq_hold(g_enqueue_lock);
 	g_enqueue_waken_cond.wait(eq_hold, []() { return g_notify_stop || g_enqueue_list1.size() > 0; });
 	if (g_notify_stop)
 		return X_STOP;
 	if (g_enqueue_list1.size() == 0)
 		return X_LOOP;
-	auto eq_node = g_enqueue_list1.begin();
-	auto penqueue = &*eq_node;
+	eq_node  = g_enqueue_list1.begin();
+	penqueue = &*eq_node;
 	g_enqueue_list.splice(g_enqueue_list.end(), g_enqueue_list1, eq_node);
-	eq_hold.unlock();
+	}
 
 	while (true) {
 		if (!read_mark(penqueue)) {
-			eq_hold.lock();
+			std::unique_lock eq_hold(g_enqueue_lock);
 			g_enqueue_list.erase(eq_node);
 			return X_LOOP;
 		}
 		if (strncasecmp(penqueue->line, "ID ", 3) == 0) {
 			q_id(eq_node);
 		} else if (strncasecmp(penqueue->line, "LISTEN ", 7) == 0) {
-			auto ret = q_listen(eq_node, eq_hold);
+			auto ret = q_listen(eq_node);
 			if (ret == 2)
 				return X_LOOP;
 		} else if (strncasecmp(penqueue->line, "SELECT ", 7) == 0) {
@@ -592,7 +604,7 @@ static int ev_enqwork_1()
 		} else if (strncasecmp(penqueue->line, "UNSELECT ", 9) == 0) {
 			q_unselect(eq_node);
 		} else if (strcasecmp(penqueue->line, "QUIT") == 0) {
-			auto ret = q_quit(eq_node, eq_hold);
+			auto ret = q_quit(eq_node);
 			if (ret == 2)
 				return X_LOOP;
 		} else if (strcasecmp(penqueue->line, "PING") == 0) {
@@ -612,49 +624,54 @@ static void *ev_enqwork(void *)
 
 static int ev_deqwork_1()
 {
+	std::shared_ptr<DEQUEUE_NODE> pdequeue;
+	{
 	std::unique_lock dq_hold(g_dequeue_lock);
 	g_dequeue_waken_cond.wait(dq_hold, []() { return g_notify_stop || g_dequeue_list1.size() > 0; });
 	if (g_notify_stop)
 		return X_STOP;
 	if (g_dequeue_list1.size() == 0)
 		return X_LOOP;
-	/*shared_ptr*/ auto pdequeue = g_dequeue_list1.front();
+	pdequeue = g_dequeue_list1.front();
 	g_dequeue_list1.erase(g_dequeue_list1.begin());
-	dq_hold.unlock();
+	}
 	
 	auto last_time = time(nullptr);
-	std::unique_lock hl_hold(g_host_lock);
-	auto phost = std::find_if(g_host_list.begin(), g_host_list.end(),
-	             [&](const HOST_NODE &h) { return strcmp(h.res_id, pdequeue->res_id) == 0; });
-	if (phost == g_host_list.end())
-		return X_LOOP;
-	hl_hold.unlock();
+	decltype(g_host_list)::iterator phost;
+	{
+		std::unique_lock hl_hold(g_host_lock);
+		phost = std::find_if(g_host_list.begin(), g_host_list.end(),
+		        [&](const HOST_NODE &h) { return strcmp(h.res_id, pdequeue->res_id) == 0; });
+		if (phost == g_host_list.end())
+			return X_LOOP;
+	}
 	
 	while (!g_notify_stop) {
+		{
 		std::unique_lock pdc_hold(pdequeue->cond_mutex);
 		pdequeue->waken_cond.wait_for(pdc_hold, std::chrono::seconds(1));
-		pdc_hold.unlock();
+		}
 		if (g_notify_stop)
 			return X_STOP;
-		std::unique_lock fifo_hold(pdequeue->lock);
-		auto buff = pdequeue->fifo.pop_front();
-		fifo_hold.unlock();
+		auto buff = [&]() {
+			std::unique_lock fifo_hold(pdequeue->lock);
+			return pdequeue->fifo.pop_front();
+		}();
 		auto cur_time = time(nullptr);
 		
 		if (!buff.has_value()) {
 			if (cur_time - last_time >= SOCKET_TIMEOUT - 3) {
 				if (pdequeue->sk_write("PING\r\n") != 6 ||
 				    !read_response(pdequeue->sockd)) {
-					hl_hold.lock();
+					std::unique_lock hl_hold(g_host_lock);
 					auto it = std::find(phost->list.begin(), phost->list.end(), pdequeue);
 					if (it != phost->list.end())
 						phost->list.erase(it);
 					return X_LOOP;
 				}
 				last_time = cur_time;
-				hl_hold.lock();
+				std::unique_lock hl_hold(g_host_lock);
 				phost->last_time = cur_time;
-				hl_hold.unlock();
 			}
 			continue;
 		}
@@ -663,7 +680,7 @@ static int ev_deqwork_1()
 		auto wrret = pdequeue->sk_write(*buff);
 		if (wrret < 0 || static_cast<size_t>(wrret) != buff->size() ||
 		    !read_response(pdequeue->sockd)) {
-			hl_hold.lock();
+			std::unique_lock hl_hold(g_host_lock);
 			auto it = std::find(phost->list.begin(), phost->list.end(), pdequeue);
 			if (it != phost->list.end())
 				phost->list.erase(it);
@@ -671,9 +688,8 @@ static int ev_deqwork_1()
 		}
 		
 		last_time = cur_time;
-		hl_hold.lock();
+		std::unique_lock hl_hold(g_host_lock);
 		phost->last_time = cur_time;
-		hl_hold.unlock();
 	}	
 	return X_STOP;
 }

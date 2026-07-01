@@ -4136,22 +4136,53 @@ static ZEND_FUNCTION(mapi_linkmessage)
 	ZCL_MEMORY;
 	size_t srcheid_size = 0, msgeid_size = 0;
 	zval *pzresource;
-	BINARY search_entryid{}, message_entryid{};
+	BINARY search_entryid{}, msg_eids[1]{};
+	const BINARY_ARRAY msg_eid_s = {std::size(msg_eids), msg_eids};
 	MAPI_RESOURCE *psession;
 	
 	if (zend_parse_parameters(ZEND_NUM_ARGS(), "r|ss",
 	    &pzresource, &search_entryid.pb, &srcheid_size,
-	    &message_entryid.pb, &msgeid_size) == FAILURE
-		|| NULL == pzresource || NULL == search_entryid.pb ||
-		NULL == message_entryid.pb)
+	    &msg_eids[0].pb, &msgeid_size) == FAILURE ||
+	    pzresource == nullptr || search_entryid.pb == nullptr ||
+	    msg_eids[0].pb == nullptr)
 		pthrow(ecInvalidParam);
 	search_entryid.cb = srcheid_size;
-	message_entryid.cb = msgeid_size;
+	msg_eids[0].cb = msgeid_size;
 	ZEND_FETCH_RESOURCE(psession, pzresource, le_mapi_session);
 	if (psession->type != zs_objtype::session)
 		pthrow(ecInvalidObject);
-	auto result = zclient_linkmessage(psession->hsession,
-						search_entryid, message_entryid);
+	auto result = zclient_link_messages(psession->hsession, search_entryid,
+	              &msg_eid_s);
+	if (result != ecSuccess)
+		pthrow(result);
+	MAPI_G(hr) = ecSuccess;
+}
+
+static ZEND_FUNCTION(mapi_linkmessages)
+{
+	ZCL_MEMORY;
+	size_t srcheid_size = 0;
+	zval *res = nullptr, *arr = nullptr;
+	BINARY search_entryid{};
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "rsa",
+	    &res, &search_entryid.pb, &srcheid_size, &arr) == FAILURE ||
+	    res == nullptr || search_entryid.pb == nullptr ||
+	    arr == nullptr)
+		pthrow(ecInvalidParam);
+	search_entryid.cb = srcheid_size;
+
+	MAPI_RESOURCE *ses = nullptr;
+	ZEND_FETCH_RESOURCE(ses, res, le_mapi_session);
+	if (ses->type != zs_objtype::session)
+		pthrow(ecInvalidObject);
+
+	BINARY_ARRAY entryid_array{};
+	auto err = php_to_binary_array(arr, &entryid_array);
+	if (err != ecSuccess)
+		pthrow(err);
+	auto result = zclient_link_messages(ses->hsession, search_entryid,
+	              &entryid_array);
 	if (result != ecSuccess)
 		pthrow(result);
 	MAPI_G(hr) = ecSuccess;
@@ -4336,6 +4367,7 @@ static zend_function_entry mapi_functions[] = {
 	F(nsp_setuserpasswd)
 	F(nsp_essdn_to_username)
 	F(mapi_linkmessage)
+	F(mapi_linkmessages)
 	F(mapi_ianatz_to_tzdef)
 	F(mapi_strerror)
 	{NULL, NULL, NULL}

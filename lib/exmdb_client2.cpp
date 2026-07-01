@@ -125,6 +125,7 @@ struct async_listener {
 	srv_ident m_ident;
 	exmdb_client_remote *m_client = nullptr;
 	std::string m_dir;
+	unsigned int m_reconnect_delay = 1; /* seconds; exponential backoff for reconnect storms */
 };
 
 /**
@@ -412,9 +413,13 @@ void async_listener::connect_and_listen()
 {
 	auto fd = make_exmdb_connection(m_ident, m_dir.c_str(), true, m_client);
 	if (fd.get() < 0) {
-		sleep(1);
+		/* Exponential backoff with retry interval bounded at 32s */
+		sleep(m_reconnect_delay);
+		if (m_reconnect_delay < 16)
+			m_reconnect_delay *= 2;
 		return;
 	}
+	m_reconnect_delay = 1;
 	startup_wait = false;
 	startup_cv.notify_one();
 	struct pollfd pfd = {fd.get(), POLLIN | POLLPRI};
@@ -485,7 +490,7 @@ bool srv_entry::drop_one_connection()
 	if (conn_list.empty())
 		return false;
 	/* Pick an old one (in the front) */
-	mlog(LV_DEBUG, "exmdb_client: kicking [%s]:%hu (fd %d) to make room",
+	mlog(LV_DEBUG, "exmdb_client: reducing keepalives, closing [%s]:%hu (fd %d)",
 		ident.host.c_str(), ident.port, conn_list.front().m_fd.get());
 	conn_list.pop_front();
 	return true;

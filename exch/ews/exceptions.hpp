@@ -101,6 +101,7 @@ class EWSError : public DispatchError {
 	ERR(NameResolutionNoResults) ///< Name resolution failed / no results
 	ERR(NotEnoughMemory) ///< Out of memory
 	ERR(SchemaValidation) ///< XML value is does not confirm to schema
+	ERR(ServerBusy) ///< Server declined to process the request (e.g. batch exceeds a configured limit)
 	ERR(SubscriptionAccessDenied) ///< Trying to access subscription from another user
 	ERR(TimeZone) ///< Invalid or missing time zone
 	ERR(ValueOutOfRange) ///< Value cannot be interpreted correctly (only applied to dates according to official documentation)
@@ -149,7 +150,6 @@ E(3017, "failed to get user permissions");
 E(3018, "insufficient access rights");
 E(3019, "failed to load calendar");
 E(3020, "failed to query calendar");
-inline std::string E3021(const char* name) {return fmt::format("request '{}' is marked as beta and can be enabled with 'ews_beta = 1'", name);}
 E(3022, "failed to get folder entry id");
 E(3023, "failed to get folder properties");
 E(3024, "failed to get item entry id");
@@ -580,6 +580,10 @@ E(3449, "failed to set message id on updated content");
 E(3450, "RecurringMasterId is currently not supported");
 E(3451, "RecurringMasterId is currently not supported");
 E(3452, "RecurringMasterId is currently not supported");
+E(3453, "GetItem batch exceeds ews_max_get_items; resend in smaller batches");
+E(3454, "subscription event backlog exceeded ews_max_pending_events; re-subscribe and resync");
+E(3455, "failed to allocate the recipient set while updating attendees");
+E(3456, "failed to set PR_ROWID on an attendee recipient");
 
 #undef E
 }

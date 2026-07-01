@@ -876,6 +876,8 @@ errno_t parse_imap_seq(imap_seq_list &r, const char *s) try
 		auto min = *s == '*' ? ULONG_MAX : strtoul(s, &end, 0);
 		if (*s == '*')
 			end = const_cast<char *>(&s[1]);
+		else if (min >= SEQ_STAR)
+			min = SEQ_STAR - 1; /* keep a literal distinct from '*' */
 		if (*end == '\0') {
 			r.insert(min, min);
 			break;
@@ -889,6 +891,8 @@ errno_t parse_imap_seq(imap_seq_list &r, const char *s) try
 		auto max = *s == '*' ? ULONG_MAX : strtoul(s, &end, 0);
 		if (*s == '*')
 			end = const_cast<char *>(&s[1]);
+		else if (max >= SEQ_STAR)
+			max = SEQ_STAR - 1; /* keep a literal distinct from '*' */
 		if (max < min)
 			std::swap(min, max);
 		if (*end == '\0') {
@@ -1036,7 +1040,7 @@ std::string base64_encode(std::string_view x)
 	std::string out;
 	out.resize((x.size() + 3) / 3 * 4);
 	size_t final_size = 0;
-	int ret = encode64(x.data(), x.size(), out.data(), out.size() + 1, &final_size);
+	int ret = base64_encode_sized(x, out.data(), out.size() + 1, &final_size);
 	if (ret < 0)
 		out.clear();
 	else
@@ -1049,7 +1053,7 @@ std::string base64_decode(std::string_view x)
 	std::string out;
 	out.resize(x.size());
 	size_t final_size = 0;
-	int ret = decode64_ex(x.data(), x.size(), out.data(), x.size(), &final_size);
+	int ret = base64nl_decode_sized(x, out.data(), x.size(), &final_size);
 	if (ret < 0)
 		out.clear();
 	else
@@ -1514,9 +1518,9 @@ std::shared_ptr<CONFIG_FILE> config_file_initd(const char *fb,
 }
 
 /**
- * Convert Unicode code point @wchar to its UTF-8 representation.
+ * Convert Unicode code point @w to its UTF-8 representation.
  */
-std::string wchar_to_utf8(uint32_t w)
+std::string uchar_to_utf8(char32_t w)
 {
 	std::string s;
 	if (w <= 0x7f) {

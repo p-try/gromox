@@ -14,7 +14,8 @@
 #include <libHX/defs.h>
 #include <libHX/io.h>
 #include <libHX/string.h>
-#include <vmime/mailboxList.hpp>
+#include <vmime/addressList.hpp>
+#include <vmime/mailboxGroup.hpp>
 #include <gromox/defs.h>
 #include <gromox/fileio.h>
 #include <gromox/json.hpp>
@@ -43,8 +44,7 @@ struct ENUM_PARAM {
 
 struct BUILD_PARAM {
 	mjson_io &io;
-	const char *filename = nullptr, *msg_path = nullptr;
-	const char *storage_path = nullptr;
+	const char *msg_path = nullptr, *storage_path = nullptr;
 	int depth = 0;
 	BOOL build_result = false;
 };
@@ -64,9 +64,26 @@ bool mjson_io::exists(const std::string &path) const
 	return m_cache.find(path) != m_cache.cend();
 }
 
-void mjson_io::place(const std::string &path, std::string &&content)
+void mjson_io::place(const std::string &path, std::string &&content, bool easy)
 {
 	m_cache[path] = std::move(content);
+	if (easy)
+		m_reconstructible.emplace(path);
+	else
+		m_reconstructible.erase(path);
+}
+
+/**
+ * Release the cache entries that were marked evictable by place() — i.e. the
+ * top-level .eml scratch copies that the wrdat writer can re-read from
+ * storage. Called once per processed FETCH item so that a wide "FETCH 1:* ..."
+ * does not accumulate every message body of the folder in memory at once.
+ */
+void mjson_io::drop_reconstructible()
+{
+	for (const auto &key : m_reconstructible)
+		m_cache.erase(key);
+	m_reconstructible.clear();
 }
 
 const std::string *mjson_io::get_full(const std::string &path) const
@@ -136,6 +153,7 @@ void MJSON::clear()
 	pjson->reply.clear();
 	pjson->to.clear();
 	pjson->cc.clear();
+	pjson->bcc.clear();
 	pjson->inreply.clear();
 	pjson->subject.clear();
 	pjson->received.clear();
@@ -165,6 +183,7 @@ BOOL MJSON::load_from_json(const Json::Value &root) try
 		pjson->reply        = base64_decode(root["reply"].asString());
 		pjson->to           = base64_decode(root["to"].asString());
 		pjson->cc           = base64_decode(root["cc"].asString());
+		pjson->bcc          = base64_decode(root["bcc"].asString());
 		pjson->inreply      = base64_decode(root["inreply"].asString());
 		pjson->subject      = base64_decode(root["subject"].asString());
 		pjson->received     = base64_decode(root["received"].asString());
@@ -215,6 +234,7 @@ static BOOL mjson_record_node(MJSON *pjson, const Json::Value &jv, unsigned int 
 	m.head     = jv["head"].asUInt();
 	m.begin    = jv["begin"].asUInt();
 	m.length   = jv["length"].asUInt();
+	m.lines    = jv["lines"].asUInt();
 	if (m.ctype.empty())
 		m.ctype = "application/octet-stream";
 
@@ -294,7 +314,6 @@ static int mjson_fetch_mime_structure(mjson_io &io, const MJSON_MIME *pmime,
     const char *email_charset, BOOL b_ext, std::string &buf) try
 {
 	auto ctype = pmime->ctype;
-	HX_strupper(ctype.data());
 	auto pos = ctype.find('/');
 	std::string psubtype;
 	if (pos != ctype.npos) {
@@ -363,12 +382,7 @@ static int mjson_fetch_mime_structure(mjson_io &io, const MJSON_MIME *pmime,
 		if (NULL != storage_path && NULL != msg_filename &&
 		    pmime->ctype_is_rfc822() &&
 		    (pmime->encoding_is_b() || pmime->encoding_is_q())) {
-			std::string temp_path;
-			if (*msg_filename == '\0')
-				temp_path = storage_path + "/"s + pmime->get_id();
-			else
-				temp_path = storage_path + "/"s + msg_filename + "." + pmime->get_id();
-			ssize_t z = io.get_size(temp_path);
+			ssize_t z = io.get_size(storage_path + "/"s + pmime->get_id());
 			buf += z >= 0 ? " " + std::to_string(z) : " NIL";
 		} else {
 			buf += " " + std::to_string(pmime->length);
@@ -376,19 +390,11 @@ static int mjson_fetch_mime_structure(mjson_io &io, const MJSON_MIME *pmime,
 					
 		if (strcasecmp(ctype.c_str(), "TEXT") == 0)
 			/* body lines */
-			buf += " 0";
+			buf += " " + std::to_string(pmime->lines);
 		
 		if (NULL != storage_path && NULL != msg_filename &&
 		    pmime->ctype_is_rfc822()) {
-			std::string temp_path;
-			
-			if (*msg_filename == '\0')
-				temp_path = storage_path + "/"s + pmime->get_id() + ".dgt";
-			else
-				temp_path = storage_path + "/"s + msg_filename +
-				            "." + pmime->get_id() + ".dgt";
-
-			auto eml_content = io.get_full(temp_path);
+			auto eml_content = io.get_full(storage_path + "/"s + pmime->get_id() + ".dgt");
 			if (eml_content == nullptr)
 				goto RFC822_FAILURE;
 			Json::Value digest;
@@ -478,7 +484,7 @@ static std::string mjson_cvt_addr(const EMAIL_ADDR &email_addr)
 
 static void mjson_emit_adrlist(const std::string &al, std::string &buf)
 {
-	vmime::mailboxList vmlist;
+	vmime::addressList vmlist;
 	vmlist.parse(al);
 	if (vmlist.isEmpty()) {
 		buf += " NIL";
@@ -486,11 +492,35 @@ static void mjson_emit_adrlist(const std::string &al, std::string &buf)
 	}
 	buf += " (";
 	bool second = false;
-	for (auto entry : vmlist.getMailboxList()) {
+	for (const auto &addr : vmlist.getAddressList()) {
+		auto grp = vmime::dynamicCast<vmime::mailboxGroup>(addr);
+		if (grp != nullptr) {
+			/* RFC 3501: group start = (NIL NIL "groupname" NIL) */
+			EMAIL_ADDR ema;
+			gx_strlcpy(ema.local_part,
+				grp->getName().getConvertedText(vmime::charsets::UTF_8).c_str(),
+				std::size(ema.local_part));
+			if (second)
+				buf += ' ';
+			second = true;
+			buf += mjson_cvt_addr(ema);
+			for (const auto &mb : grp->getMailboxList()) {
+				buf += ' ';
+				buf += mjson_cvt_addr(EMAIL_ADDR(*mb));
+			}
+			/* group end = (NIL NIL NIL NIL) */
+			ema.clear();
+			buf += ' ';
+			buf += mjson_cvt_addr(ema);
+			continue;
+		}
+		auto mb = vmime::dynamicCast<vmime::mailbox>(addr);
+		if (mb == nullptr)
+			continue;
 		if (second)
 			buf += ' ';
 		second = true;
-		buf += mjson_cvt_addr(*entry);
+		buf += mjson_cvt_addr(EMAIL_ADDR(*mb));
 	}
 	buf += ')';
 }
@@ -516,7 +546,7 @@ int MJSON::fetch_envelope(const char *cset, std::string &buf) const try
 	       mjson_cvt_addr(reply.size() > 0 ? reply.c_str() : from.c_str()));
 	mjson_emit_adrlist(to, buf);
 	mjson_emit_adrlist(cc, buf);
-	buf += " NIL"; /* bcc */
+	mjson_emit_adrlist(bcc, buf);
 	buf += inreply.size() > 0 && str_isasciipr(inreply.c_str()) ?
 	       " \"" + mjson_add_backslash(inreply.c_str()) + "\"" :
 	       " NIL";
@@ -551,18 +581,20 @@ static void mjson_enum_build(const MJSON_MIME *pmime, BUILD_PARAM *pbuild) { try
 	if (!pbuild->build_result || pbuild->depth > MAX_RFC822_DEPTH ||
 	    !pmime->ctype_is_rfc822())
 		return;
-	auto temp_path = pbuild->msg_path + "/"s + pbuild->filename;
 	std::string msg_path, dgt_path;
-	if (1 == pbuild->depth) {
+	if (pbuild->depth == 1)
 		msg_path = pbuild->storage_path + "/"s + pmime->get_id();
-		dgt_path = msg_path + ".dgt";
+	else
+		msg_path = pbuild->msg_path + "/"s + pmime->get_id();
+	if (msg_path.back() == '/') {
+		msg_path.pop_back();
+		dgt_path = msg_path + "/.dgt";
 	} else {
-		msg_path = pbuild->storage_path + "/"s + pbuild->filename +
-		           "/" + pmime->get_id();
 		dgt_path = msg_path + ".dgt";
 	}
 		
-	auto eml_content = pbuild->io.get_substr(temp_path, pmime->get_content_offset(),
+	auto eml_content = pbuild->io.get_substr(pbuild->msg_path,
+	                   pmime->get_content_offset(),
 	                   pmime->get_content_length());
 	if (!eml_content.has_value()) {
 		pbuild->build_result = FALSE;
@@ -573,13 +605,16 @@ static void mjson_enum_build(const MJSON_MIME *pmime, BUILD_PARAM *pbuild) { try
 		eml = base64_decode(*std::move(eml_content));
 	} else if (pmime->encoding_is_q()) {
 		std::string qpout;
-		qpout.resize(eml.size());
-		auto qdlen = qpnl_decode_sized(eml, qpout.data(), qpout.size());
+		qpout.resize(eml_content->size());
+		auto qdlen = qpnl_decode_sized(*std::move(eml_content), qpout.data(), qpout.size());
 		if (qdlen < 0) {
 			pbuild->build_result = false;
 			return;
 		}
+		qpout.resize(qdlen);
 		eml = std::move(qpout);
+	} else {
+		eml = std::move(*eml_content);
 	}
 	
 	MJSON temp_mjson;
@@ -603,10 +638,7 @@ static void mjson_enum_build(const MJSON_MIME *pmime, BUILD_PARAM *pbuild) { try
 		pbuild->build_result = FALSE;
 		return;
 	}
-	if (pbuild->depth == 1)
-		digest["file"] = pmime->get_id();
-	else
-		digest["file"] = std::string(pbuild->filename) + "." + pmime->get_id();
+	digest["file"] = pmime->get_id();
 	pbuild->io.place(dgt_path, json_to_str(digest));
 	if (!temp_mjson.load_from_json(digest)) {
 		pbuild->build_result = FALSE;
@@ -617,7 +649,6 @@ static void mjson_enum_build(const MJSON_MIME *pmime, BUILD_PARAM *pbuild) { try
 	if (pbuild->depth >= MAX_RFC822_DEPTH || !temp_mjson.has_rfc822_part())
 		return;
 	BUILD_PARAM build_param{pbuild->io};
-	build_param.filename = temp_mjson.get_mail_filename();
 	build_param.msg_path = temp_mjson.path.c_str();
 	build_param.storage_path = pbuild->storage_path;
 	build_param.depth = pbuild->depth + 1;
@@ -638,11 +669,9 @@ BOOL MJSON::rfc822_build(mjson_io &io, const char *storage_path) const
 		return FALSE;
 	if (pjson->path.empty())
 		return FALSE;
-	auto temp_path = storage_path + "/"s + pjson->get_mail_filename();
 	BUILD_PARAM build_param{io};
-	build_param.filename = pjson->get_mail_filename();
 	build_param.msg_path = pjson->path.c_str();
-	build_param.storage_path = temp_path.c_str();
+	build_param.storage_path = storage_path;
 	build_param.depth = 1;
 	build_param.build_result = TRUE;
 	pjson->enum_mime(mjson_enum_build, &build_param);
@@ -664,9 +693,10 @@ BOOL MJSON::rfc822_get(mjson_io &io, MJSON *pjson, const char *storage_path,
 	snprintf(mjson_id, 64, "%s.", id);
 	while (NULL != (pdot = strrchr(mjson_id, '.'))) {
 		*pdot = '\0';
-		char dgt_path[256];
-		snprintf(dgt_path, std::size(dgt_path), "%s/%s/%s.dgt", storage_path,
-		         pjson_base->get_mail_filename(), mjson_id);
+		auto dgt_path = storage_path + "/"s + pjson_base->get_mail_filename();
+		if (dgt_path.back() == '/')
+			dgt_path.pop_back();
+		dgt_path += "/"s + mjson_id + ".dgt";
 		auto eml_content = io.get_full(dgt_path);
 		if (eml_content == nullptr)
 			continue;

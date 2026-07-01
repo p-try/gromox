@@ -82,6 +82,7 @@ static constexpr cfg_directive gromox_cfg_defaults[] = {
 	{"daemons_fd_limit", "imap_fd_limit", CFG_ALIAS},
 	{"imap_fd_limit", "0", CFG_SIZE},
 	{"imap_accept_haproxy", "0", CFG_SIZE},
+	{"malloc_trim_interval", "10min", CFG_TIME, "0"},
 	CFG_TABLE_END,
 };
 
@@ -206,7 +207,7 @@ static int imls_thrwork(generic_connection &&conn)
 			return 0;
 		}
 		if (!use_tls) {
-			char caps[128];
+			char caps[256];
 			capability_list(caps, std::size(caps), ctx);
 			if (HXio_fullwrite(conn.sockd, "* OK [CAPABILITY ", 17) < 0 ||
 			    HXio_fullwrite(conn.sockd, caps, strlen(caps)) < 0 ||
@@ -227,7 +228,16 @@ static int imls_thrwork(generic_connection &&conn)
 
 char *capability_list(char *dst, size_t z, imap_context *ctx)
 {
-	gx_strlcpy(dst, "IMAP4rev1 XLIST SPECIAL-USE UNSELECT UIDPLUS IDLE LITERAL+", z);
+	/*
+	 * The bundled rev2 extensions are rev1-compatible (a rev1 client may
+	 * use MOVE/ESEARCH/etc. without ENABLE), so advertise them
+	 * unconditionally.
+	 */
+	gx_strlcpy(dst, "IMAP4rev1 XLIST SPECIAL-USE UNSELECT UIDPLUS IDLE "
+	           "LITERAL+ ENABLE MOVE ESEARCH SEARCHRES "
+	           "LIST-EXTENDED LIST-STATUS STATUS=SIZE NAMESPACE", z);
+	if (g_rfc9051_enable)
+		HX_strlcat(dst, " IMAP4rev2", z);
 	bool offer_tls = g_support_tls;
 	if (ctx != nullptr) {
 		if (ctx->connection.ssl != nullptr || ctx->is_authed())
@@ -439,6 +449,7 @@ int main(int argc, char **argv)
 	service_init({g_config_file, g_dfl_svc_plugins, context_num});
 	if (switch_user_exec(*g_config_file, argv) != 0)
 		return EXIT_FAILURE;
+	heap_reaper trimmer(gxconfig->get_ll("malloc_trim_interval"));
 	textmaps_init();
 	if (0 != service_run()) { 
 		printf("[system]: failed to run service\n");

@@ -24,7 +24,12 @@ enum {
 	FLAG_FORWARDED= 0x40,
 
 	/* mnemonics */
-	FLAG_ALL      = 0x4F,
+	/*
+	 * Flags that a client may set/clear via the STORE command.
+	 * \Recent is server-managed and thus not included.
+	 */
+	FLAG_SETTABLE = FLAG_ANSWERED | FLAG_FLAGGED | FLAG_DELETED | FLAG_SEEN |
+	                FLAG_DRAFT | FLAG_FORWARDED,
 
 	/* internal */
 	FLAG_LOADED   = 0x80,
@@ -44,6 +49,7 @@ extern GX_EXPORT int list_mail(const char *path, const std::string &folder, std:
 extern GX_EXPORT int delete_mail(const char *path, const std::string &folder, const std::vector<MSG_UNIT *> &);
 extern GX_EXPORT int get_uid(const char *path, const std::string &folder, const std::string &mid, unsigned int *uid);
 extern GX_EXPORT int summary_folder(const char *path, const std::string &folder, size_t *exists, size_t *recent, size_t *unseen, uint32_t *uidvalid, uint32_t *uidnext, int *perrno);
+extern GX_EXPORT int folder_sizes(const char *path, const std::string &folder, size_t *size, size_t *deleted, int *perrno);
 extern GX_EXPORT int make_folder(const char *path, const std::string &folder, int *perrno);
 extern GX_EXPORT int remove_folder(const char *path, const std::string &folder, int *perrno);
 extern GX_EXPORT int ping_mailbox(const char *path, int *perrno);
@@ -60,9 +66,11 @@ extern GX_EXPORT int fetch_simple_uid(const char *path, const std::string &folde
 extern GX_EXPORT int fetch_detail_uid(const char *path, const std::string &folder, const gromox::imap_seq_list &, XARRAY *, int *perrno);
 extern GX_EXPORT int set_flags(const char *path, const std::string &folder, const std::string &mid, unsigned int flag_bits, unsigned int *new_bits, int *perrno);
 extern GX_EXPORT int unset_flags(const char *path, const std::string &folder, const std::string &mid, unsigned int flag_bits, unsigned int *new_bits, int *perrno);
-extern GX_EXPORT int get_flags(const char *path, const std::string &folder, const std::string &mid, unsigned int *pflag_bits, int *perrno);
+extern GX_EXPORT int get_flags(const char *path, const std::string &folder, const std::string &mid, unsigned int *pflag_bits, int *perrno, std::string *keywords = nullptr);
 extern GX_EXPORT int copy_mail(const char *path, const std::string &src_folder, const std::string &src_mid, const std::string &dst_folder, std::string &dst_mid, int *perrno);
 extern GX_EXPORT int search(const char *path, const std::string &folder, const char *charset, std::span<std::string> argv, std::string &ret_buff, int *perrno);
 extern GX_EXPORT int search_uid(const char *path, const std::string &folder, const char *charset, std::span<std::string> argv, std::string &ret_buff, int *perrno);
+extern GX_EXPORT int set_keywords(const char *path, const std::string &folder, const std::string &mid, const std::string &keywords, int *perrno);
+extern GX_EXPORT int get_folder_keywords(const char *path, const std::string &folder, std::vector<std::string> &out, int *perrno);
 
 }

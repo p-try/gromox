@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <json/value.h>
 #include <gromox/util.hpp>
@@ -12,14 +13,21 @@ using MJSON_MIME_ENUM = void (*)(MJSON_MIME *, void *);
 
 struct GX_EXPORT mjson_io {
 	std::unordered_map<std::string, std::string> m_cache;
+	/*
+	 * Subset of m_cache keys that are cheaply reconstructible and safe to
+	 * drop between FETCH items (e.g. top-level .eml bodies, which the
+	 * wrdat writer re-reads from storage on demand).
+	 */
+	std::unordered_set<std::string> m_reconstructible;
 	using c_iter = decltype(m_cache)::const_iterator;
 
 	bool exists(const std::string &path) const;
 	const std::string *get_full(const std::string &path) const;
 	std::optional<std::string> get_substr(const std::string &path, size_t of, size_t ln) const;
 	ssize_t get_size(const std::string &path) const;
-	void place(const std::string &path, std::string &&ctnt);
-	void clear() { m_cache.clear(); }
+	void place(const std::string &path, std::string &&ctnt, bool evictable = false);
+	void drop_reconstructible();
+	void clear() { m_reconstructible.clear(); m_cache.clear(); }
 	bool valid(c_iter it) const { return it != m_cache.cend(); }
 	bool invalid(c_iter it) const { return it == m_cache.cend(); }
 };
@@ -28,7 +36,7 @@ struct GX_EXPORT MJSON_MIME {
 	std::vector<MJSON_MIME> children;
 	enum mime_type mime_type = mime_type::none;
 	std::string id, ctype, encoding, charset, filename, cid, cntl, cntdspn;
-	size_t head = 0, begin = 0, length = 0;
+	size_t head = 0, begin = 0, length = 0, lines = 0;
 
 	bool contains_none_type() const;
 	const MJSON_MIME *find_by_id(const char *) const;
@@ -78,7 +86,7 @@ struct GX_EXPORT MJSON {
 	bool flag = false;
 	unsigned int priority = 0, uid = 0;
 	size_t size = 0;
-	std::string path, filename, charset, msgid, from, sender, reply, to, cc;
+	std::string path, filename, charset, msgid, from, sender, reply, to, cc, bcc;
 	std::string inreply, subject, received, date, ref, notification;
 
 	template<typename... Args> void enum_mime(Args &&...args) {

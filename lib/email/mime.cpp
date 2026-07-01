@@ -293,7 +293,7 @@ bool MIME::write_content(const char *pcontent, size_t length,
 		content_begin = content_buf.get();
 		if (pmime->content_begin == nullptr)
 			return false;
-		encode64_ex(pcontent, length, content_buf.get(), buff_length,
+		base64nl_encode_sized({pcontent, length}, content_buf.get(), buff_length,
 				&pmime->content_length);
 		pmime->set_field("Content-Transfer-Encoding", "base64");
 		return true;
@@ -1052,7 +1052,8 @@ bool MIME::read_content(char *out_buff, size_t *plength) const try
 	
 	switch (encoding_type) {
 	case mime_encoding::base64:
-		if (decode64_ex(pbuff.get(), size, out_buff, max_length, plength) != 0) {
+		if (base64_decode_sized({pbuff.get(), size}, out_buff,
+		    max_length, plength) != 0) {
 			mlog(LV_DEBUG, "mime: failed to decode base64 mime content");
 			if (*plength == 0)
 				return false;
@@ -1263,7 +1264,7 @@ static void replace_qb(char *s)
 static int make_digest_single(const MIME *pmime, const char *id_string,
     size_t *poffset, size_t head_offset, Json::Value &dsarray)
 {
-	size_t content_len = 0;
+	size_t content_len = 0, content_lines = 0;
 	char content_type[256], encoding_buff[128], content_disposition[256], *ptoken;
 
 	strcpy(content_type, pmime->content_type);
@@ -1280,7 +1281,8 @@ static int make_digest_single(const MIME *pmime, const char *id_string,
 	digest["begin"] = Json::Value::UInt64(*poffset);
 	if (!pmime->get_field("Content-Transfer-Encoding", encoding_buff, 128) ||
 	    !str_isasciipr(encoding_buff)) {
-		digest["encoding"] = "8bit";
+		/* RFC 2045 §6.1: absent Content-Transfer-Encoding means 7bit. */
+		digest["encoding"] = "7bit";
 	} else {
 		replace_qb(encoding_buff);
 		HX_strrtrim(encoding_buff);
@@ -1292,6 +1294,28 @@ static int make_digest_single(const MIME *pmime, const char *id_string,
 		if (pmime->mime_type == mime_type::single) {
 			*poffset += pmime->content_length;
 			content_len = pmime->content_length;
+			/*
+			 * RFC 2046 §5.1.1: the CRLF preceding a boundary
+			 * delimiter belongs to the delimiter, not the body.
+			 * Strip exactly one trailing newline from the
+			 * *reported* length for a part inside a multipart (cf.
+			 * the same treatment in MIME::read_content). *poffset
+			 * keeps the full length so sibling offsets stay
+			 * correct.
+			 */
+			auto parent = pmime->get_parent();
+			if (parent != nullptr &&
+			    parent->mime_type == mime_type::multiple) {
+				if (content_len >= 2 && newline_size(
+				    &pmime->content_begin[content_len-2], 2) == 2)
+					content_len -= 2;
+				else if (content_len >= 1 && newline_size(
+				    &pmime->content_begin[content_len-1], 1) == 1)
+					content_len -= 1;
+			}
+			for (size_t i = 0; i < content_len; ++i)
+				if (pmime->content_begin[i] == '\n')
+					++content_lines;
 		} else if (pmime->mime_type == mime_type::single_obj) {
 			auto mgl = pmime->get_mail_ptr()->get_length();
 			if (mgl < 0)
@@ -1306,6 +1330,7 @@ static int make_digest_single(const MIME *pmime, const char *id_string,
 	}
 
 	digest["length"] = Json::Value::UInt64(content_len);
+	digest["lines"] = Json::Value::UInt64(content_lines);
 	std::string charset;
 	if (pmime->get_content_param("charset", charset) &&
 	    str_isasciipr(charset.c_str())) {
@@ -1517,7 +1542,7 @@ static bool mime_parse_multiple(MIME *pmime)
 	begin = pmime->content_begin;
 	auto end = begin + pmime->content_length - boundary_len;
 	auto ptr = begin;
-	for (ptr=begin; ptr < end; ptr++) {
+	for (; ptr < end; ptr++) {
 		if (ptr[0] != '-' || ptr[1] != '-' ||
 		    strncmp(pmime->boundary_string, ptr + 2, boundary_len) != 0)
 			continue;

@@ -1125,15 +1125,6 @@ std::string EWSContext::essdn_to_username(const std::string& essdn) const
 }
 
 /**
- * @brief      Assert that experimental mode is enabled
- */
-void EWSContext::experimental(const char* name) const
-{
-	if (!m_plugin.experimental)
-		throw UnknownRequestError(E3021(name));
-}
-
-/**
  * @brief      Get user maildir from Mailbox speciication
  *
  * @param      Mailbox   Mailbox structure
@@ -1219,8 +1210,17 @@ std::pair<std::list<sNotificationEvent>, bool> EWSContext::getEvents(const tSubs
 	auto mgr = m_plugin.get_submgr(subscriptionId.tsub_rawkey, subscriptionId.timeout);
 	if (mgr == nullptr)
 		throw EWSError::InvalidSubscription(E3202);
+	std::lock_guard evguard(mgr->lock);
 	if (mgr->username != m_auth_info.username)
 		throw EWSError::AccessDenied(E3203);
+	if (mgr->overflow)
+		/*
+		 * Backlog was previously dropped in EWSPlugin::event() because
+		 * the client could not keep up. Fault the subscription to make
+		 * the caller (streaming notify() / pull GetEvents) report it
+		 * in ErrorSubscriptionIds.
+		 */
+		throw EWSError::InvalidSubscription(E3454);
 	std::pair<std::list<sNotificationEvent>, bool> result{{}, mgr->events.size() > 50};
 	auto &evt = mgr->events;
 	if (result.second) {
@@ -2726,13 +2726,22 @@ void EWSContext::updateAttendees(const std::string &dir,
 	if (!exmdb.empty_message_instance_rcpts(dir.c_str(), inst->instanceId))
 		throw EWSError::ItemSave(E3092);
 
-	TARRAY_SET rcpts{};
+	auto rcpts = tarray_set_init();
+	if (rcpts == nullptr)
+		throw EWSError::NotEnoughMemory(E3455);
+	auto cl_rcpts = HX::make_scope_exit([&]() { tarray_set_free(rcpts); });
+	uint32_t row_id = 0;
 	auto parseAttendees = [&](const tinyxml2::XMLElement *xml, uint32_t type) {
 		for (auto entry = xml->FirstChildElement("Attendee");
 		     entry != nullptr;
 		     entry = entry->NextSiblingElement("Attendee")) {
 			tAttendee att(entry);
-			att.Mailbox.mkRecipient(rcpts.emplace(), type);
+			auto rcpt = rcpts->emplace();
+			att.Mailbox.mkRecipient(rcpt, type);
+			/* update_message_instance_rcpts wants PR_ROWID */
+			if (rcpt->set(PR_ROWID, &row_id) != ecSuccess)
+				throw EWSError::NotEnoughMemory(E3456);
+			++row_id;
 		}
 	};
 	if (shape.requiredAttendees)
@@ -2742,9 +2751,9 @@ void EWSContext::updateAttendees(const std::string &dir,
 	if (shape.resourceAttendees)
 		parseAttendees(shape.resourceAttendees, MAPI_TO);
 
-	if (rcpts.count > 0) {
+	if (rcpts->count > 0) {
 		if (!exmdb.update_message_instance_rcpts(dir.c_str(),
-		    inst->instanceId, &rcpts))
+		    inst->instanceId, rcpts))
 			throw EWSError::ItemSave(E3351);
 		/* Set organizer properties when attendees are present */
 		std::string dispName;

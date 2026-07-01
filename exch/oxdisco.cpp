@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2022–2026 grommunio GmbH
 // This file is part of Gromox.
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -728,8 +729,9 @@ int OxdiscoPlugin::resp_web(XMLElement *el, const char *authuser,
 			return -1;
 		err = cvt_username_to_mdbdn(email, x500_org_name.c_str(),
 		      user_id, mdbdn);
-	}
-	else {
+		if (err != ecSuccess)
+			mdbdn.clear();
+	} else {
 		DisplayName = public_folder;
 		unsigned int org_id = 0;
 		if (!mysql_adaptor_get_domain_ids(domain, &domain_id, &org_id))
@@ -747,6 +749,8 @@ int OxdiscoPlugin::resp_web(XMLElement *el, const char *authuser,
 			return -1;
 		err = cvt_username_to_mdbdn(email, x500_org_name.c_str(),
 		      user_id, mdbdn);
+		if (err != ecSuccess)
+			mdbdn.clear();
 	}
 
 	add_child(resp_user, "DisplayName", DisplayName);
@@ -989,7 +993,6 @@ http_status OxdiscoPlugin::resp_json(int ctx_id, const char *get_request_uri) co
 	if (error == true) {
 		respdoc["ErrorCode"] = missing_parameter;
 		respdoc["ErrorMessage"] = missing_parameter_message;
-		error = false;
 	}
 	int code = 200;
 	Json::StreamWriterBuilder swb;
@@ -1011,26 +1014,47 @@ http_status OxdiscoPlugin::resp_json(int ctx_id, const char *get_request_uri) co
  */
 http_status OxdiscoPlugin::resp_autocfg(int ctx_id, const char *email) const
 {
+	static constexpr const char noparam[] =
+		"Hostnames may be incorrect because no user was specified";
 	tinyxml2::XMLDocument respdoc;
 	auto decl = respdoc.NewDeclaration();
 	respdoc.InsertEndChild(decl);
+
+	/*
+	 * One marker at the beginning (e.g. for interactive users that look at
+	 * it with a text editor)
+	 */
+	assert(email != nullptr);
+	if (*email == '\0')
+		respdoc.InsertEndChild(respdoc.NewComment(noparam));
 
 	auto resproot = respdoc.NewElement("clientConfig");
 	resproot->SetAttribute("version", "1.1");
 	respdoc.InsertEndChild(resproot);
 
-	auto domain = strchr(email, '@');
+	/*
+	 * Because the HTTP request is unauthenticated anyway,
+	 * produce a result even for non-existing users.
+	 */
+	const char *domain = nullptr;
+	if (*email == '\0')
+		/*
+		 * One marker at the beginning (e.g. for interactive users that
+		 * look at it with a command line utility like curl)
+		 */
+		respdoc.InsertEndChild(respdoc.NewComment(noparam));
+	else
+		domain = strchr(email, '@');
 	if (domain == nullptr)
-		return http_status::not_found;
-	++domain;
+		domain = "";
+	else
+		++domain;
 	bool is_private = strncasecmp(email, public_folder_email, 19) != 0;
 	std::pair<std::string, std::string> homesrv_buf;
 	if (mysql_adaptor_get_homeserver(is_private ? email : domain,
-	    is_private, homesrv_buf) != 0) {
-		mlog(LV_ERR, "oxdisco: no homeserver for \"%s\", does that user even exist?!",
+	    is_private, homesrv_buf) != 0)
+		mlog(LV_INFO, "oxdisco: no homeserver for \"%s\", does that user even exist?!",
 			is_private ? email : domain);
-		return http_status::not_found;
-	}
 	const char *t_host_id = homesrv_buf.second.c_str();
 	if (*t_host_id == '\0')
 		t_host_id = host_id.c_str();

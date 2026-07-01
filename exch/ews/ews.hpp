@@ -134,6 +134,7 @@ class EWSPlugin {
 		std::vector<detail::ExmdbSubscriptionKey> inner_subs; ///< Exmdb subscription keys
 		std::list<Structures::sNotificationEvent> events; ///< Events that occurred since last check
 		detail::ContextKey waitingContext = -1; ///< ID of context waiting for events
+		bool overflow = false; ///< Backlog hit ews_max_pending_events; faulted out so the client re-subscribes and resyncs
 	};
 
 	void event(const char*, BOOL, uint32_t, const DB_NOTIFY*) const;
@@ -160,8 +161,10 @@ class EWSPlugin {
 	int request_logging = 0; ///< 0 = none, 1 = request names, 2 = request data
 	int response_logging = 0; ///< 0 = none, 1 = response names, 2 = response data
 	int pretty_response = 0; ///< 0 = compact output, 1 = pretty printed response
-	int experimental = 0; ///< Enable experimental requests, 0 = disabled
 	size_t max_user_photo_size = 5 << 20; ///< Maximum user photo file size (5 MiB)
+	uint32_t max_sync_changes = 512; ///< SyncFolderItems items per page; clamps client MaxChangesReturned, 0 = unlimited. Matches Exchange's 512 limit.
+	uint32_t max_get_items = 0; ///< Optional GetItem batch cap, 0 = unlimited (Exchange does not cap this; overflow -> ErrorServerBusy)
+	uint32_t max_pending_events = 4000; ///< Per-subscription undelivered streaming-event cap, 0 = unlimited. Backlog past this faults the subscription out so the client re-subscribes and resyncs, instead of pinning RSS.
 	std::chrono::milliseconds cache_interval{5'000}; ///< Interval for cache cleanup
 	std::chrono::milliseconds cache_attachment_instance_lifetime{30'000}; ///< Lifetime of attachment instances
 	std::chrono::milliseconds cache_embedded_instance_lifetime{30'000}; ///< Lifetime of embedded instances
@@ -351,7 +354,6 @@ class EWSContext {
 	void writePermissions(const std::string&, uint64_t, const std::vector<PERMISSION_DATA>&) const;
 
 	gromox::time_duration age() const { return tp_now() - m_created; }
-	void experimental(const char*) const;
 
 	inline detail::ContextKey context_id() const { return m_ctx_id; }
 	inline const HTTP_AUTH_INFO& auth_info() const {return m_auth_info;}

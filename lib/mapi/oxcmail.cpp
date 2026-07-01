@@ -187,13 +187,14 @@ static BOOL oxcmail_username_to_oneoff(const char *username,
 	return TRUE;
 }
 
-static BOOL oxcmail_essdn_to_entryid(const char *pessdn, BINARY *pbin)
+static BOOL oxcmail_essdn_to_entryid(const char *pessdn, BINARY *pbin,
+    enum display_type dtyp = DT_MAILUSER)
 {
 	EXT_PUSH ext_push;
 	EMSAB_ENTRYID_view tmp_entryid;
 	
 	tmp_entryid.flags = 0;
-	tmp_entryid.type = DT_MAILUSER;
+	tmp_entryid.type = dtyp;
 	tmp_entryid.px500dn = deconst(pessdn);
 	if (!ext_push.init(pbin->pb, 1280, EXT_FLAG_UTF16) ||
 	    ext_push.p_abk_eid(tmp_entryid) != pack_result::ok)
@@ -206,13 +207,17 @@ BOOL oxcmail_username_to_entryid(const char *username,
     const char *pdisplay_name, BINARY *pbin, enum display_type *dtpp)
 {
 	std::string essdn;
+	enum display_type dtype = DT_MAILUSER;
 
 	if (oxcmail_get_user_ids != nullptr &&
-	    oxcmail_get_user_ids(username, nullptr, nullptr, dtpp) &&
+	    oxcmail_get_user_ids(username, nullptr, nullptr, &dtype) &&
 	    cvt_username_to_essdn(username, g_oxcmail_org_name,
 	    oxcmail_get_user_ids, oxcmail_get_domain_ids,
-	    essdn) == ecSuccess)
-		return oxcmail_essdn_to_entryid(essdn.c_str(), pbin);
+	    essdn) == ecSuccess) {
+		if (dtpp != nullptr)
+			*dtpp = dtype;
+		return oxcmail_essdn_to_entryid(essdn.c_str(), pbin, dtype);
+	}
 	if (dtpp != nullptr)
 		*dtpp = DT_MAILUSER;
 	return oxcmail_username_to_oneoff(
@@ -357,7 +362,7 @@ static BOOL oxcmail_parse_recipient(const EMAIL_ADDR *paddr,
 			if (!oxcmail_username_to_oneoff(paddr->addr, paddr->display_name, &tmp_bin))
 				return FALSE;
 		} else {
-			if (!oxcmail_essdn_to_entryid(essdn.c_str(), &tmp_bin))
+			if (!oxcmail_essdn_to_entryid(essdn.c_str(), &tmp_bin, dtypx))
 				return FALSE;
 		}
 		if (pproplist->set(PR_ENTRYID, &tmp_bin) != ecSuccess ||
@@ -1973,7 +1978,7 @@ static bool oxcmail_enum_dsn_rcpt_fields(const std::vector<dsn_field> &pfields,
 		    dispname.c_str(), &tmp_bin))
 			return false;
 	} else {
-		if (!oxcmail_essdn_to_entryid(essdn.c_str(), &tmp_bin))
+		if (!oxcmail_essdn_to_entryid(essdn.c_str(), &tmp_bin, dtypx))
 			return false;
 	}
 	if (pproplist->set(PR_ENTRYID, &tmp_bin) != ecSuccess ||
@@ -2143,7 +2148,7 @@ static bool oxcmail_enum_mdn(const char *tag,
 		       mcparam->proplist.set(PR_REPORT_TEXT, value) == ecSuccess;
 	} else if (0 == strcasecmp(tag, "X-MSExch-Correlation-Key")) {
 		len = strlen(value);
-		if (len <= 1024 && decode64(value, len, tmp_buff,
+		if (len <= 1024 && base64_decode_sized({value, len}, tmp_buff,
 		    std::size(tmp_buff), &len) == 0) {
 			tmp_bin.pc = tmp_buff;
 			tmp_bin.cb = len;
@@ -3627,7 +3632,7 @@ static BOOL oxcmail_export_mdn(const MESSAGE_CONTENT *pmsg, const char *charset,
 	if (!dsn.append_field(pdsn_fields, "Disposition", tmp_buff))
 		return FALSE;
 	auto bv = pmsg->proplist.get<const BINARY>(PR_PARENT_KEY);
-	if (bv != nullptr && encode64(bv->pb, bv->cb, tmp_buff,
+	if (bv != nullptr && base64_encode_sized(*bv, tmp_buff,
 	    std::size(tmp_buff), &base64_len) == 0) {
 		tmp_buff[base64_len] = '\0';
 		if (!dsn.append_field(pdsn_fields, "X-MSExch-Correlation-Key", tmp_buff))
@@ -4064,7 +4069,15 @@ bool oxcmail_converter::do_export(const message_content &imsg,
 		BINARY *pbin = nullptr;
 		if (pmime == nullptr || !pmime->set_content_type("application/ms-tnef"))
 			return exp_false;
-		pbin = tnef_serialize(pmsg, log_id, alloc, std::move(get_propname));
+		/*
+		 * get_propname is a converter member shared across the whole
+		 * recursive export; pass a copy. tnef_serialize takes it by
+		 * value and moves internally, so moving here would empty the
+		 * member for later sibling/embedded parts, and the next
+		 * oxcmail_export_mail_head would invoke an empty std::function
+		 * (bad_function_call).
+		 */
+		pbin = tnef_serialize(pmsg, log_id, alloc, get_propname);
 		if (pbin == nullptr)
 			return exp_false;
 		if (!pmime->write_content(pbin->pc, pbin->cb, mime_encoding::base64)) {

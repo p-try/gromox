@@ -61,7 +61,6 @@ static void imap_parser_event_proc(char *event);
 static void imap_parser_event_touch(const char *user, const char *folder);
 static void imap_parser_event_flag(const char *username, const char *folder, uint32_t uid);
 static int imap_parser_dispatch_cmd(std::span<std::string> argv, imap_context &);
-static void imap_parser_context_clear(imap_context *);
 static int imap_parser_wrdat_retrieve(imap_context &);
 
 unsigned int g_imapcmd_debug;
@@ -294,7 +293,7 @@ static tproc_status ps_stat_stls(imap_context &ctx)
 				/* ignore */;
 			imap_parser_log_info(pcontext, LV_WARN, "out of memory for TLS object");
 			pcontext->connection.reset(SLEEP_BEFORE_CLOSE);
-			imap_parser_context_clear(pcontext);
+			ctx.clear();
 			return tproc_status::close;
 		}
 		SSL_set_fd(pcontext->connection.ssl, pcontext->connection.sockd);
@@ -336,7 +335,7 @@ static tproc_status ps_stat_stls(imap_context &ctx)
 		pcontext->connection.reset();
 		pcontext->connection.reset();
 	}
-	imap_parser_context_clear(pcontext);
+	ctx.clear();
 	return tproc_status::close;
 }
 
@@ -500,7 +499,14 @@ static tproc_status ps_literal_processing(imap_context &ctx)
 		       pcontext->read_buffer, i);
 		pcontext->command_len += i;
 		std::vector<std::string> argv;
-		auto argc = parse_imap_args(pcontext->command_buffer, pcontext->command_len, argv);
+		/*
+		 * Choice of keep_nil here: In a client command, the atom "NIL"
+		 * is always a literal (e.g. a mailbox name, search string or
+		 * flag keyword), never the IMAP null. The latter only appears
+		 * in server responses.
+		 */
+		auto argc = parse_imap_args(pcontext->command_buffer,
+		            pcontext->command_len, argv, true);
 		if (argc >= 3 && strcasecmp(argv[1].c_str(), "APPEND") == 0) {
 			/* Special handling for APPEND with potentially huge literals */
 			switch (icp_long_append_begin(argv, ctx)) {
@@ -635,8 +641,9 @@ static tproc_status ps_cmd_processing(imap_context &ctx)
 		}
 
 		std::vector<std::string> argv;
+		/* "NIL" is a literal atom in commands, not the null. Keep NIL. */
 		auto argc = parse_imap_args(pcontext->command_buffer,
-			    pcontext->command_len, argv);
+			    pcontext->command_len, argv, true);
 
 		if (pcontext->sched_stat == isched_stat::appended) {
 			if (argc > 0) {
@@ -678,11 +685,23 @@ static tproc_status ps_cmd_processing(imap_context &ctx)
 			return tproc_status::literal_processing;
 		}
 
-		if (argc < 2 || strlen(argv[0].c_str()) >= 32) {
+		if (argc < 2) {
 			size_t string_length = 0;
 			auto imap_reply_str = resource_get_imap_code(1800, 1, &string_length);
-			if (argc <= 0 || argv[0].size() >= 32) {
-				pcontext->connection.write("* ", 2);
+			if (argc <= 0) {
+				/*
+				 * Argument parsing failed and cleared argv. Recover
+				 * the tag from the raw line so the client still gets
+				 * a tagged BAD it can match (RFC 3501 7.1.3) rather
+				 * than an untagged one that leaves it waiting.
+				 */
+				size_t taglen = strcspn(pcontext->command_buffer, " ");
+				if (taglen > 0) {
+					pcontext->connection.write(pcontext->command_buffer, taglen);
+					pcontext->connection.write(" ", 1);
+				} else {
+					pcontext->connection.write("* ", 2);
+				}
 				pcontext->connection.write(imap_reply_str, string_length);
 			} else {
 				pcontext->connection.write(argv[0].c_str(), argv[0].size());
@@ -950,7 +969,7 @@ static tproc_status ps_end_processing(imap_context *pcontext,
 	}
 	ctx.wrdat_content = nullptr;
 	ctx.wrdat_backing.reset();
-	imap_parser_context_clear(pcontext);
+	ctx.clear();
 	return tproc_status::close;
 }
 
@@ -1180,7 +1199,8 @@ static void imap_parser_event_touch(const char *username, const char *folder)
 			other->async_change_mask |= REPORT_NEWMAIL;
 }
 
-void imap_parser_bcast_flags(const imap_context &current, uint32_t uid) try
+void imap_parser_bcast_flags(const imap_context &current, uint32_t uid,
+    bcastfl is_flag) try
 {
 	char buff[1024];
 
@@ -1191,8 +1211,9 @@ void imap_parser_bcast_flags(const imap_context &current, uint32_t uid) try
 	if (plist == nullptr)
 		return;
 	for (auto other : *plist) {
-		if (&current == other ||
-		    current.selected_folder != other->selected_folder)
+		if (&current == other && is_flag == bcastfl::include_self)
+			continue;
+		if (current.selected_folder != other->selected_folder)
 			continue;
 		other->f_flags.emplace(uid);
 		other->async_change_mask |= REPORT_FLAGS;
@@ -1226,7 +1247,7 @@ static void imap_parser_event_flag(const char *username, const char *folder,
 }
 
 void imap_parser_bcast_expunge(const imap_context &current,
-    const std::vector<MITEM *> &exp_list) try
+    const std::vector<MITEM *> &exp_list, const std::string &folder) try
 {
 	char user_lo[UADDR_SIZE];
 	gx_strlcpy(user_lo, current.username, std::size(user_lo));
@@ -1238,7 +1259,7 @@ void imap_parser_bcast_expunge(const imap_context &current,
 	if (ctx_list == nullptr)
 		return;
 	for (auto &other : *ctx_list) {
-		if (current.selected_folder != other->selected_folder)
+		if (folder != other->selected_folder)
 			continue;
 		for (auto p : exp_list)
 			other->f_expunged_uids.emplace_back(p->uid);
@@ -1246,7 +1267,7 @@ void imap_parser_bcast_expunge(const imap_context &current,
 	}
 	hl_hold.unlock();
 	/* Bcast to other bus listeners (IOW, pop3) */
-	auto cmd = "MESSAGE-EXPUNGE "s + user_lo + " " + current.selected_folder + " ";
+	auto cmd = "MESSAGE-EXPUNGE "s + user_lo + " " + folder + " ";
 	auto csize = cmd.size();
 	for (auto p : exp_list) {
 		cmd.resize(csize);
@@ -1300,18 +1321,34 @@ static void imap_parser_echo_expunges(imap_context &ctx, STREAM *stream,
 } catch (const std::bad_alloc &) {
 }
 
-void imap_parser_echo_modify(imap_context *pcontext, STREAM *pstream)
+void imap_parser_echo_modify(imap_context *pcontext, STREAM *pstream,
+    echomod se_flag)
 {
-	if (pcontext->async_change_mask == 0)
-		return;
+	auto &ctx = *pcontext;
 	int err;
 	bool b_first;
 	char buff[1024];
 	decltype(pcontext->f_expunged_uids) f_expunged;
 
 	std::unique_lock hl_hold(g_hash_lock);
-	f_expunged = std::move(pcontext->f_expunged_uids);
-	pcontext->async_change_mask &= ~REPORT_EXPUNGE;
+	/*
+	 * Test the mask under the lock. The event thread raises these bits
+	 * while holding g_hash_lock (imap_parser_bcast_flags / event_expunge),
+	 * so an unlocked pre-check could observe 0 and return in the window
+	 * after the change was queued but before the bit became visible to
+	 * this thread, dropping the notification for this command cycle.
+	 */
+	if (pcontext->async_change_mask == 0)
+		return;
+	/*
+	 * RFC 3501 §7.4.1: an EXPUNGE response MUST NOT be sent while responding
+	 * to FETCH/STORE/SEARCH. Leave the queued expunges (and the seq-number
+	 * renumbering) pending for the next NOOP/CHECK/EXPUNGE/IDLE.
+	 */
+	if (se_flag == echomod::suppress_expunge) {
+		f_expunged = std::move(pcontext->f_expunged_uids);
+		pcontext->async_change_mask &= ~REPORT_EXPUNGE;
+	}
 	auto f_flags = std::move(pcontext->f_flags);
 	pcontext->async_change_mask &= ~(REPORT_FLAGS | REPORT_NEWMAIL);
 	hl_hold.unlock();
@@ -1324,7 +1361,10 @@ void imap_parser_echo_modify(imap_context *pcontext, STREAM *pstream)
 	 */
 	if (pcontext->contents.refresh(*pcontext, pcontext->selected_folder,
 	    f_expunged.size() > 0) == 0) {
-		auto outlen = gx_snprintf(buff, std::size(buff),
+		auto outlen = pcontext->enabled_rev2 ?
+		          gx_snprintf(buff, std::size(buff), "* %zu EXISTS\r\n",
+		          ctx.contents.n_exists()) :
+		          gx_snprintf(buff, std::size(buff),
 		          "* %zu EXISTS\r\n"
 		          "* %u RECENT\r\n",
 		          pcontext->contents.n_exists(),
@@ -1340,13 +1380,28 @@ void imap_parser_echo_modify(imap_context *pcontext, STREAM *pstream)
 		if (item == nullptr)
 			continue;
 		unsigned int flag_bits = 0;
+		std::string keywords;
 		if (midb_agent::get_flags(pcontext->maildir,
 		    pcontext->selected_folder, item->mid, &flag_bits,
-		    &err) != MIDB_RESULT_OK)
+		    &err, &keywords) != MIDB_RESULT_OK)
 			continue;
+		/*
+		 * Announce a keyword to the _receiving_ session before this
+		 * async FETCH shows it (covers the cross-session case where
+		 * another connection introduced it).
+		 */
+		if (!keywords.empty()) {
+			auto line = icp_make_kwannounce_line(*pcontext, keywords);
+			if (line.size() > 0) {
+				if (pstream == nullptr)
+					pcontext->connection.write(line.c_str(), line.size());
+				else
+					pstream->write(line.c_str(), line.size());
+			}
+		}
 		auto outlen = gx_snprintf(buff, std::size(buff), "* %d FETCH (FLAGS (", item->id);
 		b_first = false;
-		if (flag_bits & FLAG_RECENT) {
+		if (!ctx.enabled_rev2 && flag_bits & FLAG_RECENT) {
 			outlen += gx_snprintf(&buff[outlen], std::size(buff) - outlen, "\\Recent");
 			b_first = true;
 		}
@@ -1383,6 +1438,12 @@ void imap_parser_echo_modify(imap_context *pcontext, STREAM *pstream)
 			if (b_first)
 				buff[outlen++] = ' ';
 			outlen += gx_snprintf(&buff[outlen], std::size(buff) - outlen, "$Forwarded");
+			b_first = true;
+		}
+		if (!keywords.empty()) {
+			if (b_first)
+				buff[outlen++] = ' ';
+			outlen += gx_snprintf(&buff[outlen], std::size(buff) - outlen, "%s", keywords.c_str());
 		}
 		outlen += gx_snprintf(&buff[outlen], std::size(buff) - outlen, "))\r\n");
 		if (pstream == nullptr)
@@ -1412,6 +1473,7 @@ static int imap_parser_dispatch_cmd2(std::span<std::string> argv,
 		{"COPY", icp_copy},
 		{"CREATE", icp_create},
 		{"DELETE", icp_delete},
+		{"ENABLE", icp_enable},
 		{"EXAMINE", icp_examine},
 		{"EXPUNGE", icp_expunge},
 		{"FETCH", icp_fetch},
@@ -1421,6 +1483,8 @@ static int imap_parser_dispatch_cmd2(std::span<std::string> argv,
 		{"LOGIN", icp_login},
 		{"LOGOUT", icp_logout},
 		{"LSUB", icp_lsub},
+		{"MOVE", icp_move},
+		{"NAMESPACE", icp_namespace},
 		{"NOOP", icp_noop},
 		{"RENAME", icp_rename},
 		{"SEARCH", icp_search},
@@ -1436,6 +1500,7 @@ static int imap_parser_dispatch_cmd2(std::span<std::string> argv,
 		{"COPY", icp_uid_copy},
 		{"EXPUNGE", icp_uid_expunge},
 		{"FETCH", icp_uid_fetch},
+		{"MOVE", icp_uid_move},
 		{"SEARCH", icp_uid_search},
 		{"STORE", icp_uid_store},
 	};
@@ -1500,15 +1565,14 @@ imap_context::imap_context()
     pcontext->connection.sockd = -1;
 }
 
-static void imap_parser_context_clear(imap_context *pcontext)
+void imap_context::clear()
 {
-    if (pcontext == nullptr) {
-        return;
-    }
+	auto pcontext = this;
 	auto &ctx = *pcontext;
 	pcontext->connection.reset();
 	pcontext->proto_stat = iproto_stat::none;
 	pcontext->sched_stat = isched_stat::none;
+	ctx.enabled_rev2 = false;
 	ctx.wrdat_content = nullptr;
 	ctx.wrdat_backing.reset();
 	pcontext->mid.clear();
@@ -1529,6 +1593,14 @@ static void imap_parser_context_clear(imap_context *pcontext)
 	pcontext->stream.clear();
 	pcontext->f_flags.clear();
 	pcontext->f_expunged_uids.clear();
+	pcontext->contents.clear();
+	pcontext->saved_uids.clear();
+	pcontext->announced_keywords.clear();
+	/*
+	 * Drop any pending async bits so a freshly pooled context does not
+	 * start out flagged for a notification it has no queued changes for.
+	 */
+	pcontext->async_change_mask.store(0, std::memory_order_relaxed);
 	pcontext->auth_times = 0;
 	pcontext->username[0] = '\0';
 	pcontext->maildir[0] = '\0';
